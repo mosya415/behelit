@@ -33,18 +33,29 @@ const (
 	gNone    = "·" // none / muted
 )
 
-// termWidth bounds the hairline width. Uses $COLUMNS when present (no cgo, no
-// ioctl, nothing for a security reviewer to frown at), else a sane fixed width.
+// termWidth is the full terminal width for hairlines and right-alignment: the
+// real column count from the terminal (osTermWidth), else $COLUMNS, else 80.
 func termWidth() int {
+	if w := osTermWidth(); w > 0 {
+		return clampWidth(w)
+	}
 	if c := strings.TrimSpace(os.Getenv("COLUMNS")); c != "" {
-		if n, err := strconv.Atoi(c); err == nil && n >= 40 {
-			if n > 100 {
-				n = 100
-			}
-			return n
+		if n, err := strconv.Atoi(c); err == nil && n > 0 {
+			return clampWidth(n)
 		}
 	}
-	return 60
+	return 80
+}
+
+func clampWidth(n int) int {
+	switch {
+	case n < 20:
+		return 20
+	case n > 220:
+		return 220
+	default:
+		return n
+	}
 }
 
 // hr prints a full-width hairline rule.
@@ -72,17 +83,15 @@ func contValue(value string) {
 	fmt.Printf("  %-8s %s\n", "", value)
 }
 
-// ticket prints the top "ticket header" bar: left brand, right est/live, spread
-// to the full width with a green LIVE dot.
+// ticket prints the top "ticket header" bar: optional left brand and a
+// right-aligned est/live marker (green LIVE dot), spread to the full width.
 func ticket(left, right string) {
 	w := termWidth()
-	// right is composed with a colored dot; measure its plain form for spacing.
-	rightPlain := right
-	pad := w - 1 - utf8.RuneCountInString(left) - utf8.RuneCountInString(rightPlain)
+	coloredRight := strings.Replace(right, gUp, cGreen+gUp+cFaint, 1)
+	pad := w - 1 - utf8.RuneCountInString(left) - utf8.RuneCountInString(right)
 	if pad < 1 {
 		pad = 1
 	}
-	coloredRight := strings.Replace(right, gUp, cGreen+gUp+cFaint, 1)
 	fmt.Printf(" %s%s%s%s%s\n", cFaint, left, strings.Repeat(" ", pad), coloredRight, cReset)
 }
 

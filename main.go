@@ -547,8 +547,6 @@ LCA_ALLOW, LCA_DIR, LCA_CTX_TOKENS.
 `)
 }
 
-const orgLabel = "GIGALEARN · ENGINEERING"
-
 func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client, notes []string) {
 	who := "?"
 	if u, err := user.Current(); err == nil {
@@ -556,7 +554,7 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	}
 
 	hr()
-	ticket(orgLabel, "EST.2026 · "+gUp+" LIVE ▲")
+	ticket(os.Getenv("LCA_ORG"), gUp+" LIVE ▲")
 	fmt.Println()
 	eyebrow("session")
 	title("Latent Coding Agent")

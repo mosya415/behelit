@@ -45,6 +45,7 @@ are denied rather than run unattended.
 | `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
 | `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
+| `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -94,7 +95,8 @@ UPPERCASE labels. Status glyphs are shared everywhere: `●` ready/ok, `◐` par
 `✕` failed, `·` muted. Casing is applied only to our own chrome (labels, section
 titles, status words) — never to data (paths, model ids, commands, file
 contents, diffs), which is always shown verbatim. Hairline width follows
-`$COLUMNS` (no ioctl/cgo), default 60.
+the real terminal column count (a read-only `TIOCGWINSZ` ioctl on unix; no cgo,
+no deps), falling back to `$COLUMNS` then 80.
 
 On screen the model's prose is shown but the tool-call tags are hidden — the
 clean action markers (`· READ_FILE …`, `● APPROVAL REQUIRED …`) stand in for
