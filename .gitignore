@@ -1,0 +1,5 @@
+# built binary
+/lca
+
+# local agent state (audit log + transcripts live under $LCA_DIR, default ~/.lca)
+/.lca/
