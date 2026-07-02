@@ -81,15 +81,15 @@ func (a *Approver) TrustedClasses() []string {
 func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 	class := classOf(kind)
 	if a.trusted[class] {
-		fmt.Printf("\033[90m● auto-approved (%s trusted): %s\033[0m\n", class, header)
+		fmt.Printf(" %s%s AUTO-APPROVED%s %s\n", cFaint, gNone, cReset, header)
 		return true, true
 	}
 
-	fmt.Printf("\n\033[33m● approval required: %s\033[0m\n", header)
+	fmt.Printf("\n %s%s APPROVAL REQUIRED%s %s\n", cYellow, gUp, cReset, header)
 	if preview != "" {
 		fmt.Println(preview)
 	}
-	fmt.Print("apply? [y/N/a=all] ")
+	fmt.Print(" APPLY? " + cFaint + "[Y/N/A=ALL]" + cReset + " ")
 
 	line, err := a.in.ReadString('\n')
 	if err != nil {
@@ -100,7 +100,7 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 		return true, false
 	case "a", "all":
 		a.TrustAll()
-		fmt.Println("\033[90m  (auto-approve enabled for this session — /approve off to disable)\033[0m")
+		fmt.Println(" " + faint("%s AUTO-APPROVE ENABLED (session) — /approve off to disable", gNone))
 		return true, false
 	default:
 		return false, false

@@ -61,7 +61,7 @@ func main() {
 	banner(cfg, jail, rec, ap, client, notes)
 
 	for {
-		fmt.Print("\n\033[36m›\033[0m ")
+		fmt.Print("\n " + cFaint + "›" + cReset + " ")
 		line, err := in.ReadString('\n')
 		if err != nil { // EOF (Ctrl-D)
 			fmt.Println()
@@ -76,7 +76,7 @@ func main() {
 		case "/reset":
 			msgs = msgs[:1]
 			rec.Event("reset", nil)
-			fmt.Println("(transcript cleared)")
+			fmt.Println(" " + faint("%s TRANSCRIPT CLEARED", gNone))
 			continue
 		}
 		if handleApproveCmd(line, ap, rec) {
@@ -104,10 +104,10 @@ func main() {
 func reconcileModel(client *Client, rec *Recorder) []string {
 	models, err := client.ListModels()
 	if err != nil {
-		return []string{warnln("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
+		return []string{warn("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
 	}
 	if len(models) == 0 {
-		return []string{warnln("endpoint advertises no models — using configured name as-is")}
+		return []string{warn("endpoint advertises no models — using configured name as-is")}
 	}
 	if info, ok := findModel(models, client.Model()); ok {
 		return []string{readyLine(info)}
@@ -118,10 +118,10 @@ func reconcileModel(client *Client, rec *Recorder) []string {
 		rec.Event("model_adopt", map[string]any{"from": prev, "to": models[0].ID})
 		return []string{
 			readyLine(models[0]),
-			dimln("adopted (configured %q not served)", prev),
+			faint("adopted (configured %q not served)", prev),
 		}
 	}
-	lines := []string{warnln("configured %q not served; choose one with /model:", client.Model())}
+	lines := []string{warn("configured %q not served; choose one with /model:", client.Model())}
 	return append(lines, modelTable(models, client.Model())...)
 }
 
@@ -135,14 +135,14 @@ func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 	models, err := client.ListModels()
 
 	if arg == "" {
-		fmt.Printf("current model: %s @ %s\n", client.Model(), client.Endpoint())
+		eyebrow("models")
+		kv("current", client.Model()+"  "+faint("@ %s", client.Endpoint()))
 		switch {
 		case err != nil:
-			fmt.Printf("  \033[33mdiscovery unavailable: %v\033[0m\n", err)
+			fmt.Println("  " + warn("discovery unavailable: %v", err))
 		case len(models) == 0:
-			fmt.Println("  (endpoint advertises no models)")
+			fmt.Println("  " + faint("endpoint advertises no models"))
 		default:
-			fmt.Println("served models:")
 			for _, l := range modelTable(models, client.Model()) {
 				fmt.Println(l)
 			}
@@ -153,10 +153,10 @@ func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 	prev := client.Model()
 	client.SetModel(arg)
 	rec.Event("model_change", map[string]any{"from": prev, "to": arg})
-	fmt.Printf("model: %s → %s\n", prev, arg)
+	fmt.Printf("  %sMODEL%s %s → %s\n", cFaint, cReset, prev, arg)
 	if err == nil && len(models) > 0 {
 		if _, ok := findModel(models, arg); !ok {
-			fmt.Printf("\033[33m  warning: %q is not in the endpoint's served list\033[0m\n", arg)
+			fmt.Println("  " + warn("warning: %q is not in the endpoint's served list", arg))
 		}
 	}
 	return true
@@ -185,17 +185,17 @@ func describeModel(m ModelInfo) string {
 }
 
 // modelTable renders one status line per served model: a green ● means served/
-// ready, a cyan → marks the current selection, followed by its detail.
+// ready, a bold → marks the current selection, followed by its detail.
 func modelTable(ms []ModelInfo, current string) []string {
 	lines := make([]string, 0, len(ms))
 	for _, m := range ms {
 		mark := " "
 		if m.ID == current {
-			mark = "\033[36m→\033[0m"
+			mark = cBold + "→" + cReset
 		}
-		line := fmt.Sprintf("  \033[32m●\033[0m %s %s", mark, m.ID)
+		line := fmt.Sprintf("  %s%s%s %s %s", cGreen, gUp, cReset, mark, m.ID)
 		if d := describeModel(m); d != "" {
-			line += "  \033[90m" + d + "\033[0m"
+			line += "  " + faint("%s", d)
 		}
 		lines = append(lines, line)
 	}
@@ -204,19 +204,11 @@ func modelTable(ms []ModelInfo, current string) []string {
 
 // readyLine is the banner status for the active model.
 func readyLine(m ModelInfo) string {
-	s := "\033[32m● ready\033[0m"
+	s := statusText(cGreen, gUp, "ready")
 	if d := describeModel(m); d != "" {
-		s += " \033[90m— " + d + "\033[0m"
+		s += " " + faint("— %s", d)
 	}
 	return s
-}
-
-func warnln(format string, a ...any) string {
-	return "\033[33m" + fmt.Sprintf(format, a...) + "\033[0m"
-}
-
-func dimln(format string, a ...any) string {
-	return "\033[90m" + fmt.Sprintf(format, a...) + "\033[0m"
 }
 
 // handleApproveCmd processes the /approve REPL command (on|off|status). Returns
@@ -236,14 +228,14 @@ func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
 	case "edit", "write":
 		ap.Trust("edit")
 	case "", "status":
-		fmt.Printf("approval mode: %s\n", ap.Mode())
+		kv("approve", strings.ToUpper(ap.Mode()))
 		return true
 	default:
-		fmt.Println("usage: /approve [on|off|run|edit|status]")
+		fmt.Println("  " + faint("usage: /approve [on|off|run|edit|status]"))
 		return true
 	}
 	rec.Event("approve_mode", map[string]any{"trusted": ap.TrustedClasses()})
-	fmt.Printf("approval mode: %s\n", ap.Mode())
+	kv("approve", strings.ToUpper(ap.Mode()))
 	return true
 }
 
@@ -252,7 +244,7 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 		printed := false
 		onDelta := func(s string) {
 			if !printed {
-				fmt.Print("\n\033[32m●\033[0m ")
+				fmt.Print("\n " + cBold + gUp + cReset + " ")
 				printed = true
 			}
 			fmt.Print(s)
@@ -260,7 +252,7 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 
 		send, trimmed := trimForContext(*msgs, ctxTokens)
 		if trimmed > 0 {
-			fmt.Printf("\033[90m context: trimmed %d old tool outputs (~%dk tok budget)\033[0m\n", trimmed, ctxTokens/1000)
+			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
 		reply, err := client.CompleteStream(send, onDelta)
@@ -268,7 +260,7 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println()
 		}
 		if err != nil {
-			fmt.Println("\033[31mendpoint error:\033[0m", err)
+			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
 			rec.Event("error", map[string]any{"err": err.Error()})
 			return
 		}
@@ -283,7 +275,7 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 		*msgs = append(*msgs, Message{Role: "user", Content: results})
 		rec.Transcript(*msgs)
 	}
-	fmt.Printf("\033[33m(stopped: hit %d-step cap)\033[0m\n", maxSteps)
+	fmt.Println(" " + warn("%s STOPPED — hit %d-step cap", gPartial, maxSteps))
 	rec.Event("step_cap", map[string]any{"steps": maxSteps})
 }
 
@@ -293,15 +285,15 @@ func executeBlocks(jail *Jail, ap *Approver, rec *Recorder, blocks []Block) stri
 		var res string
 		switch b.Name {
 		case "read_file":
-			fmt.Printf("\033[90m read_file %s\033[0m\n", b.Attr["path"])
+			toolLine("read_file", b.Attr["path"])
 			res = readFile(jail, b.Attr["path"], b.Attr["lines"])
 			rec.Event("read_file", map[string]any{"path": b.Attr["path"], "result": summarize(res)})
 		case "grep":
-			fmt.Printf("\033[90m grep %q %s\033[0m\n", b.Attr["pattern"], b.Attr["path"])
+			toolLine("grep", fmt.Sprintf("%q %s", b.Attr["pattern"], b.Attr["path"]))
 			res = grepTree(jail, b.Attr["pattern"], b.Attr["path"])
 			rec.Event("grep", map[string]any{"pattern": b.Attr["pattern"], "path": b.Attr["path"], "result": summarize(res)})
 		case "list_dir":
-			fmt.Printf("\033[90m list_dir %s\033[0m\n", b.Attr["path"])
+			toolLine("list_dir", b.Attr["path"])
 			res = listDir(jail, b.Attr["path"])
 			rec.Event("list_dir", map[string]any{"path": b.Attr["path"]})
 		case "edit":
@@ -325,7 +317,7 @@ func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "error": err.Error()})
 		return "error: " + err.Error()
 	}
-	approved, auto := ap.Confirm("edit", "edit "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
+	approved, auto := ap.Confirm("edit", "EDIT "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
 	if !approved {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this edit"
@@ -350,7 +342,7 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		action = "create"
 	}
 	preview := fmt.Sprintf("  %s %s (%d bytes)", action, b.Attr["path"], len(b.Body))
-	approved, auto := ap.Confirm("write", action+" "+b.Attr["path"], preview)
+	approved, auto := ap.Confirm("write", strings.ToUpper(action)+" "+b.Attr["path"], preview)
 	if !approved {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this write"
@@ -366,7 +358,7 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 
 func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	cmd := strings.TrimSpace(b.Body)
-	approved, auto := ap.Confirm("run_command", "run", "  $ "+cmd)
+	approved, auto := ap.Confirm("run_command", "RUN", "  $ "+cmd)
 	if !approved {
 		rec.Event("run_command", map[string]any{"cmd": cmd, "approved": false})
 		return "user denied this command"
@@ -391,20 +383,30 @@ LCA_ALLOW, LCA_DIR, LCA_CTX_TOKENS.
 `)
 }
 
+const orgLabel = "GIGALEARN · ENGINEERING"
+
 func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client, notes []string) {
 	who := "?"
 	if u, err := user.Current(); err == nil {
-		who = fmt.Sprintf("%s (uid %s)", u.Username, u.Uid)
+		who = fmt.Sprintf("%s · uid %s", u.Username, u.Uid)
 	}
-	fmt.Println("\033[1mLatent Coding Agent\033[0m")
-	fmt.Printf("  user:    %s\n", who)
-	fmt.Printf("  jail:    %s\n", jail.Root)
-	fmt.Printf("  model:   %s @ %s\n", client.Model(), cfg.BaseURL)
+
+	hr()
+	ticket(orgLabel, "EST.2026 · "+gUp+" LIVE ▲")
+	fmt.Println()
+	eyebrow("session")
+	title("Latent Coding Agent")
+	hr()
+
+	kv("user", who)
+	kv("jail", jail.Root)
+	kv("model", client.Model()+"  "+faint("@ %s", cfg.BaseURL))
 	for _, n := range notes {
-		fmt.Printf("           %s\n", n)
+		contValue(n)
 	}
-	fmt.Printf("  audit:   %s\n", cfg.Dir)
-	fmt.Printf("  log:     %s\n", rec.SessionPath())
-	fmt.Printf("  approve: %s\n", ap.Mode())
-	fmt.Println("  commands: /model [name]  /approve [on|off|run|edit|status]  /reset  /exit")
+	kv("audit", cfg.Dir)
+	kv("log", rec.SessionPath())
+	kv("approve", strings.ToUpper(ap.Mode()))
+	hr()
+	fmt.Println(" " + faint("/model [name]   /approve [on|off|run|edit|status]   /reset   /exit"))
 }

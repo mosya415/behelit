@@ -67,6 +67,16 @@ see what the server actually serves and reconciles it with `LCA_MODEL`:
 status for the active model. Adoptions and switches are written to the audit log
 (`model_adopt` / `model_change`).
 
+## Terminal style — `ui.go`
+
+Monochrome terminal aesthetic: grays for chrome, color used **only** as status
+(muted phosphor green/yellow/red), separation by 1px-style hairlines (`─`), and
+UPPERCASE labels. Status glyphs are shared everywhere: `●` ready/ok, `◐` partial,
+`✕` failed, `·` muted. Casing is applied only to our own chrome (labels, section
+titles, status words) — never to data (paths, model ids, commands, file
+contents, diffs), which is always shown verbatim. Hairline width follows
+`$COLUMNS` (no ioctl/cgo), default 60.
+
 ## Design (the four non-trivial parts)
 
 1. **Tool-call transport — `protocol.go`.** The model emits line-anchored XML-ish
@@ -168,6 +178,7 @@ edit.go       strict search/replace + whole-file write
 jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
 context.go    transcript trimming to a token budget (prefill control)
+ui.go         terminal styling: palette, hairlines, status glyphs, labels
 prompt.go     system prompt (kept in sync with protocol.go)
 agent_test.go tests for parser / edit / jail / tokenizer
 ```
