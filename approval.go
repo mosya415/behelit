@@ -3,11 +3,12 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"sort"
 	"strings"
 )
 
-// The soft gate. read_file/grep run automatically (no side effects); edit,
-// write and run_command are shown to the user and require an explicit "y".
+// The soft gate. read_file/grep/list_dir run automatically (no side effects);
+// edit, write and run_command are shown to the user and require an explicit "y".
 // This is deliberately advisory — the jail (jail.go) is the hard boundary.
 // Both are required: the gate catches intent, the jail catches reach.
 
@@ -19,28 +20,68 @@ func needsApproval(name string) bool {
 	return false
 }
 
-// Approver owns the interactive gate and the session-wide "approve all" mode.
+// Side-effecting tools group into two trust CLASSES so the user can grant
+// standing approval to one kind of action without the other — e.g. auto-run
+// allowlisted commands while still confirming every file change.
+//
+//	"edit" — file mutations: edit, write
+//	"run"  — command execution: run_command
+func classOf(kind string) string {
+	switch kind {
+	case "edit", "write":
+		return "edit"
+	case "run_command", "run":
+		return "run"
+	}
+	return kind
+}
+
+var allClasses = []string{"edit", "run"}
+
+// Approver owns the interactive gate and the session's per-class trust set.
 // It is the single place a side-effecting action is confirmed, so every path is
 // recorded consistently — including whether the yes was typed by the user or
-// granted automatically by the trust mode (audited via the `auto` return).
+// granted automatically by a trusted class (audited via the `auto` return).
 type Approver struct {
 	in      *bufio.Reader
-	autoAll bool // when set, every action is approved without prompting
+	trusted map[string]bool // trusted classes: "edit", "run"
 }
 
 func NewApprover(in *bufio.Reader) *Approver {
-	return &Approver{in: in}
+	return &Approver{in: in, trusted: map[string]bool{}}
 }
 
-// Confirm reports whether an action may proceed and whether it was auto-granted.
-// Prompt answers:
+func (a *Approver) Trust(class string) { a.trusted[classOf(class)] = true }
+func (a *Approver) TrustAll() {
+	for _, c := range allClasses {
+		a.trusted[c] = true
+	}
+}
+func (a *Approver) Clear()                   { a.trusted = map[string]bool{} }
+func (a *Approver) Trusts(class string) bool { return a.trusted[classOf(class)] }
+
+// TrustedClasses returns the trusted classes in stable order (for audit/display).
+func (a *Approver) TrustedClasses() []string {
+	var cs []string
+	for c := range a.trusted {
+		if a.trusted[c] {
+			cs = append(cs, c)
+		}
+	}
+	sort.Strings(cs)
+	return cs
+}
+
+// Confirm reports whether an action of the given kind may proceed and whether it
+// was auto-granted by a trusted class. Prompt answers:
 //
 //	y / yes  approve just this action
 //	n / <Enter>  deny (default)
 //	a / all  approve this and auto-approve every later action this session
-func (a *Approver) Confirm(header, preview string) (approved, auto bool) {
-	if a.autoAll {
-		fmt.Printf("\033[90m● auto-approved (session): %s\033[0m\n", header)
+func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
+	class := classOf(kind)
+	if a.trusted[class] {
+		fmt.Printf("\033[90m● auto-approved (%s trusted): %s\033[0m\n", class, header)
 		return true, true
 	}
 
@@ -58,7 +99,7 @@ func (a *Approver) Confirm(header, preview string) (approved, auto bool) {
 	case "y", "yes":
 		return true, false
 	case "a", "all":
-		a.autoAll = true
+		a.TrustAll()
 		fmt.Println("\033[90m  (auto-approve enabled for this session — /approve off to disable)\033[0m")
 		return true, false
 	default:
@@ -66,12 +107,15 @@ func (a *Approver) Confirm(header, preview string) (approved, auto bool) {
 	}
 }
 
-func (a *Approver) SetAuto(on bool) { a.autoAll = on }
-func (a *Approver) Auto() bool      { return a.autoAll }
-
+// Mode renders the current trust posture for the banner / status.
 func (a *Approver) Mode() string {
-	if a.autoAll {
-		return "auto-approve (session)"
+	cs := a.TrustedClasses()
+	switch {
+	case len(cs) == 0:
+		return "prompt each action"
+	case len(cs) == len(allClasses):
+		return "auto-approve all (session)"
+	default:
+		return "auto-approve: " + strings.Join(cs, ", ")
 	}
-	return "prompt each action"
 }

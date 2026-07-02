@@ -107,10 +107,17 @@ At each gate the prompt is `[y/N/a=all]`:
 - `n` / Enter — deny (the model is told and can adjust)
 - `a` — approve this and auto-approve every later action **this session**
 
-Toggle the session mode any time from the REPL: `/approve on`, `/approve off`,
-`/approve status`. The audit log records `auto: true` on every action granted by
-the trust mode, so an interactive `y` and an auto-approval are always
-distinguishable after the fact.
+Trust can also be granted per **class** from the REPL, so you can auto-run
+allowlisted commands while still confirming every file change (or vice versa):
+
+- `/approve run` — auto-approve `run_command`
+- `/approve edit` — auto-approve file mutations (`edit`, `write`)
+- `/approve on` — auto-approve everything; `/approve off` — back to prompting
+- `/approve status` — show the current posture
+
+The audit log records `auto: true` on every action granted by a trusted class,
+so an interactive `y` and an auto-approval are always distinguishable after the
+fact. `-y` on the command line trusts all classes for a one-shot run.
 
 ## Audit & transcript — `recorder.go`
 

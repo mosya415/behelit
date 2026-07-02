@@ -34,7 +34,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 	ap := NewApprover(in)
 	if *yes || *yesLong {
-		ap.SetAuto(true)
+		ap.TrustAll()
 	}
 
 	notes := reconcileModel(client, rec)
@@ -228,18 +228,22 @@ func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
 	arg := strings.TrimSpace(strings.TrimPrefix(line, "/approve"))
 	switch arg {
 	case "on", "all":
-		ap.SetAuto(true)
-		rec.Event("approve_mode", map[string]any{"auto": true})
-		fmt.Println("auto-approve: ON (every action approved without prompting)")
+		ap.TrustAll()
 	case "off":
-		ap.SetAuto(false)
-		rec.Event("approve_mode", map[string]any{"auto": false})
-		fmt.Println("auto-approve: OFF (prompt for each action)")
+		ap.Clear()
+	case "run":
+		ap.Trust("run")
+	case "edit", "write":
+		ap.Trust("edit")
 	case "", "status":
 		fmt.Printf("approval mode: %s\n", ap.Mode())
+		return true
 	default:
-		fmt.Println("usage: /approve [on|off|status]")
+		fmt.Println("usage: /approve [on|off|run|edit|status]")
+		return true
 	}
+	rec.Event("approve_mode", map[string]any{"trusted": ap.TrustedClasses()})
+	fmt.Printf("approval mode: %s\n", ap.Mode())
 	return true
 }
 
@@ -321,7 +325,7 @@ func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "error": err.Error()})
 		return "error: " + err.Error()
 	}
-	approved, auto := ap.Confirm("edit "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
+	approved, auto := ap.Confirm("edit", "edit "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
 	if !approved {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this edit"
@@ -346,7 +350,7 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		action = "create"
 	}
 	preview := fmt.Sprintf("  %s %s (%d bytes)", action, b.Attr["path"], len(b.Body))
-	approved, auto := ap.Confirm(action+" "+b.Attr["path"], preview)
+	approved, auto := ap.Confirm("write", action+" "+b.Attr["path"], preview)
 	if !approved {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this write"
@@ -362,7 +366,7 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 
 func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	cmd := strings.TrimSpace(b.Body)
-	approved, auto := ap.Confirm("run", "  $ "+cmd)
+	approved, auto := ap.Confirm("run_command", "run", "  $ "+cmd)
 	if !approved {
 		rec.Event("run_command", map[string]any{"cmd": cmd, "approved": false})
 		return "user denied this command"
@@ -402,5 +406,5 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	fmt.Printf("  audit:   %s\n", cfg.Dir)
 	fmt.Printf("  log:     %s\n", rec.SessionPath())
 	fmt.Printf("  approve: %s\n", ap.Mode())
-	fmt.Println("  commands: /model [name]  /approve [on|off|status]  /reset  /exit")
+	fmt.Println("  commands: /model [name]  /approve [on|off|run|edit|status]  /reset  /exit")
 }
