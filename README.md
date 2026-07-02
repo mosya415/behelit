@@ -32,7 +32,23 @@ confined to it.
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
-REPL commands: `/reset` (clear transcript), `/exit`.
+REPL commands: `/model [name]`, `/approve [on|off|status]`, `/reset`, `/exit`.
+
+### Model selection
+
+There is no router — one model per session, sent as the `model` field to the
+single `LCA_BASE_URL` endpoint. On startup the agent queries `GET /v1/models` to
+see what the server actually serves and reconciles it with `LCA_MODEL`:
+
+- configured name is served → used as-is
+- not served but exactly one model is offered → that one is adopted (the common
+  vLLM/SGLang case: one model per endpoint, whose id rarely matches a guess)
+- not served and several are offered → a warning; pick one with `/model <name>`
+- discovery unavailable (endpoint down or no `/models`) → configured name used as-is
+
+`/model` lists served models (current marked); `/model <name>` switches for
+later turns. Adoptions and switches are written to the audit log
+(`model_adopt` / `model_change`).
 
 ## Design (the four non-trivial parts)
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,6 +37,57 @@ func NewClient(cfg Config) *Client {
 		apiKey:  cfg.APIKey,
 		temp:    cfg.Temperature,
 	}
+}
+
+func (c *Client) Model() string     { return c.model }
+func (c *Client) SetModel(m string) { c.model = m }
+func (c *Client) Endpoint() string  { return c.baseURL }
+
+type modelsResponse struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+// ListModels queries the OpenAI-compatible /models endpoint to discover what the
+// server actually serves. Short timeout so a hung or absent endpoint never
+// blocks startup. Not every server implements it — callers treat an error as
+// "discovery unavailable", not fatal.
+func (c *Client) ListModels() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("endpoint returned %d", resp.StatusCode)
+	}
+	var out modelsResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("bad /models json: %w", err)
+	}
+	ids := make([]string, 0, len(out.Data))
+	for _, m := range out.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, nil
 }
 
 type chatRequest struct {

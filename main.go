@@ -27,9 +27,10 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 	ap := NewApprover(in)
 
-	banner(cfg, jail, rec, ap)
+	notes := reconcileModel(client, rec)
+	banner(cfg, jail, rec, ap, client, notes)
 	rec.Event("session_start", map[string]any{
-		"root": jail.Root, "model": cfg.Model, "endpoint": cfg.BaseURL,
+		"root": jail.Root, "model": client.Model(), "endpoint": cfg.BaseURL,
 	})
 	defer rec.Event("session_end", nil)
 
@@ -57,6 +58,9 @@ func main() {
 		if handleApproveCmd(line, ap, rec) {
 			continue
 		}
+		if handleModelCmd(line, client, rec) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
@@ -68,6 +72,80 @@ func main() {
 // runTurn drives the agentic loop for one user message: stream the model, execute
 // any tool blocks, feed results back, repeat until the model stops emitting
 // tools (a final answer) or we hit the step cap.
+// reconcileModel discovers what the endpoint actually serves and reconciles it
+// with the configured model name. If the configured name isn't served but the
+// endpoint offers exactly one model, we adopt it (the common vLLM/SGLang case:
+// one model per endpoint, whose id rarely matches a hand-typed guess). Returns
+// human-readable notes for the banner; never fatal.
+func reconcileModel(client *Client, rec *Recorder) []string {
+	models, err := client.ListModels()
+	if err != nil {
+		return []string{fmt.Sprintf("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
+	}
+	if len(models) == 0 {
+		return []string{"endpoint advertises no models — using configured name as-is"}
+	}
+	if contains(models, client.Model()) {
+		return nil
+	}
+	if len(models) == 1 {
+		prev := client.Model()
+		client.SetModel(models[0])
+		rec.Event("model_adopt", map[string]any{"from": prev, "to": models[0]})
+		return []string{fmt.Sprintf("configured %q not served; adopted the only served model %q", prev, models[0])}
+	}
+	return []string{fmt.Sprintf("configured %q not served; choose one with /model (served: %s)",
+		client.Model(), strings.Join(models, ", "))}
+}
+
+// handleModelCmd processes the /model REPL command. "/model" lists served models
+// (current marked); "/model <name>" switches for subsequent turns.
+func handleModelCmd(line string, client *Client, rec *Recorder) bool {
+	if line != "/model" && !strings.HasPrefix(line, "/model ") {
+		return false
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(line, "/model"))
+	models, err := client.ListModels()
+
+	if arg == "" {
+		fmt.Printf("current model: %s @ %s\n", client.Model(), client.Endpoint())
+		switch {
+		case err != nil:
+			fmt.Printf("  (discovery unavailable: %v)\n", err)
+		case len(models) == 0:
+			fmt.Println("  (endpoint advertises no models)")
+		default:
+			fmt.Println("served models:")
+			for _, m := range models {
+				mark := "  "
+				if m == client.Model() {
+					mark = "* "
+				}
+				fmt.Printf("  %s%s\n", mark, m)
+			}
+		}
+		return true
+	}
+
+	prev := client.Model()
+	client.SetModel(arg)
+	rec.Event("model_change", map[string]any{"from": prev, "to": arg})
+	fmt.Printf("model: %s → %s\n", prev, arg)
+	if err == nil && len(models) > 0 && !contains(models, arg) {
+		fmt.Printf("\033[33m  warning: %q is not in the endpoint's served list\033[0m\n", arg)
+	}
+	return true
+}
+
+func contains(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 // handleApproveCmd processes the /approve REPL command (on|off|status). Returns
 // true if the line was such a command and has been handled.
 func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
@@ -213,7 +291,7 @@ func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	return res
 }
 
-func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver) {
+func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client, notes []string) {
 	who := "?"
 	if u, err := user.Current(); err == nil {
 		who = fmt.Sprintf("%s (uid %s)", u.Username, u.Uid)
@@ -221,9 +299,12 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver) {
 	fmt.Println("\033[1mLatent Coding Agent\033[0m")
 	fmt.Printf("  user:    %s\n", who)
 	fmt.Printf("  jail:    %s\n", jail.Root)
-	fmt.Printf("  model:   %s @ %s\n", cfg.Model, cfg.BaseURL)
+	fmt.Printf("  model:   %s @ %s\n", client.Model(), cfg.BaseURL)
+	for _, n := range notes {
+		fmt.Printf("           \033[33m%s\033[0m\n", n)
+	}
 	fmt.Printf("  audit:   %s\n", cfg.Dir)
 	fmt.Printf("  log:     %s\n", rec.SessionPath())
 	fmt.Printf("  approve: %s\n", ap.Mode())
-	fmt.Println("  commands: /approve [on|off|status]  /reset  /exit")
+	fmt.Println("  commands: /model [name]  /approve [on|off|status]  /reset  /exit")
 }
