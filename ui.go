@@ -18,14 +18,33 @@ import (
 const (
 	cReset  = "\033[0m"
 	cBold   = "\033[1m"
-	cDim    = "\033[38;5;246m" // --dim  #8c8c92
-	cFaint  = "\033[38;5;240m" // --faint #54545a (labels, rules, muted)
-	cGreen  = "\033[38;5;114m" // --green #6fdc8c
-	cYellow = "\033[38;5;179m" // --yellow #e3c873
-	cRed    = "\033[38;5;167m" // --red   #d8635b
-	cCode   = "\033[38;5;73m"  // inline code / code blocks — muted teal, not a box
-	cFgOff  = "\033[39m"       // reset foreground only (composes inside other styles)
+	cDim    = "\033[38;5;246m"      // --dim  #8c8c92
+	cFaint  = "\033[38;5;240m"      // --faint #54545a (labels, rules, muted)
+	cGreen  = "\033[38;5;114m"      // --green #6fdc8c
+	cYellow = "\033[38;5;179m"      // --yellow #e3c873
+	cRed    = "\033[38;5;167m"      // --red   #d8635b
+	cCode   = "\033[38;5;73m"       // inline code / code blocks — muted teal, not a box
+	cFgOff  = "\033[39m"            // reset foreground only (composes inside other styles)
+	cBandBg = "\033[48;2;45;60;50m" // gray-green fill for a submitted prompt band
 )
+
+// stripANSI removes SGR escape sequences, leaving visible text (UTF-8 intact).
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			j := i + 1
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			i = j + 1
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
 
 // runeWidth approximates the terminal column width of a rune: 0 for combining
 // marks / joiners / variation selectors, 2 for CJK-wide and emoji, else 1.

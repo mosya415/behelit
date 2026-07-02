@@ -62,6 +62,11 @@ cancel a line, Ctrl-D to exit). Typing `/` pops up a live menu of commands;
 Tab completes. It uses raw terminal mode on Linux only and falls back to a plain
 cooked read when stdin is not a terminal (pipes, one-shot) or off Linux.
 
+The input area is fenced by a hairline above and below, and a submitted prompt
+is redrawn as a full-width gray-green band — so past turns are easy to pick out
+as you scroll up. The session starts with the screen and scrollback cleared
+(`clearScreen`), so nothing above the banner is reachable.
+
 ### Endpoints
 
 Start with several endpoints and switch between them at runtime — useful on a

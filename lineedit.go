@@ -50,6 +50,8 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 	pos := 0
 	hist := len(e.history)
 
+	// top fence of the input area
+	e.out(cFaint + strings.Repeat("─", termWidth()) + cReset + "\r\n")
 	e.render(prompt, buf, pos)
 	for {
 		b, err := e.rd.ReadByte()
@@ -58,7 +60,7 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		}
 		switch b {
 		case '\r', '\n':
-			e.out("\r\033[J" + prompt + string(buf) + "\r\n")
+			e.submit(prompt, buf)
 			line := string(buf)
 			if s := strings.TrimSpace(line); s != "" && (len(e.history) == 0 || e.history[len(e.history)-1] != s) {
 				e.history = append(e.history, s)
@@ -176,6 +178,20 @@ func (e *LineEditor) readRune(first byte) rune {
 	}
 	r, _ := utf8.DecodeRune(bytes)
 	return r
+}
+
+// submit collapses the live input into the past-prompt presentation: the entered
+// text as a full-width gray-green band, closed by a hairline below (the top fence
+// was drawn when the prompt opened). An empty line just advances.
+func (e *LineEditor) submit(prompt string, buf []rune) {
+	if len(buf) == 0 {
+		e.out("\r\033[J" + prompt + "\r\n")
+		return
+	}
+	w := termWidth()
+	bar := cFaint + strings.Repeat("─", w) + cReset
+	band := cBandBg + padTo(stripANSI(prompt)+string(buf), w, 0) + cReset
+	e.out("\r\033[J" + band + "\r\n" + bar + "\r\n")
 }
 
 // render redraws the input line and, when the line is a "/command" prefix, a
