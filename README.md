@@ -80,10 +80,13 @@ contents, diffs), which is always shown verbatim. Hairline width follows
 
 On screen the model's prose is shown but the tool-call tags are hidden — the
 clean action markers (`· READ_FILE …`, `● APPROVAL REQUIRED …`) stand in for
-them. The hide/show decision reuses the same tag matcher as the parser, so what
-the screen hides is exactly what will execute. The full text (tags included) is
-still kept in the transcript and fed back to the model; `LCA_RAW=1` streams it
-verbatim for debugging a model's protocol adherence.
+them, each followed by a one-line outcome (`→ 2 lines`, `→ 3 matches`,
+`● edited sample.txt (1 replacement)`). Prose streams character-by-character;
+only a line that could be a tag (it opens with `<`) is briefly buffered to
+end-of-line to decide. The hide/show decision reuses the same tag matcher as the
+parser, so what the screen hides is exactly what will execute. The full text
+(tags included) is still kept in the transcript and fed back to the model;
+`LCA_RAW=1` streams it verbatim for debugging a model's protocol adherence.
 
 ## Design (the four non-trivial parts)
 

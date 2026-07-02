@@ -97,6 +97,12 @@ func toolLine(name, arg string) {
 	fmt.Printf(" %s%s %-9s%s %s\n", cFaint, gNone, strings.ToUpper(name), cReset, arg)
 }
 
+// toolInfo prints a faint informational outcome under a tool marker (read-only
+// tools: counts). toolOK / toolErr print an action outcome with a status glyph.
+func toolInfo(text string) { fmt.Printf("   %s→ %s%s\n", cFaint, text, cReset) }
+func toolOK(text string)   { fmt.Printf("   %s%s%s %s\n", cGreen, gUp, cReset, text) }
+func toolErr(text string)  { fmt.Printf("   %s%s%s %s\n", cRed, gDown, cReset, text) }
+
 func warn(format string, a ...any) string {
 	return cYellow + fmt.Sprintf(format, a...) + cReset
 }

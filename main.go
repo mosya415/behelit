@@ -296,10 +296,64 @@ func executeBlocks(jail *Jail, ap *Approver, rec *Recorder, blocks []Block) stri
 		default:
 			res = "error: unknown tool " + b.Name
 		}
+		printOutcome(b.Name, res)
 		fmt.Fprintf(&out, "<tool_result name=\"%s\" path=\"%s\">\n%s\n</tool_result>\n",
 			b.Name, b.Attr["path"], res)
 	}
 	return out.String()
+}
+
+// printOutcome shows a one-line result under a tool's marker: counts for the
+// read-only tools, a status glyph for the side-effecting ones.
+func printOutcome(name, res string) {
+	if strings.HasPrefix(res, "error:") {
+		toolErr(strings.TrimSpace(strings.TrimPrefix(res, "error:")))
+		return
+	}
+	switch name {
+	case "read_file":
+		n := lineCount(res) - 1 // minus the "path:" header line
+		if n < 0 {
+			n = 0
+		}
+		toolInfo(plural(n, "line", "lines"))
+	case "grep":
+		if res == "no matches" {
+			toolInfo("no matches")
+		} else {
+			toolInfo(plural(lineCount(res), "match", "matches"))
+		}
+	case "list_dir":
+		n := lineCount(res) - 1 // minus the header line
+		if n < 0 {
+			n = 0
+		}
+		toolInfo(plural(n, "entry", "entries"))
+	default: // edit / write / run_command
+		if strings.HasPrefix(res, "user denied") {
+			toolInfo("denied")
+		} else {
+			toolOK(summarize(res))
+		}
+	}
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// lineCount counts non-empty lines in a tool result (an at-a-glance hint).
+func lineCount(s string) int {
+	n := 0
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
@@ -313,7 +367,7 @@ func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this edit"
 	}
-	res, err := applyEdit(abs, b.Search, b.Replace)
+	res, err := applyEdit(abs, b.Attr["path"], b.Search, b.Replace)
 	if err != nil {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
 		return "error: " + err.Error()
@@ -338,7 +392,7 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this write"
 	}
-	res, err := writeWholeFile(abs, b.Body)
+	res, err := writeWholeFile(abs, b.Attr["path"], b.Body)
 	if err != nil {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
 		return "error: " + err.Error()

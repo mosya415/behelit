@@ -56,7 +56,7 @@ func TestApplyEdit_Strict(t *testing.T) {
 	f := filepath.Join(dir, "a.txt")
 	os.WriteFile(f, []byte("alpha\nbeta\ngamma\n"), 0o644)
 
-	if _, err := applyEdit(f, "beta", "BETA"); err != nil {
+	if _, err := applyEdit(f, "a.txt", "beta", "BETA"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	got, _ := os.ReadFile(f)
@@ -64,12 +64,12 @@ func TestApplyEdit_Strict(t *testing.T) {
 		t.Fatalf("bad result: %q", got)
 	}
 
-	if _, err := applyEdit(f, "nope", "x"); err == nil {
+	if _, err := applyEdit(f, "a.txt", "nope", "x"); err == nil {
 		t.Fatal("expected not-found error")
 	}
 
 	os.WriteFile(f, []byte("x\nx\n"), 0o644)
-	if _, err := applyEdit(f, "x", "y"); err == nil {
+	if _, err := applyEdit(f, "a.txt", "x", "y"); err == nil {
 		t.Fatal("expected ambiguous-match error")
 	}
 }
