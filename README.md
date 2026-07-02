@@ -46,6 +46,7 @@ are denied rather than run unattended.
 | `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
+| `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
 | `LCA_DISCOVER_CMD` | unset                      | External endpoint-discovery command for `/discover` (e.g. `modelstat --json`) |
 

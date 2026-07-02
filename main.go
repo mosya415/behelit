@@ -63,6 +63,9 @@ func main() {
 		return
 	}
 
+	if os.Getenv("LCA_NO_CLEAR") == "" {
+		clearScreen()
+	}
 	banner(cfg, jail, rec, ap, client, notes)
 
 	for {

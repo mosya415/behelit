@@ -58,6 +58,16 @@ func clampWidth(n int) int {
 	}
 }
 
+// clearScreen wipes the screen and scrollback and homes the cursor, so an
+// interactive session starts from the top instead of wherever the cursor was.
+// It emits nothing unless stdout is a real terminal (osTermWidth > 0), so piped
+// or redirected output is never polluted with escape codes.
+func clearScreen() {
+	if osTermWidth() > 0 {
+		fmt.Print("\033[3J\033[H\033[2J")
+	}
+}
+
 // hr prints a full-width hairline rule.
 func hr() {
 	fmt.Println(cFaint + strings.Repeat("─", termWidth()) + cReset)
