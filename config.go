@@ -20,6 +20,7 @@ type Config struct {
 	CtxTokens   int      // approximate token budget for the transcript sent to the model
 	Allowed     []string // command allowlist (matched against basename of argv[0])
 	Dir         string   // where the audit log and session transcripts are written
+	Raw         bool     // stream raw model text (show tool tags) — for protocol debugging
 }
 
 func env(key, def string) string {
@@ -47,6 +48,7 @@ func loadConfig() Config {
 		Temperature: 0.2,
 		MaxSteps:    25,
 		CtxTokens:   atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
+		Raw:         os.Getenv("LCA_RAW") != "",
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

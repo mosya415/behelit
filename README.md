@@ -43,6 +43,7 @@ are denied rather than run unattended.
 | `LCA_ALLOW`    | see below                      | Comma-separated command allowlist         |
 | `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
 | `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
+| `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -76,6 +77,13 @@ UPPERCASE labels. Status glyphs are shared everywhere: `●` ready/ok, `◐` par
 titles, status words) — never to data (paths, model ids, commands, file
 contents, diffs), which is always shown verbatim. Hairline width follows
 `$COLUMNS` (no ioctl/cgo), default 60.
+
+On screen the model's prose is shown but the tool-call tags are hidden — the
+clean action markers (`· READ_FILE …`, `● APPROVAL REQUIRED …`) stand in for
+them. The hide/show decision reuses the same tag matcher as the parser, so what
+the screen hides is exactly what will execute. The full text (tags included) is
+still kept in the transcript and fed back to the model; `LCA_RAW=1` streams it
+verbatim for debugging a model's protocol adherence.
 
 ## Design (the four non-trivial parts)
 
@@ -179,6 +187,7 @@ jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
 context.go    transcript trimming to a token budget (prefill control)
 ui.go         terminal styling: palette, hairlines, status glyphs, labels
+stream.go     prose filter: hide tool tags from the human view (kept in transcript)
 prompt.go     system prompt (kept in sync with protocol.go)
 agent_test.go tests for parser / edit / jail / tokenizer
 ```

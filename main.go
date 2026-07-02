@@ -53,7 +53,7 @@ func main() {
 		}
 		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 		msgs = append(msgs, Message{Role: "user", Content: prompt})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw)
 		rec.Transcript(msgs)
 		return
 	}
@@ -88,14 +88,11 @@ func main() {
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw)
 		rec.Transcript(msgs)
 	}
 }
 
-// runTurn drives the agentic loop for one user message: stream the model, execute
-// any tool blocks, feed results back, repeat until the model stops emitting
-// tools (a final answer) or we hit the step cap.
 // reconcileModel discovers what the endpoint actually serves and reconciles it
 // with the configured model name. If the configured name isn't served but the
 // endpoint offers exactly one model, we adopt it (the common vLLM/SGLang case:
@@ -239,26 +236,20 @@ func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
 	return true
 }
 
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int) {
+// runTurn drives the agentic loop for one user message: stream the model, execute
+// any tool blocks, feed results back, repeat until the model stops emitting
+// tools (a final answer) or we hit the step cap.
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw bool) {
 	for step := 0; step < maxSteps; step++ {
-		printed := false
-		onDelta := func(s string) {
-			if !printed {
-				fmt.Print("\n " + cBold + gUp + cReset + " ")
-				printed = true
-			}
-			fmt.Print(s)
-		}
+		pw := newProseWriter(raw)
 
 		send, trimmed := trimForContext(*msgs, ctxTokens)
 		if trimmed > 0 {
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
-		reply, err := client.CompleteStream(send, onDelta)
-		if printed {
-			fmt.Println()
-		}
+		reply, err := client.CompleteStream(send, pw.feed)
+		pw.end()
 		if err != nil {
 			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
 			rec.Event("error", map[string]any{"err": err.Error()})
