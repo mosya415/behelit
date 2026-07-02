@@ -46,8 +46,11 @@ see what the server actually serves and reconciles it with `LCA_MODEL`:
 - not served and several are offered → a warning; pick one with `/model <name>`
 - discovery unavailable (endpoint down or no `/models`) → configured name used as-is
 
-`/model` lists served models (current marked); `/model <name>` switches for
-later turns. Adoptions and switches are written to the audit log
+`/model` lists served models with status — a green `●` (served/ready), a cyan
+`→` on the current selection, and each model's context window and backend
+(`ctx 32768, vllm`) when the server reports `max_model_len` / `owned_by`.
+`/model <name>` switches for later turns. The startup banner shows the same
+status for the active model. Adoptions and switches are written to the audit log
 (`model_adopt` / `model_change`).
 
 ## Design (the four non-trivial parts)

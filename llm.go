@@ -43,9 +43,20 @@ func (c *Client) Model() string     { return c.model }
 func (c *Client) SetModel(m string) { c.model = m }
 func (c *Client) Endpoint() string  { return c.baseURL }
 
+// ModelInfo is what we surface about a served model. Fields beyond ID are
+// best-effort: vLLM populates owned_by and max_model_len; leaner servers (e.g.
+// SGLang) may omit them, in which case they read as empty/0 and are hidden.
+type ModelInfo struct {
+	ID      string
+	OwnedBy string
+	MaxLen  int // context window (max_model_len), 0 if unknown
+}
+
 type modelsResponse struct {
 	Data []struct {
-		ID string `json:"id"`
+		ID          string `json:"id"`
+		OwnedBy     string `json:"owned_by"`
+		MaxModelLen int    `json:"max_model_len"`
 	} `json:"data"`
 }
 
@@ -53,7 +64,7 @@ type modelsResponse struct {
 // server actually serves. Short timeout so a hung or absent endpoint never
 // blocks startup. Not every server implements it — callers treat an error as
 // "discovery unavailable", not fatal.
-func (c *Client) ListModels() ([]string, error) {
+func (c *Client) ListModels() ([]ModelInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -81,13 +92,13 @@ func (c *Client) ListModels() ([]string, error) {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("bad /models json: %w", err)
 	}
-	ids := make([]string, 0, len(out.Data))
+	infos := make([]ModelInfo, 0, len(out.Data))
 	for _, m := range out.Data {
 		if m.ID != "" {
-			ids = append(ids, m.ID)
+			infos = append(infos, ModelInfo{ID: m.ID, OwnedBy: m.OwnedBy, MaxLen: m.MaxModelLen})
 		}
 	}
-	return ids, nil
+	return infos, nil
 }
 
 type chatRequest struct {

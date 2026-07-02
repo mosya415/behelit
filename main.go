@@ -76,30 +76,33 @@ func main() {
 // with the configured model name. If the configured name isn't served but the
 // endpoint offers exactly one model, we adopt it (the common vLLM/SGLang case:
 // one model per endpoint, whose id rarely matches a hand-typed guess). Returns
-// human-readable notes for the banner; never fatal.
+// pre-colored display lines for the banner; never fatal.
 func reconcileModel(client *Client, rec *Recorder) []string {
 	models, err := client.ListModels()
 	if err != nil {
-		return []string{fmt.Sprintf("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
+		return []string{warnln("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
 	}
 	if len(models) == 0 {
-		return []string{"endpoint advertises no models — using configured name as-is"}
+		return []string{warnln("endpoint advertises no models — using configured name as-is")}
 	}
-	if contains(models, client.Model()) {
-		return nil
+	if info, ok := findModel(models, client.Model()); ok {
+		return []string{readyLine(info)}
 	}
 	if len(models) == 1 {
 		prev := client.Model()
-		client.SetModel(models[0])
-		rec.Event("model_adopt", map[string]any{"from": prev, "to": models[0]})
-		return []string{fmt.Sprintf("configured %q not served; adopted the only served model %q", prev, models[0])}
+		client.SetModel(models[0].ID)
+		rec.Event("model_adopt", map[string]any{"from": prev, "to": models[0].ID})
+		return []string{
+			readyLine(models[0]),
+			dimln("adopted (configured %q not served)", prev),
+		}
 	}
-	return []string{fmt.Sprintf("configured %q not served; choose one with /model (served: %s)",
-		client.Model(), strings.Join(models, ", "))}
+	lines := []string{warnln("configured %q not served; choose one with /model:", client.Model())}
+	return append(lines, modelTable(models, client.Model())...)
 }
 
 // handleModelCmd processes the /model REPL command. "/model" lists served models
-// (current marked); "/model <name>" switches for subsequent turns.
+// with their status; "/model <name>" switches for subsequent turns.
 func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 	if line != "/model" && !strings.HasPrefix(line, "/model ") {
 		return false
@@ -111,17 +114,13 @@ func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 		fmt.Printf("current model: %s @ %s\n", client.Model(), client.Endpoint())
 		switch {
 		case err != nil:
-			fmt.Printf("  (discovery unavailable: %v)\n", err)
+			fmt.Printf("  \033[33mdiscovery unavailable: %v\033[0m\n", err)
 		case len(models) == 0:
 			fmt.Println("  (endpoint advertises no models)")
 		default:
 			fmt.Println("served models:")
-			for _, m := range models {
-				mark := "  "
-				if m == client.Model() {
-					mark = "* "
-				}
-				fmt.Printf("  %s%s\n", mark, m)
+			for _, l := range modelTable(models, client.Model()) {
+				fmt.Println(l)
 			}
 		}
 		return true
@@ -131,19 +130,69 @@ func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 	client.SetModel(arg)
 	rec.Event("model_change", map[string]any{"from": prev, "to": arg})
 	fmt.Printf("model: %s → %s\n", prev, arg)
-	if err == nil && len(models) > 0 && !contains(models, arg) {
-		fmt.Printf("\033[33m  warning: %q is not in the endpoint's served list\033[0m\n", arg)
+	if err == nil && len(models) > 0 {
+		if _, ok := findModel(models, arg); !ok {
+			fmt.Printf("\033[33m  warning: %q is not in the endpoint's served list\033[0m\n", arg)
+		}
 	}
 	return true
 }
 
-func contains(xs []string, v string) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
+func findModel(ms []ModelInfo, id string) (ModelInfo, bool) {
+	for _, m := range ms {
+		if m.ID == id {
+			return m, true
 		}
 	}
-	return false
+	return ModelInfo{}, false
+}
+
+// describeModel renders the status detail of a served model (context window,
+// backend). Empty when the server exposes neither.
+func describeModel(m ModelInfo) string {
+	var bits []string
+	if m.MaxLen > 0 {
+		bits = append(bits, fmt.Sprintf("ctx %d", m.MaxLen))
+	}
+	if m.OwnedBy != "" {
+		bits = append(bits, m.OwnedBy)
+	}
+	return strings.Join(bits, ", ")
+}
+
+// modelTable renders one status line per served model: a green ● means served/
+// ready, a cyan → marks the current selection, followed by its detail.
+func modelTable(ms []ModelInfo, current string) []string {
+	lines := make([]string, 0, len(ms))
+	for _, m := range ms {
+		mark := " "
+		if m.ID == current {
+			mark = "\033[36m→\033[0m"
+		}
+		line := fmt.Sprintf("  \033[32m●\033[0m %s %s", mark, m.ID)
+		if d := describeModel(m); d != "" {
+			line += "  \033[90m" + d + "\033[0m"
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// readyLine is the banner status for the active model.
+func readyLine(m ModelInfo) string {
+	s := "\033[32m● ready\033[0m"
+	if d := describeModel(m); d != "" {
+		s += " \033[90m— " + d + "\033[0m"
+	}
+	return s
+}
+
+func warnln(format string, a ...any) string {
+	return "\033[33m" + fmt.Sprintf(format, a...) + "\033[0m"
+}
+
+func dimln(format string, a ...any) string {
+	return "\033[90m" + fmt.Sprintf(format, a...) + "\033[0m"
 }
 
 // handleApproveCmd processes the /approve REPL command (on|off|status). Returns
@@ -301,7 +350,7 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	fmt.Printf("  jail:    %s\n", jail.Root)
 	fmt.Printf("  model:   %s @ %s\n", client.Model(), cfg.BaseURL)
 	for _, n := range notes {
-		fmt.Printf("           \033[33m%s\033[0m\n", n)
+		fmt.Printf("           %s\n", n)
 	}
 	fmt.Printf("  audit:   %s\n", cfg.Dir)
 	fmt.Printf("  log:     %s\n", rec.SessionPath())
