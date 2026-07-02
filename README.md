@@ -36,7 +36,8 @@ are denied rather than run unattended.
 
 | Var            | Default                        | Meaning                                   |
 | -------------- | ------------------------------ | ----------------------------------------- |
-| `LCA_BASE_URL` | `http://localhost:8000/v1`     | OpenAI-compatible endpoint (vLLM/SGLang)  |
+| `LCA_BASE_URL` | `http://localhost:8000/v1`     | Current OpenAI-compatible endpoint (vLLM/SGLang) |
+| `LCA_ENDPOINTS`| unset                          | Extra endpoints (comma-separated) for `/endpoint` switching |
 | `LCA_MODEL`    | `local`                        | Model name as served                      |
 | `LCA_API_KEY`  | `sk-noauth`                    | Optional bearer token                     |
 | `LCA_ROOT`     | current dir                    | Jail root                                 |
@@ -47,7 +48,23 @@ are denied rather than run unattended.
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
-REPL commands: `/model [name]`, `/approve [on|off|status]`, `/reset`, `/exit`.
+REPL commands: `/model [name]`, `/endpoint [n|url]`, `/approve [on|off|run|edit|status]`, `/reset`, `/exit`.
+
+### Endpoints
+
+Start with several endpoints and switch between them at runtime — useful on a
+cluster where nodes come and go:
+
+```sh
+LCA_BASE_URL=http://node1:8000/v1 LCA_ENDPOINTS=http://node2:8000/v1,http://node3:8000/v1 ./lca
+```
+
+`/endpoint` lists the known endpoints (current marked); `/endpoint <n>` switches
+by list index and `/endpoint <url>` switches to any address (added to the list)
+— handy when a SLURM allocation hands out a fresh `host:port`. A bare `host:port`
+gets `http://` prepended. Switching re-runs model discovery on the new endpoint,
+so the model is re-adopted/validated there. Switches are audited
+(`endpoint_change`).
 
 ### Model selection
 

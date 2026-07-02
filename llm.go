@@ -22,21 +22,45 @@ type Message struct {
 
 // Client is a tiny OpenAI-compatible chat-completions client. stdlib only.
 type Client struct {
-	http    *http.Client
-	baseURL string
-	model   string
-	apiKey  string
-	temp    float64
+	http      *http.Client
+	baseURL   string
+	endpoints []string // known endpoints, for /endpoint switching
+	model     string
+	apiKey    string
+	temp      float64
 }
 
 func NewClient(cfg Config) *Client {
-	return &Client{
-		http:    &http.Client{Timeout: 10 * time.Minute},
-		baseURL: cfg.BaseURL,
-		model:   cfg.Model,
-		apiKey:  cfg.APIKey,
-		temp:    cfg.Temperature,
+	eps := cfg.Endpoints
+	if len(eps) == 0 {
+		eps = []string{cfg.BaseURL}
 	}
+	return &Client{
+		http:      &http.Client{Timeout: 10 * time.Minute},
+		baseURL:   cfg.BaseURL,
+		endpoints: eps,
+		model:     cfg.Model,
+		apiKey:    cfg.APIKey,
+		temp:      cfg.Temperature,
+	}
+}
+
+func (c *Client) Endpoints() []string { return c.endpoints }
+
+// SetEndpoint switches the active endpoint (trailing slash trimmed, http://
+// prepended when no scheme is given) and remembers it in the known list.
+func (c *Client) SetEndpoint(u string) {
+	u = strings.TrimRight(u, "/")
+	if !strings.Contains(u, "://") {
+		u = "http://" + u
+	}
+	c.baseURL = u
+	for _, e := range c.endpoints {
+		if e == u {
+			return
+		}
+	}
+	c.endpoints = append(c.endpoints, u)
 }
 
 func (c *Client) Model() string     { return c.model }

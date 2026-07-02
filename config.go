@@ -12,7 +12,8 @@ import (
 // comes from the process (uid/gid of whoever ran the binary).
 type Config struct {
 	Root        string   // realpath jail root; nothing may be touched outside it
-	BaseURL     string   // OpenAI-compatible endpoint, e.g. http://localhost:8000/v1
+	BaseURL     string   // current OpenAI-compatible endpoint, e.g. http://localhost:8000/v1
+	Endpoints   []string // known endpoints (BaseURL + LCA_ENDPOINTS), for /endpoint switching
 	Model       string   // model name as served by vLLM/SGLang
 	APIKey      string   // optional; most local servers accept any token
 	Temperature float64  // low by default for deterministic tool use
@@ -57,7 +58,23 @@ func loadConfig() Config {
 	if v := os.Getenv("LCA_ALLOW"); v != "" {
 		cfg.Allowed = splitFields(v)
 	}
+
+	// Known endpoints: the current BaseURL first, then any from LCA_ENDPOINTS
+	// (comma-separated), deduped and trailing-slash-trimmed.
+	cfg.Endpoints = []string{cfg.BaseURL}
+	for _, e := range splitFields(os.Getenv("LCA_ENDPOINTS")) {
+		cfg.Endpoints = appendUnique(cfg.Endpoints, strings.TrimRight(e, "/"))
+	}
 	return cfg
+}
+
+func appendUnique(xs []string, v string) []string {
+	for _, x := range xs {
+		if x == v {
+			return xs
+		}
+	}
+	return append(xs, v)
 }
 
 func atoiDefault(s string, def int) int {

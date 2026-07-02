@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"strconv"
 	"strings"
 )
 
@@ -85,6 +86,9 @@ func main() {
 		if handleModelCmd(line, client, rec) {
 			continue
 		}
+		if handleEndpointCmd(line, client, rec) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
@@ -157,6 +161,68 @@ func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 		}
 	}
 	return true
+}
+
+// handleEndpointCmd processes the /endpoint (alias /ep) REPL command.
+// "/endpoint" lists known endpoints (current marked); "/endpoint <n|url>"
+// switches — by list index, or to any URL (handy when a SLURM allocation hands
+// out a fresh host:port). After switching it re-discovers models there.
+func handleEndpointCmd(line string, client *Client, rec *Recorder) bool {
+	arg, ok := commandArg(line, "/endpoint", "/ep")
+	if !ok {
+		return false
+	}
+	eps := client.Endpoints()
+
+	if arg == "" {
+		eyebrow("endpoints")
+		for i, e := range eps {
+			mark := " "
+			extra := ""
+			if e == client.Endpoint() {
+				mark = cBold + "→" + cReset
+				extra = "  " + faint("(%s)", client.Model())
+			}
+			fmt.Printf("  %s %d  %s%s\n", mark, i+1, e, extra)
+		}
+		fmt.Println("  " + faint("switch: /endpoint <n|url>"))
+		return true
+	}
+
+	target := arg
+	if n, err := strconv.Atoi(arg); err == nil {
+		if n < 1 || n > len(eps) {
+			fmt.Println("  " + warn("no endpoint #%d (have %d)", n, len(eps)))
+			return true
+		}
+		target = eps[n-1]
+	}
+
+	prev := client.Endpoint()
+	client.SetEndpoint(target)
+	rec.Event("endpoint_change", map[string]any{"from": prev, "to": client.Endpoint()})
+	fmt.Printf("  %sENDPOINT%s %s → %s\n", cFaint, cReset, prev, client.Endpoint())
+
+	// re-discover what the new endpoint serves and reconcile the model
+	for _, n := range reconcileModel(client, rec) {
+		fmt.Println("  " + n)
+	}
+	return true
+}
+
+// commandArg matches a slash command (or its aliases) and returns its trimmed
+// argument. It requires either an exact match or a space-separated argument, so
+// "/endpoints" does not match "/endpoint".
+func commandArg(line string, names ...string) (string, bool) {
+	for _, name := range names {
+		if line == name {
+			return "", true
+		}
+		if strings.HasPrefix(line, name+" ") {
+			return strings.TrimSpace(line[len(name):]), true
+		}
+	}
+	return "", false
 }
 
 func findModel(ms []ModelInfo, id string) (ModelInfo, bool) {
@@ -445,7 +511,11 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 
 	kv("user", who)
 	kv("jail", jail.Root)
-	kv("model", client.Model()+"  "+faint("@ %s", cfg.BaseURL))
+	endpointNote := ""
+	if len(client.Endpoints()) > 1 {
+		endpointNote = faint("  (+%d more — /endpoint)", len(client.Endpoints())-1)
+	}
+	kv("model", client.Model()+"  "+faint("@ %s", client.Endpoint())+endpointNote)
 	for _, n := range notes {
 		contValue(n)
 	}
@@ -453,5 +523,5 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	kv("log", rec.SessionPath())
 	kv("approve", strings.ToUpper(ap.Mode()))
 	hr()
-	fmt.Println(" " + faint("/model [name]   /approve [on|off|run|edit|status]   /reset   /exit"))
+	fmt.Println(" " + faint("/model [name]   /endpoint [n|url]   /approve [on|off|run|edit|status]   /reset   /exit"))
 }
