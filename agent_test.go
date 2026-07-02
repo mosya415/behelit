@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +102,45 @@ func TestJail_SymlinkEscape(t *testing.T) {
 	j, _ := NewJail(root, nil)
 	if _, err := j.Resolve("link/secret"); err == nil {
 		t.Fatal("symlink escape should be rejected")
+	}
+}
+
+func TestTrimForContext(t *testing.T) {
+	big := strings.Repeat("x", 4000) // ~1k tokens each
+	msgs := []Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "do the thing"},
+		{Role: "assistant", Content: "reading"},
+		{Role: "user", Content: "<tool_result name=\"read_file\">\n" + big + "\n</tool_result>"},
+		{Role: "assistant", Content: "reading more"},
+		{Role: "user", Content: "<tool_result name=\"read_file\">\n" + big + "\n</tool_result>"},
+		{Role: "assistant", Content: "now editing"},
+		{Role: "user", Content: "<tool_result name=\"edit\">ok</tool_result>"},
+		{Role: "assistant", Content: "done step"},
+		{Role: "user", Content: "keep going"},
+	}
+
+	out, trimmed := trimForContext(msgs, 500) // force trimming
+	if trimmed == 0 {
+		t.Fatal("expected some messages to be collapsed")
+	}
+	// system prompt and the user's real instruction must survive verbatim
+	if out[0].Content != "sys" || out[1].Content != "do the thing" {
+		t.Fatal("system/user instruction must not be trimmed")
+	}
+	// the oldest large tool_result should be the stub
+	if out[3].Content != trimStub {
+		t.Fatalf("oldest tool_result not collapsed: %q", out[3].Content)
+	}
+	// the original slice must be untouched (disk transcript stays complete)
+	if msgs[3].Content == trimStub {
+		t.Fatal("trimForContext must not mutate the input slice")
+	}
+
+	// under budget → returned unchanged
+	small := []Message{{Role: "user", Content: "hi"}}
+	if _, n := trimForContext(small, 24000); n != 0 {
+		t.Fatalf("small transcript should not be trimmed, got %d", n)
 	}
 }
 

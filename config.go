@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -16,6 +17,7 @@ type Config struct {
 	APIKey      string   // optional; most local servers accept any token
 	Temperature float64  // low by default for deterministic tool use
 	MaxSteps    int      // safety cap on tool-call iterations per user turn
+	CtxTokens   int      // approximate token budget for the transcript sent to the model
 	Allowed     []string // command allowlist (matched against basename of argv[0])
 	Dir         string   // where the audit log and session transcripts are written
 }
@@ -44,6 +46,7 @@ func loadConfig() Config {
 		APIKey:      env("LCA_API_KEY", "sk-noauth"),
 		Temperature: 0.2,
 		MaxSteps:    25,
+		CtxTokens:   atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",
@@ -53,6 +56,17 @@ func loadConfig() Config {
 		cfg.Allowed = splitFields(v)
 	}
 	return cfg
+}
+
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func splitFields(s string) []string {

@@ -28,6 +28,7 @@ confined to it.
 | `LCA_ROOT`     | current dir                    | Jail root                                 |
 | `LCA_ALLOW`    | see below                      | Comma-separated command allowlist         |
 | `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
+| `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -45,9 +46,13 @@ REPL commands: `/reset` (clear transcript), `/exit`.
    regenerates — never a silent fuzzy pick. `<write>` for whole small files. No
    unified diff (it drifts on quantized weights).
 
-3. **Context — `tools.go` + `main.go`.** The repo is never dumped into the
-   prompt. The model pulls what it needs via auto-running `read_file`/`grep`; a
-   running message transcript is kept to avoid prefill blow-up.
+3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the
+   prompt. The model pulls what it needs via auto-running `read_file`/`grep`. The
+   full transcript is kept on disk for audit, but the copy *sent* to the model is
+   trimmed to an approximate token budget (`LCA_CTX_TOKENS`): the oldest
+   `tool_result` outputs are collapsed to a stub first (the model already
+   extracted what it needed), while user instructions and the assistant's own
+   reasoning are preserved. Keeps prefill bounded across long sessions.
 
 4. **Scope as defense-in-depth — `jail.go` + `approval.go`.** A realpath jail
    (symlink-resolved, prefix-checked) confines every path to the root, and
@@ -117,7 +122,8 @@ protocol.go   line-anchored tag parser (tool-call transport)
 tools.go      read_file, grep, run_command (no-shell exec)
 edit.go       strict search/replace + whole-file write
 jail.go       realpath jail + command allowlist
-approval.go   soft approval gate
+approval.go   soft approval gate + session approve-all mode
+context.go    transcript trimming to a token budget (prefill control)
 prompt.go     system prompt (kept in sync with protocol.go)
 agent_test.go tests for parser / edit / jail / tokenizer
 ```

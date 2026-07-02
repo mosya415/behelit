@@ -60,7 +60,7 @@ func main() {
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens)
 		rec.Transcript(msgs)
 	}
 }
@@ -92,7 +92,7 @@ func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
 	return true
 }
 
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps int) {
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int) {
 	for step := 0; step < maxSteps; step++ {
 		printed := false
 		onDelta := func(s string) {
@@ -102,7 +102,13 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			}
 			fmt.Print(s)
 		}
-		reply, err := client.CompleteStream(*msgs, onDelta)
+
+		send, trimmed := trimForContext(*msgs, ctxTokens)
+		if trimmed > 0 {
+			fmt.Printf("\033[90m context: trimmed %d old tool outputs (~%dk tok budget)\033[0m\n", trimmed, ctxTokens/1000)
+			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
+		}
+		reply, err := client.CompleteStream(send, onDelta)
 		if printed {
 			fmt.Println()
 		}
