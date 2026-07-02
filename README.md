@@ -27,6 +27,7 @@ confined to it.
 | `LCA_API_KEY`  | `sk-noauth`                    | Optional bearer token                     |
 | `LCA_ROOT`     | current dir                    | Jail root                                 |
 | `LCA_ALLOW`    | see below                      | Comma-separated command allowlist         |
+| `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -56,6 +57,20 @@ REPL commands: `/reset` (clear transcript), `/exit`.
 
 `read_file`/`grep` run automatically (no side effects). `edit`/`write`/
 `run_command` require an explicit `y` at the prompt.
+
+## Audit & transcript — `recorder.go`
+
+Both artifacts live under `$LCA_DIR` (default `~/.lca`), created `0600` under the
+invoking user's own uid — the audit trail is per-user for free, no extra plumbing.
+
+- `audit.jsonl` — append-only, one JSON event per line (timestamp, uid, user,
+  pid, session, kind + fields). Records every tool call, whether it was approved,
+  and the outcome. Never rewritten.
+- `transcripts/<session>.json` — the full running message list, rewritten after
+  every turn so a crashed or killed session stays reviewable.
+
+Replies stream token-by-token over SSE; streaming is a UX layer only — the
+tool-call parser sees the fully assembled text, so it cannot affect correctness.
 
 ## Protocol reference
 
