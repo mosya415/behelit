@@ -23,7 +23,63 @@ const (
 	cGreen  = "\033[38;5;114m" // --green #6fdc8c
 	cYellow = "\033[38;5;179m" // --yellow #e3c873
 	cRed    = "\033[38;5;167m" // --red   #d8635b
+	cCode   = "\033[38;5;73m"  // inline code / code blocks — muted teal, not a box
+	cFgOff  = "\033[39m"       // reset foreground only (composes inside other styles)
 )
+
+// runeWidth approximates the terminal column width of a rune: 0 for combining
+// marks / joiners / variation selectors, 2 for CJK-wide and emoji, else 1.
+func runeWidth(r rune) int {
+	switch {
+	case r == 0x200D || r == 0xFE0F || r == 0x2060 || (r >= 0x0300 && r <= 0x036F):
+		return 0
+	case (r >= 0x1100 && r <= 0x115F), (r >= 0x2E80 && r <= 0xA4CF),
+		(r >= 0xAC00 && r <= 0xD7A3), (r >= 0xF900 && r <= 0xFAFF),
+		(r >= 0xFE30 && r <= 0xFE4F), (r >= 0xFF00 && r <= 0xFF60),
+		(r >= 0x1F000 && r <= 0x1FAFF), (r >= 0x2600 && r <= 0x27BF),
+		(r >= 0x2B00 && r <= 0x2BFF):
+		return 2
+	default:
+		return 1
+	}
+}
+
+// visibleWidth is the printed width of s, skipping ANSI SGR escapes.
+func visibleWidth(s string) int {
+	w := 0
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b { // ESC — skip a CSI sequence up to its final byte
+			j := i + 1
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			i = j + 1
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		w += runeWidth(r)
+		i += size
+	}
+	return w
+}
+
+// padTo pads s (measured by visible width) to width columns. align: 0 left, 1
+// right, 2 center.
+func padTo(s string, width, align int) string {
+	pad := width - visibleWidth(s)
+	if pad <= 0 {
+		return s
+	}
+	switch align {
+	case 1:
+		return strings.Repeat(" ", pad) + s
+	case 2:
+		l := pad / 2
+		return strings.Repeat(" ", l) + s + strings.Repeat(" ", pad-l)
+	default:
+		return s + strings.Repeat(" ", pad)
+	}
+}
 
 // Status glyphs, shared across the whole UI.
 const (

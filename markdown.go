@@ -64,7 +64,7 @@ func renderInline(s string) string {
 	var b strings.Builder
 	for i, seg := range parts {
 		if i%2 == 1 {
-			b.WriteString("\033[7m" + seg + "\033[27m") // reverse video = inline code
+			b.WriteString(cCode + seg + cFgOff) // inline code = muted teal, no box
 		} else {
 			b.WriteString(inlineEmph(seg))
 		}
@@ -77,6 +77,135 @@ func inlineEmph(s string) string {
 	s = reBold.ReplaceAllString(s, "\033[1m$1\033[22m")   // **bold**
 	s = reItalic.ReplaceAllString(s, "\033[3m$1\033[23m") // *italic*
 	return s
+}
+
+// --- Tables ---------------------------------------------------------------
+//
+// A pipe table is a header row, a separator row (dashes/colons), then data rows.
+// We render it as aligned columns with a hairline under the header — no vertical
+// bars, monochrome.
+
+func isTableRow(t string) bool {
+	return strings.Contains(t, "|") && (strings.HasPrefix(t, "|") || strings.Count(t, "|") >= 2)
+}
+
+func isTableSeparator(t string) bool {
+	cells := parseCells(t)
+	if len(cells) == 0 {
+		return false
+	}
+	for _, c := range cells {
+		if c == "" {
+			return false
+		}
+		for _, r := range c {
+			if r != '-' && r != ':' && r != ' ' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseCells(row string) []string {
+	row = strings.TrimSpace(row)
+	row = strings.TrimPrefix(row, "|")
+	row = strings.TrimSuffix(row, "|")
+	parts := strings.Split(row, "|")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+
+func parseAligns(sep string) []int { // 0 left, 1 right, 2 center
+	cells := parseCells(sep)
+	a := make([]int, len(cells))
+	for i, c := range cells {
+		l, r := strings.HasPrefix(c, ":"), strings.HasSuffix(c, ":")
+		switch {
+		case l && r:
+			a[i] = 2
+		case r:
+			a[i] = 1
+		}
+	}
+	return a
+}
+
+// renderMarkdownTable renders buffered table rows into aligned display lines. If
+// the block is not actually a table (no separator row), each line is rendered as
+// ordinary Markdown instead.
+func renderMarkdownTable(rows []string) []string {
+	if len(rows) < 2 || !isTableSeparator(rows[1]) {
+		out := make([]string, len(rows))
+		for i, r := range rows {
+			out[i] = renderMarkdownLine(r)
+		}
+		return out
+	}
+
+	header := parseCells(rows[0])
+	aligns := parseAligns(rows[1])
+	var data [][]string
+	for _, r := range rows[2:] {
+		data = append(data, parseCells(r))
+	}
+
+	ncols := len(header)
+	for _, d := range data {
+		if len(d) > ncols {
+			ncols = len(d)
+		}
+	}
+
+	cell := func(cells []string, j int) string {
+		if j < len(cells) {
+			return renderInline(cells[j])
+		}
+		return ""
+	}
+	align := func(j int) int {
+		if j < len(aligns) {
+			return aligns[j]
+		}
+		return 0
+	}
+
+	width := make([]int, ncols)
+	rHeader := make([]string, ncols)
+	for j := 0; j < ncols; j++ {
+		rHeader[j] = cell(header, j)
+		width[j] = visibleWidth(rHeader[j])
+	}
+	rData := make([][]string, len(data))
+	for i, d := range data {
+		rData[i] = make([]string, ncols)
+		for j := 0; j < ncols; j++ {
+			rData[i][j] = cell(d, j)
+			if w := visibleWidth(rData[i][j]); w > width[j] {
+				width[j] = w
+			}
+		}
+	}
+
+	var out []string
+	hc := make([]string, ncols)
+	total := 0
+	for j := 0; j < ncols; j++ {
+		hc[j] = "\033[1m" + padTo(rHeader[j], width[j], align(j)) + "\033[22m"
+		total += width[j]
+	}
+	total += 2 * (ncols - 1)
+	out = append(out, strings.Join(hc, "  "))
+	out = append(out, cFaint+strings.Repeat("─", total)+cReset)
+	for _, d := range rData {
+		for j := 0; j < ncols; j++ {
+			d[j] = padTo(d[j], width[j], align(j))
+		}
+		out = append(out, strings.Join(d, "  "))
+	}
+	return out
 }
 
 func renderMathSpans(s string) string {

@@ -31,7 +31,8 @@ type proseWriter struct {
 	started        bool // the assistant bullet has been printed at least once
 	pendingNewline bool // a line was printed; emit the separator before the next
 
-	line strings.Builder // current line buffer (until newline)
+	line  strings.Builder // current line buffer (until newline)
+	table []string        // buffered consecutive table rows (rendered on flush)
 }
 
 func newProseWriter(raw bool) *proseWriter { return &proseWriter{raw: raw} }
@@ -68,6 +69,7 @@ func (p *proseWriter) end() {
 		p.flushLine(p.line.String())
 		p.line.Reset()
 	}
+	p.flushTable()
 	if p.started {
 		p.out("\n")
 	}
@@ -95,18 +97,37 @@ func (p *proseWriter) flushLine(raw string) {
 
 	// (2) fenced code blocks: toggle on ``` / ~~~, print inner lines verbatim.
 	if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+		p.flushTable()
 		p.fence = !p.fence
 		return
 	}
 	if p.fence {
-		p.printLine(cFaint + "│ " + cReset + line)
+		p.printLine(cFaint + "│ " + cReset + cCode + line + cFgOff)
 		return
 	}
+
+	// (3) pipe tables: buffer consecutive rows, render aligned when the run ends.
+	if isTableRow(trimmed) {
+		p.table = append(p.table, line)
+		return
+	}
+	p.flushTable()
 
 	if trimmed == "" {
 		return // drop blank lines to keep the view tight
 	}
 	p.printLine(renderMarkdownLine(line))
+}
+
+func (p *proseWriter) flushTable() {
+	if len(p.table) == 0 {
+		return
+	}
+	rows := p.table
+	p.table = nil
+	for _, l := range renderMarkdownTable(rows) {
+		p.printLine(l)
+	}
 }
 
 // printLine emits one display line through the assistant gutter: the bullet for

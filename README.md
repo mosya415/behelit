@@ -134,10 +134,12 @@ parser, so what the screen hides is exactly what will execute. The full text
 ## Markdown & math rendering — `markdown.go`, `math.go`
 
 The model's prose is rendered as Markdown in the monochrome style: headings and
-`**bold**` in bold, `*italic*` in italic, `` `inline code` `` as reverse video,
-`-`/`1.` lists with a `•` bullet, `>` quotes with a faint bar, and fenced
-` ``` ` code blocks printed verbatim behind a `│` gutter. Emphasis is limited to
-`*`/`**` (underscores stay literal, since they are common in code identifiers).
+`**bold**` in bold, `*italic*` in italic, `` `inline code` `` in a muted teal
+(no box), `-`/`1.` lists with a `•` bullet, `>` quotes with a faint bar, fenced
+` ``` ` code blocks behind a `│` gutter, and pipe tables rendered as aligned
+columns with a hairline under the header (emoji width is accounted for).
+Emphasis is limited to `*`/`**` (underscores stay literal, since they are common
+in code identifiers).
 
 Inline math in `$…$` / `$$…$$` is approximated in Unicode (`math.go`): Greek
 letters, operators, super/subscripts, roots and simple fractions —
