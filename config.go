@@ -22,6 +22,7 @@ type Config struct {
 	Allowed     []string // command allowlist (matched against basename of argv[0])
 	Dir         string   // where the audit log and session transcripts are written
 	Raw         bool     // stream raw model text (show tool tags) — for protocol debugging
+	Discover    bool     // query /models to adopt/validate the model (off = trust configured name)
 }
 
 func env(key, def string) string {
@@ -50,6 +51,7 @@ func loadConfig() Config {
 		MaxSteps:    25,
 		CtxTokens:   atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
 		Raw:         os.Getenv("LCA_RAW") != "",
+		Discover:    os.Getenv("LCA_DISCOVER") != "",
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

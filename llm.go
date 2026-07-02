@@ -128,6 +128,39 @@ func (c *Client) ProbeModels(baseURL string) ([]ModelInfo, error) {
 	return infos, nil
 }
 
+// ProbeHealth checks whether an endpoint is reachable, independent of the model
+// router: ANY HTTP response (even 404) counts as up — only a transport error is
+// down. Models are returned when /models happens to answer 200, otherwise nil.
+func (c *Client) ProbeHealth(baseURL string) (up bool, models []ModelInfo) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
+	if err != nil {
+		return false, nil
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, nil // transport error → down
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return true, nil // reachable, but no usable model list
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var out modelsResponse
+	if json.Unmarshal(raw, &out) == nil {
+		for _, m := range out.Data {
+			if m.ID != "" {
+				models = append(models, ModelInfo{ID: m.ID, OwnedBy: m.OwnedBy, MaxLen: m.MaxModelLen})
+			}
+		}
+	}
+	return true, models
+}
+
 type chatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
@@ -234,7 +267,11 @@ func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, e
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("endpoint returned %d: %s", resp.StatusCode, truncate(string(raw), 500))
+		msg := fmt.Sprintf("endpoint returned %d: %s", resp.StatusCode, truncate(string(raw), 500))
+		if resp.StatusCode == http.StatusNotFound {
+			msg += "  (check the endpoint URL includes the right base path, e.g. .../v1)"
+		}
+		return "", fmt.Errorf("%s", msg)
 	}
 
 	reader := bufio.NewReader(resp.Body)

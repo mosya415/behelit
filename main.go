@@ -39,7 +39,10 @@ func main() {
 		ap.TrustAll()
 	}
 
-	notes := reconcileModel(client, rec)
+	var notes []string
+	if cfg.Discover {
+		notes = reconcileModel(client, rec)
+	}
 	rec.Event("session_start", map[string]any{
 		"root": jail.Root, "model": client.Model(), "endpoint": cfg.BaseURL,
 	})
@@ -84,10 +87,10 @@ func main() {
 		if handleApproveCmd(line, ap, rec) {
 			continue
 		}
-		if handleModelCmd(line, client, rec) {
+		if handleModelCmd(line, client, rec, cfg.Discover) {
 			continue
 		}
-		if handleEndpointCmd(line, client, rec) {
+		if handleEndpointCmd(line, client, rec, cfg.Discover) {
 			continue
 		}
 
@@ -127,18 +130,24 @@ func reconcileModel(client *Client, rec *Recorder) []string {
 	return append(lines, modelTable(models, client.Model())...)
 }
 
-// handleModelCmd processes the /model REPL command. "/model" lists served models
-// with their status; "/model <name>" switches for subsequent turns.
-func handleModelCmd(line string, client *Client, rec *Recorder) bool {
-	if line != "/model" && !strings.HasPrefix(line, "/model ") {
+// handleModelCmd processes the /model REPL command. "/model <name>" sets the
+// model for subsequent turns (no validation — we trust the name). "/model" shows
+// the current model; only when discovery is enabled does it probe /models and
+// list what the router serves.
+func handleModelCmd(line string, client *Client, rec *Recorder, discover bool) bool {
+	arg, ok := commandArg(line, "/model")
+	if !ok {
 		return false
 	}
-	arg := strings.TrimSpace(strings.TrimPrefix(line, "/model"))
-	models, err := client.ListModels()
 
 	if arg == "" {
 		eyebrow("models")
 		kv("current", client.Model()+"  "+faint("@ %s", client.Endpoint()))
+		if !discover {
+			fmt.Println("  " + faint("set with /model <name>  ·  discovery off (LCA_DISCOVER=1 to probe)"))
+			return true
+		}
+		models, err := client.ListModels()
 		switch {
 		case err != nil:
 			fmt.Println("  " + warn("discovery unavailable: %v", err))
@@ -156,19 +165,22 @@ func handleModelCmd(line string, client *Client, rec *Recorder) bool {
 	client.SetModel(arg)
 	rec.Event("model_change", map[string]any{"from": prev, "to": arg})
 	fmt.Printf("  %sMODEL%s %s → %s\n", cFaint, cReset, prev, arg)
-	if err == nil && len(models) > 0 {
-		if _, ok := findModel(models, arg); !ok {
-			fmt.Println("  " + warn("warning: %q is not in the endpoint's served list", arg))
+	if discover {
+		if models, err := client.ListModels(); err == nil && len(models) > 0 {
+			if _, ok := findModel(models, arg); !ok {
+				fmt.Println("  " + warn("warning: %q is not in the endpoint's served list", arg))
+			}
 		}
 	}
 	return true
 }
 
 // handleEndpointCmd processes the /endpoint (alias /ep) REPL command.
-// "/endpoint" lists known endpoints (current marked); "/endpoint <n|url>"
-// switches — by list index, or to any URL (handy when a SLURM allocation hands
-// out a fresh host:port). After switching it re-discovers models there.
-func handleEndpointCmd(line string, client *Client, rec *Recorder) bool {
+// "/endpoint" lists known endpoints with a reachability check (current marked);
+// "/endpoint <n|url>" switches — by list index, or to any URL (handy when a
+// SLURM allocation hands out a fresh host:port). Re-discovery on switch only
+// happens when discovery is enabled.
+func handleEndpointCmd(line string, client *Client, rec *Recorder, discover bool) bool {
 	arg, ok := commandArg(line, "/endpoint", "/ep")
 	if !ok {
 		return false
@@ -204,50 +216,51 @@ func handleEndpointCmd(line string, client *Client, rec *Recorder) bool {
 	rec.Event("endpoint_change", map[string]any{"from": prev, "to": client.Endpoint()})
 	fmt.Printf("  %sENDPOINT%s %s → %s\n", cFaint, cReset, prev, client.Endpoint())
 
-	// re-discover what the new endpoint serves and reconcile the model
-	for _, n := range reconcileModel(client, rec) {
-		fmt.Println("  " + n)
+	if discover {
+		for _, n := range reconcileModel(client, rec) {
+			fmt.Println("  " + n)
+		}
 	}
 	return true
 }
 
-// endpointProbe is the health result for one endpoint.
+// endpointProbe is the reachability result for one endpoint.
 type endpointProbe struct {
-	models []ModelInfo
-	err    error
+	up     bool
+	models []ModelInfo // present only if /models answered 200
 }
 
 func (p endpointProbe) glyph() string {
-	if p.err != nil {
+	if !p.up {
 		return cRed + gDown + cReset // ✕ down
 	}
 	return cGreen + gUp + cReset // ● up
 }
 
-// detail renders the right-hand description: model info when up, a reason when
-// down. For the current endpoint it names the selected model specifically.
+// detail renders the right-hand description. For the current endpoint it names
+// the selected model; otherwise it shows any models the probe happened to see.
 func (p endpointProbe) detail(isCurrent bool, currentModel string) string {
-	if p.err != nil {
+	if !p.up {
 		return faint("down")
 	}
 	switch {
 	case isCurrent:
 		return faint("%s", currentModel)
-	case len(p.models) == 0:
-		return faint("no models")
 	case len(p.models) == 1:
 		d := p.models[0].ID
 		if extra := describeModel(p.models[0]); extra != "" {
 			d += "  " + faint("%s", extra)
 		}
 		return d
-	default:
+	case len(p.models) > 1:
 		return faint("%d models", len(p.models))
+	default:
+		return faint("up")
 	}
 }
 
-// probeEndpoints health-checks every endpoint concurrently (bounded by the
-// per-request timeout in ProbeModels), preserving input order.
+// probeEndpoints reachability-checks every endpoint concurrently (bounded by the
+// per-request timeout in ProbeHealth), preserving input order.
 func probeEndpoints(client *Client, eps []string) []endpointProbe {
 	out := make([]endpointProbe, len(eps))
 	var wg sync.WaitGroup
@@ -255,8 +268,8 @@ func probeEndpoints(client *Client, eps []string) []endpointProbe {
 		wg.Add(1)
 		go func(i int, e string) {
 			defer wg.Done()
-			m, err := client.ProbeModels(e)
-			out[i] = endpointProbe{models: m, err: err}
+			up, m := client.ProbeHealth(e)
+			out[i] = endpointProbe{up: up, models: m}
 		}(i, e)
 	}
 	wg.Wait()

@@ -46,6 +46,7 @@ are denied rather than run unattended.
 | `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
+| `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -60,32 +61,26 @@ cluster where nodes come and go:
 LCA_BASE_URL=http://node1:8000/v1 LCA_ENDPOINTS=http://node2:8000/v1,http://node3:8000/v1 ./lca
 ```
 
-`/endpoint` lists the known endpoints and **health-probes them concurrently**,
-showing `●` up (with the served model / count) or `✕` down for each, current
-marked. `/endpoint <n>` switches by list index and `/endpoint <url>` switches to
-any address (added to the list) — handy when a SLURM allocation hands out a fresh
-`host:port`. A bare `host:port` gets `http://` prepended. Switching re-runs model
-discovery on the new endpoint, so the model is re-adopted/validated there.
-Switches are audited (`endpoint_change`).
+`/endpoint` lists the known endpoints with a concurrent **reachability check** —
+a green `●` up (any HTTP response counts, so a model router that has no `/models`
+route still reads as up) or `✕` down (transport error) for each, current marked.
+`/endpoint <n>` switches by list index and `/endpoint <url>` switches to any
+address (added to the list) — handy when a SLURM allocation hands out a fresh
+`host:port`. A bare `host:port` gets `http://` prepended; include the base path
+(e.g. `.../v1`) the server expects. Switches are audited (`endpoint_change`).
 
 ### Model selection
 
-There is no router — one model per session, sent as the `model` field to the
-single `LCA_BASE_URL` endpoint. On startup the agent queries `GET /v1/models` to
-see what the server actually serves and reconciles it with `LCA_MODEL`:
+One model per session, sent as the `model` field to the current endpoint. By
+default the agent does **not** query the router for a model list — it simply
+trusts `LCA_MODEL` (and `/model <name>` to change it). This keeps it decoupled
+from whatever `/models` does or doesn't return.
 
-- configured name is served → used as-is
-- not served but exactly one model is offered → that one is adopted (the common
-  vLLM/SGLang case: one model per endpoint, whose id rarely matches a guess)
-- not served and several are offered → a warning; pick one with `/model <name>`
-- discovery unavailable (endpoint down or no `/models`) → configured name used as-is
-
-`/model` lists served models with status — a green `●` (served/ready), a cyan
-`→` on the current selection, and each model's context window and backend
-(`ctx 32768, vllm`) when the server reports `max_model_len` / `owned_by`.
-`/model <name>` switches for later turns. The startup banner shows the same
-status for the active model. Adoptions and switches are written to the audit log
-(`model_adopt` / `model_change`).
+Set `LCA_DISCOVER=1` to opt into discovery: on startup (and on `/endpoint`
+switch) the agent queries `GET /v1/models`, adopts the sole served model if the
+configured name is absent, or warns if several are served; `/model` then lists
+served models with status (`●`, context window, backend). Switches are audited
+(`model_change`, and `model_adopt` under discovery).
 
 ## Terminal style — `ui.go`
 
