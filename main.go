@@ -8,6 +8,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 func main() {
@@ -176,14 +177,14 @@ func handleEndpointCmd(line string, client *Client, rec *Recorder) bool {
 
 	if arg == "" {
 		eyebrow("endpoints")
+		probes := probeEndpoints(client, eps)
 		for i, e := range eps {
 			mark := " "
-			extra := ""
 			if e == client.Endpoint() {
 				mark = cBold + "→" + cReset
-				extra = "  " + faint("(%s)", client.Model())
 			}
-			fmt.Printf("  %s %d  %s%s\n", mark, i+1, e, extra)
+			fmt.Printf("  %s %d  %s %s  %s\n",
+				mark, i+1, probes[i].glyph(), e, probes[i].detail(e == client.Endpoint(), client.Model()))
 		}
 		fmt.Println("  " + faint("switch: /endpoint <n|url>"))
 		return true
@@ -208,6 +209,58 @@ func handleEndpointCmd(line string, client *Client, rec *Recorder) bool {
 		fmt.Println("  " + n)
 	}
 	return true
+}
+
+// endpointProbe is the health result for one endpoint.
+type endpointProbe struct {
+	models []ModelInfo
+	err    error
+}
+
+func (p endpointProbe) glyph() string {
+	if p.err != nil {
+		return cRed + gDown + cReset // ✕ down
+	}
+	return cGreen + gUp + cReset // ● up
+}
+
+// detail renders the right-hand description: model info when up, a reason when
+// down. For the current endpoint it names the selected model specifically.
+func (p endpointProbe) detail(isCurrent bool, currentModel string) string {
+	if p.err != nil {
+		return faint("down")
+	}
+	switch {
+	case isCurrent:
+		return faint("%s", currentModel)
+	case len(p.models) == 0:
+		return faint("no models")
+	case len(p.models) == 1:
+		d := p.models[0].ID
+		if extra := describeModel(p.models[0]); extra != "" {
+			d += "  " + faint("%s", extra)
+		}
+		return d
+	default:
+		return faint("%d models", len(p.models))
+	}
+}
+
+// probeEndpoints health-checks every endpoint concurrently (bounded by the
+// per-request timeout in ProbeModels), preserving input order.
+func probeEndpoints(client *Client, eps []string) []endpointProbe {
+	out := make([]endpointProbe, len(eps))
+	var wg sync.WaitGroup
+	for i, e := range eps {
+		wg.Add(1)
+		go func(i int, e string) {
+			defer wg.Done()
+			m, err := client.ProbeModels(e)
+			out[i] = endpointProbe{models: m, err: err}
+		}(i, e)
+	}
+	wg.Wait()
+	return out
 }
 
 // commandArg matches a slash command (or its aliases) and returns its trimmed

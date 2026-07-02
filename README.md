@@ -59,12 +59,13 @@ cluster where nodes come and go:
 LCA_BASE_URL=http://node1:8000/v1 LCA_ENDPOINTS=http://node2:8000/v1,http://node3:8000/v1 ./lca
 ```
 
-`/endpoint` lists the known endpoints (current marked); `/endpoint <n>` switches
-by list index and `/endpoint <url>` switches to any address (added to the list)
-— handy when a SLURM allocation hands out a fresh `host:port`. A bare `host:port`
-gets `http://` prepended. Switching re-runs model discovery on the new endpoint,
-so the model is re-adopted/validated there. Switches are audited
-(`endpoint_change`).
+`/endpoint` lists the known endpoints and **health-probes them concurrently**,
+showing `●` up (with the served model / count) or `✕` down for each, current
+marked. `/endpoint <n>` switches by list index and `/endpoint <url>` switches to
+any address (added to the list) — handy when a SLURM allocation hands out a fresh
+`host:port`. A bare `host:port` gets `http://` prepended. Switching re-runs model
+discovery on the new endpoint, so the model is re-adopted/validated there.
+Switches are audited (`endpoint_change`).
 
 ### Model selection
 

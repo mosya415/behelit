@@ -84,15 +84,18 @@ type modelsResponse struct {
 	} `json:"data"`
 }
 
-// ListModels queries the OpenAI-compatible /models endpoint to discover what the
-// server actually serves. Short timeout so a hung or absent endpoint never
-// blocks startup. Not every server implements it — callers treat an error as
-// "discovery unavailable", not fatal.
-func (c *Client) ListModels() ([]ModelInfo, error) {
+// ListModels queries the current endpoint's /models. Short timeout so a hung or
+// absent endpoint never blocks. Not every server implements it — callers treat
+// an error as "discovery unavailable", not fatal.
+func (c *Client) ListModels() ([]ModelInfo, error) { return c.ProbeModels(c.baseURL) }
+
+// ProbeModels queries an arbitrary endpoint's /models — used both for discovery
+// on the active endpoint and for health-probing the others in the list.
+func (c *Client) ProbeModels(baseURL string) ([]ModelInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
 	if err != nil {
 		return nil, err
 	}
