@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
 	"os/user"
@@ -10,6 +11,12 @@ import (
 
 func main() {
 	cfg := loadConfig()
+
+	yes := flag.Bool("y", false, "auto-approve side-effecting actions (for one-shot / non-interactive use)")
+	yesLong := flag.Bool("yes", false, "alias for -y")
+	flag.Usage = usage
+	flag.Parse()
+	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
 
 	jail, err := NewJail(cfg.Root, cfg.Allowed)
 	if err != nil {
@@ -26,15 +33,32 @@ func main() {
 	client := NewClient(cfg)
 	in := bufio.NewReader(os.Stdin)
 	ap := NewApprover(in)
+	if *yes || *yesLong {
+		ap.SetAuto(true)
+	}
 
 	notes := reconcileModel(client, rec)
-	banner(cfg, jail, rec, ap, client, notes)
 	rec.Event("session_start", map[string]any{
 		"root": jail.Root, "model": client.Model(), "endpoint": cfg.BaseURL,
 	})
 	defer rec.Event("session_end", nil)
 
 	msgs := []Message{{Role: "system", Content: systemPrompt(jail)}}
+
+	// One-shot mode: a prompt on the command line runs a single turn and exits.
+	// Model-reconciliation notes go to stderr so stdout carries only the answer.
+	if prompt != "" {
+		for _, n := range notes {
+			fmt.Fprintln(os.Stderr, n)
+		}
+		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
+		msgs = append(msgs, Message{Role: "user", Content: prompt})
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens)
+		rec.Transcript(msgs)
+		return
+	}
+
+	banner(cfg, jail, rec, ap, client, notes)
 
 	for {
 		fmt.Print("\n\033[36m›\033[0m ")
@@ -272,6 +296,10 @@ func executeBlocks(jail *Jail, ap *Approver, rec *Recorder, blocks []Block) stri
 			fmt.Printf("\033[90m grep %q %s\033[0m\n", b.Attr["pattern"], b.Attr["path"])
 			res = grepTree(jail, b.Attr["pattern"], b.Attr["path"])
 			rec.Event("grep", map[string]any{"pattern": b.Attr["pattern"], "path": b.Attr["path"], "result": summarize(res)})
+		case "list_dir":
+			fmt.Printf("\033[90m list_dir %s\033[0m\n", b.Attr["path"])
+			res = listDir(jail, b.Attr["path"])
+			rec.Event("list_dir", map[string]any{"path": b.Attr["path"]})
 		case "edit":
 			res = gatedEdit(jail, ap, rec, b)
 		case "write":
@@ -338,6 +366,21 @@ func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	res := runCommand(jail, cmd)
 	rec.Event("run_command", map[string]any{"cmd": cmd, "approved": true, "auto": auto, "result": summarize(res)})
 	return res
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `Latent Coding Agent — approval-first CLI agent for local LLM endpoints.
+
+usage:
+  lca                 start interactive REPL
+  lca [-y] "<prompt>" run a single turn and exit (one-shot)
+
+flags:
+  -y, -yes            auto-approve side-effecting actions (edit/write/run_command)
+
+config is via environment (see README): LCA_BASE_URL, LCA_MODEL, LCA_ROOT,
+LCA_ALLOW, LCA_DIR, LCA_CTX_TOKENS.
+`)
 }
 
 func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client, notes []string) {

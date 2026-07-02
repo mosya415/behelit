@@ -42,8 +42,8 @@ type Block struct {
 
 var (
 	blockNames = map[string]bool{
-		"read_file": true, "grep": true, "run_command": true,
-		"write": true, "edit": true,
+		"read_file": true, "grep": true, "list_dir": true,
+		"run_command": true, "write": true, "edit": true,
 	}
 	// Matches an opening tag line: <name ...attrs...>  or self-closing <name .../>
 	reOpen = regexp.MustCompile(`^<([a-z_]+)((?:\s+[a-z_]+="[^"]*")*)\s*(/?)>$`)

@@ -23,6 +23,9 @@ Read a file (runs automatically):
 <read_file path="rel/path.go"/>
 <read_file path="rel/path.go" lines="40-80"/>
 
+List a directory tree to orient yourself (runs automatically):
+<list_dir path="subdir"/>
+
 Search the tree with a regexp (runs automatically):
 <grep pattern="funcName" path="subdir"/>
 
@@ -48,8 +51,8 @@ new code
 </edit>
 
 # Rules
-- Gather context yourself with read_file/grep before editing. Never assume file
-  contents — read them.
+- Gather context yourself with list_dir/grep/read_file before editing. Never
+  assume file contents — read them.
 - Edits use strict verbatim matching. If a search fails ("not found" or "matches
   N places"), re-read the file and produce a corrected edit — never invent text.
 - Prefer <edit> for changes to existing files; use <write> only for new or tiny files.

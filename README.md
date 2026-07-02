@@ -18,6 +18,20 @@ LCA_BASE_URL=http://localhost:8000/v1 LCA_MODEL=my-model ./lca
 The working directory at launch becomes the jail root — all file access is
 confined to it.
 
+### One-shot mode
+
+A prompt on the command line runs a single turn and exits — handy for scripts
+and CI inside the enclave. stdout carries only the assistant's answer (model
+notes go to stderr):
+
+```sh
+./lca "summarize what pkg/auth does"        # read-only, prompts if it needs to write
+./lca -y "add a nil check to Parse in x.go" # -y auto-approves side effects
+```
+
+Without `-y`, side-effecting actions still gate; if stdin is not attached they
+are denied rather than run unattended.
+
 ### Configuration (env)
 
 | Var            | Default                        | Meaning                                   |
@@ -66,7 +80,8 @@ status for the active model. Adoptions and switches are written to the audit log
    unified diff (it drifts on quantized weights).
 
 3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the
-   prompt. The model pulls what it needs via auto-running `read_file`/`grep`. The
+   prompt. The model pulls what it needs via auto-running
+   `list_dir`/`grep`/`read_file`. The
    full transcript is kept on disk for audit, but the copy *sent* to the model is
    trimmed to an approximate token budget (`LCA_CTX_TOKENS`): the oldest
    `tool_result` outputs are collapsed to a stub first (the model already
@@ -114,6 +129,7 @@ tool-call parser sees the fully assembled text, so it cannot affect correctness.
 ```
 <read_file path="rel/path.go"/>
 <read_file path="rel/path.go" lines="40-80"/>
+<list_dir path="subdir"/>
 <grep pattern="regexp" path="subdir"/>
 <run_command>
 go test ./...

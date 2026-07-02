@@ -16,9 +16,70 @@ import (
 const (
 	maxReadBytes   = 200_000
 	maxGrepMatches = 200
+	maxListEntries = 400
 	maxCmdOutput   = 64_000
 	cmdTimeout     = 60 * time.Second
 )
+
+// listDir renders a bounded, indented tree of a directory (default: jail root)
+// so the model can orient itself without dumping the repo. Skips .git, marks
+// directories with a trailing slash, and caps the entry count.
+func listDir(j *Jail, path string) string {
+	if path == "" {
+		path = "."
+	}
+	abs, err := j.Resolve(path)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	if !info.IsDir() {
+		return "error: not a directory: " + path
+	}
+
+	var b strings.Builder
+	count := 0
+	truncated := false
+	walkErr := filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if p == abs {
+			return nil // skip the root itself
+		}
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		if count >= maxListEntries {
+			truncated = true
+			return filepath.SkipAll
+		}
+		rel, _ := filepath.Rel(abs, p)
+		depth := strings.Count(rel, string(filepath.Separator))
+		name := d.Name()
+		if d.IsDir() {
+			name += "/"
+		}
+		fmt.Fprintf(&b, "%s%s\n", strings.Repeat("  ", depth), name)
+		count++
+		return nil
+	})
+	if walkErr != nil {
+		return "error: " + walkErr.Error()
+	}
+
+	out := b.String()
+	if out == "" {
+		out = "(empty directory)\n"
+	}
+	if truncated {
+		out += fmt.Sprintf("... (truncated at %d entries)\n", maxListEntries)
+	}
+	return strings.TrimRight(path, "/") + "/\n" + out
+}
 
 // readFile returns raw file content (no line-number prefixes, so the model can
 // copy exact text into a <search> block). An optional lines="a-b" range slices
