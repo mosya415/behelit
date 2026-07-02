@@ -75,6 +75,17 @@ func main() {
 			fmt.Println()
 			return
 		}
+		line = strings.TrimRight(line, "\r\n")
+		// Backslash line-continuation: a line ending in \ keeps reading, so a
+		// long prompt can be typed across several lines.
+		for strings.HasSuffix(line, "\\") {
+			fmt.Print("   " + cFaint + "…" + cReset + " ")
+			cont, err := in.ReadString('\n')
+			if err != nil {
+				break
+			}
+			line = line[:len(line)-1] + "\n" + strings.TrimRight(cont, "\r\n")
+		}
 		line = strings.TrimSpace(line)
 		switch line {
 		case "":
@@ -245,8 +256,8 @@ func handleDiscoverCmd(line string, client *Client, rec *Recorder, cmd string) b
 		return false
 	}
 	if strings.TrimSpace(cmd) == "" {
-		fmt.Println("  " + faint("set LCA_DISCOVER_CMD, e.g."))
-		fmt.Println("  " + faint(`LCA_DISCOVER_CMD='python3 -m modelstat --discovery slurm --json -R gigalearn-test'`))
+		fmt.Println("  " + faint("set LCA_DISCOVER_CMD (runs via sh -c). if modelstat lives elsewhere, cd to it:"))
+		fmt.Println("  " + faint(`LCA_DISCOVER_CMD='cd /path/to/status_page && python3 -m modelstat --discovery slurm --json -R gigalearn-test'`))
 		return true
 	}
 

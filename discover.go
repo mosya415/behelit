@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,17 @@ import (
 	"strings"
 	"time"
 )
+
+// lastLine returns the last non-empty line of s, capped — Python tracebacks put
+// the actual error (e.g. "ModuleNotFoundError: No module named 'modelstat'") last.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	last := lines[len(lines)-1]
+	if len(last) > 300 {
+		last = last[:300] + "…"
+	}
+	return last
+}
 
 // Endpoint discovery via an external command (LCA_DISCOVER_CMD), e.g. the
 // SLURM-aware `modelstat` tool. We deliberately do NOT reimplement the cluster
@@ -45,9 +57,16 @@ func runDiscovery(cmdline string) (msResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmdline).Output()
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdline)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return msResult{}, fmt.Errorf("discovery command failed: %w", err)
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return msResult{}, fmt.Errorf("discovery command failed: %s", lastLine(detail))
 	}
 	// Tolerate leading noise: parse from the first '{'.
 	s := string(out)

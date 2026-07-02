@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -78,12 +79,17 @@ func (c *Client) SetEndpointModel(url, model string) {
 }
 func (c *Client) EndpointModel(url string) string { return c.epModel[strings.TrimRight(url, "/")] }
 
-// SetEndpoint switches the active endpoint (trailing slash trimmed, http://
-// prepended when no scheme is given) and remembers it in the known list.
+// SetEndpoint switches the active endpoint and remembers it in the known list.
+// It normalizes a human-typed address: trailing slash trimmed, http:// prepended
+// when no scheme is given, and /v1 appended when no path is present (the common
+// footgun — a bare host:port would send chat to /chat/completions and 404).
 func (c *Client) SetEndpoint(u string) {
 	u = strings.TrimRight(u, "/")
 	if !strings.Contains(u, "://") {
 		u = "http://" + u
+	}
+	if pu, err := url.Parse(u); err == nil && pu.Path == "" {
+		u += "/v1"
 	}
 	c.baseURL = u
 	for _, e := range c.endpoints {

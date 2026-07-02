@@ -52,7 +52,7 @@ are denied rather than run unattended.
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
-REPL commands: `/model [name]`, `/endpoint [n|url]`, `/approve [on|off|run|edit|status]`, `/reset`, `/exit`.
+REPL commands: `/discover`, `/endpoint [n|url]`, `/model [name]`, `/approve [on|off|run|edit|status]`, `/reset`, `/exit`. A line ending in `\` continues on the next line, so long prompts can be typed across several lines.
 
 ### Endpoints
 
