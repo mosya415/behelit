@@ -88,6 +88,23 @@ parser, so what the screen hides is exactly what will execute. The full text
 (tags included) is still kept in the transcript and fed back to the model;
 `LCA_RAW=1` streams it verbatim for debugging a model's protocol adherence.
 
+## Markdown & math rendering — `markdown.go`, `math.go`
+
+The model's prose is rendered as Markdown in the monochrome style: headings and
+`**bold**` in bold, `*italic*` in italic, `` `inline code` `` as reverse video,
+`-`/`1.` lists with a `•` bullet, `>` quotes with a faint bar, and fenced
+` ``` ` code blocks printed verbatim behind a `│` gutter. Emphasis is limited to
+`*`/`**` (underscores stay literal, since they are common in code identifiers).
+
+Inline math in `$…$` / `$$…$$` is approximated in Unicode (`math.go`): Greek
+letters, operators, super/subscripts, roots and simple fractions —
+`$\theta_{t+1} = \theta_t - \alpha \nabla L$` renders as
+`θₜ₊₁ = θₜ - α ∇ L`. A `$…$` span is only treated as math if it carries a TeX
+marker, so `$5 and $10` is left alone. A terminal can't typeset math, so this is
+a legible approximation, not true typesetting — for that, use the (not-yet-built)
+HTML report. Rendering is line-buffered (a line is formatted once complete);
+`LCA_RAW=1` disables all of it and streams verbatim.
+
 ## Design (the four non-trivial parts)
 
 1. **Tool-call transport — `protocol.go`.** The model emits line-anchored XML-ish
@@ -190,7 +207,9 @@ jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
 context.go    transcript trimming to a token budget (prefill control)
 ui.go         terminal styling: palette, hairlines, status glyphs, labels
-stream.go     prose filter: hide tool tags from the human view (kept in transcript)
+stream.go     prose filter: hide tool tags, line-buffer for markdown rendering
+markdown.go   terminal markdown renderer (headings, emphasis, code, lists, math)
+math.go       LaTeX-ish → Unicode approximation for inline/display math
 prompt.go     system prompt (kept in sync with protocol.go)
 agent_test.go tests for parser / edit / jail / tokenizer
 ```

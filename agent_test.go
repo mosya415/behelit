@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -141,6 +142,61 @@ func TestTrimForContext(t *testing.T) {
 	small := []Message{{Role: "user", Content: "hi"}}
 	if _, n := trimForContext(small, 24000); n != 0 {
 		t.Fatalf("small transcript should not be trimmed, got %d", n)
+	}
+}
+
+var reAnsiTest = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripAnsi(s string) string { return reAnsiTest.ReplaceAllString(s, "") }
+
+func TestLatexToUnicode(t *testing.T) {
+	cases := map[string]string{
+		`x^2 + y_i`:                  "x² + yᵢ",
+		`\frac{a}{b}`:                "a⁄b",
+		`\sqrt{x}`:                   "√(x)",
+		`\alpha \times \beta`:        "α × β",
+		`\sum_{i=1}^{n}`:             "∑ᵢ₌₁ⁿ",
+		`E = mc^2`:                   "E = mc²",
+		`\pi \approx 3.14`:           "π ≈ 3.14",
+		`x^{10}`:                     "x¹⁰",
+		`\theta \leq \epsilon`:       "θ ≤ ε",
+		`\|\nabla L\| \leq \epsilon`: "‖∇ L‖ ≤ ε",
+	}
+	for in, want := range cases {
+		if got := latexToUnicode(in); got != want {
+			t.Errorf("latexToUnicode(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestRenderInline(t *testing.T) {
+	cases := map[string]string{
+		"**bold** and *it* and `code`": "bold and it and code",
+		"inline math $x^2$ here":       "inline math x² here",
+		"a price $5 or $10 total":      "a price $5 or $10 total", // not math → untouched
+		"snake_case stays literal":     "snake_case stays literal",
+	}
+	for in, want := range cases {
+		if got := stripAnsi(renderInline(in)); got != want {
+			t.Errorf("renderInline(%q) → %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestRenderMarkdownLine(t *testing.T) {
+	cases := map[string]string{
+		"# Heading":  "Heading",
+		"## Sub":     "Sub",
+		"- item":     "• item",
+		"1. first":   "1. first",
+		"> quoted":   "▏ quoted",
+		"plain text": "plain text",
+		"  - nested": "  • nested",
+	}
+	for in, want := range cases {
+		if got := stripAnsi(renderMarkdownLine(in)); got != want {
+			t.Errorf("renderMarkdownLine(%q) → %q, want %q", in, got, want)
+		}
 	}
 }
 
