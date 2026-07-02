@@ -11,19 +11,21 @@ import (
 // startup; there is deliberately no config file and no auth layer — identity
 // comes from the process (uid/gid of whoever ran the binary).
 type Config struct {
-	Root        string   // realpath jail root; nothing may be touched outside it
-	BaseURL     string   // current OpenAI-compatible endpoint, e.g. http://localhost:8000/v1
-	Endpoints   []string // known endpoints (BaseURL + LCA_ENDPOINTS), for /endpoint switching
-	Model       string   // model name as served by vLLM/SGLang
-	APIKey      string   // optional; most local servers accept any token
-	Temperature float64  // low by default for deterministic tool use
-	MaxSteps    int      // safety cap on tool-call iterations per user turn
-	CtxTokens   int      // approximate token budget for the transcript sent to the model
-	Allowed     []string // command allowlist (matched against basename of argv[0])
-	Dir         string   // where the audit log and session transcripts are written
-	Raw         bool     // stream raw model text (show tool tags) — for protocol debugging
-	Discover    bool     // query /models to adopt/validate the model (off = trust configured name)
-	DiscoverCmd string   // external endpoint-discovery command (e.g. modelstat --json)
+	Root         string   // realpath jail root; nothing may be touched outside it
+	BaseURL      string   // current OpenAI-compatible endpoint, e.g. http://localhost:8000/v1
+	Endpoints    []string // known endpoints (BaseURL + LCA_ENDPOINTS), for /endpoint switching
+	Model        string   // model name as served by vLLM/SGLang
+	APIKey       string   // optional; most local servers accept any token
+	Temperature  float64  // low by default for deterministic tool use
+	MaxSteps     int      // safety cap on tool-call iterations per user turn
+	CtxTokens    int      // approximate token budget for the transcript sent to the model
+	Allowed      []string // command allowlist (matched against basename of argv[0])
+	Dir          string   // where the audit log and session transcripts are written
+	Raw          bool     // stream raw model text (show tool tags) — for protocol debugging
+	Discover     bool     // query /models to adopt/validate the model (off = trust configured name)
+	Reservation  string   // Slurm reservation to scope /discover (LCA_RESERVATION)
+	DiscoverUser string   // Slurm user filter for /discover (LCA_USER; "$me" = you)
+	Scheme       string   // http|https for discovered endpoints (LCA_SCHEME)
 }
 
 func env(key, def string) string {
@@ -43,17 +45,19 @@ func loadConfig() Config {
 		home = cwd
 	}
 	cfg := Config{
-		Root:        env("LCA_ROOT", cwd),
-		Dir:         env("LCA_DIR", filepath.Join(home, ".lca")),
-		BaseURL:     strings.TrimRight(env("LCA_BASE_URL", "http://localhost:8000/v1"), "/"),
-		Model:       env("LCA_MODEL", "local"),
-		APIKey:      env("LCA_API_KEY", "sk-noauth"),
-		Temperature: 0.2,
-		MaxSteps:    25,
-		CtxTokens:   atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
-		Raw:         os.Getenv("LCA_RAW") != "",
-		Discover:    os.Getenv("LCA_DISCOVER") != "",
-		DiscoverCmd: os.Getenv("LCA_DISCOVER_CMD"),
+		Root:         env("LCA_ROOT", cwd),
+		Dir:          env("LCA_DIR", filepath.Join(home, ".lca")),
+		BaseURL:      strings.TrimRight(env("LCA_BASE_URL", "http://localhost:8000/v1"), "/"),
+		Model:        env("LCA_MODEL", "local"),
+		APIKey:       env("LCA_API_KEY", "sk-noauth"),
+		Temperature:  0.2,
+		MaxSteps:     25,
+		CtxTokens:    atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
+		Raw:          os.Getenv("LCA_RAW") != "",
+		Discover:     os.Getenv("LCA_DISCOVER") != "",
+		Reservation:  os.Getenv("LCA_RESERVATION"),
+		DiscoverUser: os.Getenv("LCA_USER"),
+		Scheme:       env("LCA_SCHEME", "http"),
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

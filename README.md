@@ -48,7 +48,9 @@ are denied rather than run unattended.
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
-| `LCA_DISCOVER_CMD` | unset                      | External endpoint-discovery command for `/discover` (e.g. `modelstat --json`) |
+| `LCA_RESERVATION` | unset                       | Slurm reservation to scope `/discover` (e.g. `gigalearn-test`) |
+| `LCA_USER`     | unset                          | Slurm user filter for `/discover` (`$me` = you) |
+| `LCA_SCHEME`   | `http`                         | Scheme for discovered endpoints |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -71,25 +73,29 @@ address (added to the list) — handy when a SLURM allocation hands out a fresh
 `host:port`. A bare `host:port` gets `http://` prepended; include the base path
 (e.g. `.../v1`) the server expects. Switches are audited (`endpoint_change`).
 
-### Discovery via an external command
+### Slurm discovery — `discover.go`
 
 On a scheduler-driven cluster, endpoints move (requeue/preemption) and the port
-lives in the container startup script, not the router. Rather than reimplement
-that, `lca` shells out to a discovery tool you configure via `LCA_DISCOVER_CMD`
-— e.g. the SLURM-aware `modelstat`:
+lives in the container startup script, not a router. `/discover` finds the live
+models itself, natively (no external tool):
+
+1. `squeue --states=RUNNING` (scoped by `LCA_RESERVATION` / `LCA_USER`) → jobs + nodes
+2. `scontrol show job <id>` → serving node (`BatchHost`), GPU count, log paths, sbatch `Command`
+3. read the job log on shared NFS for the bound port (`Uvicorn running on http://…:PORT`)
+4. if the log lacks it, read the container startup script the sbatch runs,
+   translating the `--container-mounts` path back to its host (NFS) path, and grep `--port`
+5. confirm health + model over HTTP (`/health`, `/v1/models`)
+
+It needs only `squeue`/`scontrol` + NFS reads + HTTP from the login/dev node — no
+compute-node access. The picker shows per-model health (`● up`, `◐ unhealthy`,
+`✕ down`), engine, context window and GPU count. Each becomes
+`http://node:port/v1` and the served model name is remembered, so `/endpoint <n>`
+switches endpoint **and** selects that endpoint's model together. Nothing is
+cached — re-run `/discover` whenever addresses may have changed.
 
 ```sh
-LCA_DISCOVER_CMD='python3 -m modelstat --discovery slurm --json -R gigalearn-test' ./lca
+LCA_RESERVATION=gigalearn-test ./lca      # then: /discover
 ```
-
-`/discover` runs it, parses its JSON (`{models:[{endpoint,health,model,
-served_names,engine,max_model_len,node,gpu_count,…}]}`), refreshes the endpoint
-list and prints a picker with per-model health (`● up`, `◐ unhealthy`, `✕ down`).
-Each `host:port` becomes `http://host:port/v1`, and the served model name is
-remembered — so `/endpoint <n>` switches endpoint **and** selects that endpoint's
-model together. Nothing is cached: re-run `/discover` whenever addresses may have
-changed. The command is operator-configured (not model-driven) and runs outside
-the tool jail.
 
 ### Model selection
 
@@ -244,7 +250,7 @@ jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
 context.go    transcript trimming to a token budget (prefill control)
 ui.go         terminal styling: palette, hairlines, status glyphs, labels
-discover.go   external endpoint discovery (runs modelstat --json, parses it)
+discover.go   native Slurm discovery (squeue/scontrol/log/startup-script + probe)
 stream.go     prose filter: hide tool tags, line-buffer for markdown rendering
 markdown.go   terminal markdown renderer (headings, emphasis, code, lists, math)
 math.go       LaTeX-ish → Unicode approximation for inline/display math

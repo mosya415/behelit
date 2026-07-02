@@ -107,7 +107,7 @@ func main() {
 		if handleEndpointCmd(line, client, rec, cfg.Discover) {
 			continue
 		}
-		if handleDiscoverCmd(line, client, rec, cfg.DiscoverCmd) {
+		if handleDiscoverCmd(line, client, rec, cfg) {
 			continue
 		}
 
@@ -248,45 +248,48 @@ func handleEndpointCmd(line string, client *Client, rec *Recorder, discover bool
 	return true
 }
 
-// handleDiscoverCmd runs the external discovery command (LCA_DISCOVER_CMD), then
-// refreshes the endpoint list from its results and prints a picker. Addresses go
-// stale on requeue/preemption, so this is re-run on demand and never cached.
-func handleDiscoverCmd(line string, client *Client, rec *Recorder, cmd string) bool {
+// handleDiscoverCmd runs native Slurm discovery (squeue → scontrol → job log /
+// startup script → HTTP probe), refreshes the endpoint list from the result, and
+// prints a picker. Addresses go stale on requeue/preemption, so it is re-run on
+// demand and never cached.
+func handleDiscoverCmd(line string, client *Client, rec *Recorder, cfg Config) bool {
 	if _, ok := commandArg(line, "/discover", "/disc"); !ok {
 		return false
 	}
-	if strings.TrimSpace(cmd) == "" {
-		fmt.Println("  " + faint("set LCA_DISCOVER_CMD (runs via sh -c). if modelstat lives elsewhere, cd to it:"))
-		fmt.Println("  " + faint(`LCA_DISCOVER_CMD='cd /path/to/status_page && python3 -m modelstat --discovery slurm --json -R gigalearn-test'`))
-		return true
-	}
 
-	fmt.Println(" " + faint("%s DISCOVER  running…", gNone))
-	res, err := runDiscovery(cmd)
+	fmt.Println(" " + faint("%s DISCOVER  squeue → scontrol → logs → probe…", gNone))
+	res, err := discoverSlurm(cfg.Reservation, cfg.DiscoverUser, cfg.Scheme)
 	if err != nil {
 		fmt.Println("  " + warn("%v", err))
 		rec.Event("discover", map[string]any{"error": err.Error()})
 		return true
 	}
 
-	// Refresh the endpoint list and remember model-per-endpoint.
+	// Refresh endpoints (only ones with a resolved port) and remember the model
+	// each serves. Kept in discovery order so the picker index matches /endpoint.
 	var urls []string
 	for _, m := range res.Models {
-		if m.Endpoint == "" {
+		if m.Endpoint() == "" {
 			continue
 		}
-		u := m.baseURL()
+		u := m.baseURL(cfg.Scheme)
 		urls = append(urls, u)
 		client.SetEndpointModel(u, m.modelName())
 	}
 	client.SetEndpoints(urls)
-	rec.Event("discover", map[string]any{"count": len(res.Models)})
+	rec.Event("discover", map[string]any{"count": len(res.Models), "usable": len(urls), "reservation": cfg.Reservation})
 
 	eyebrow("discovered")
 	for _, w := range res.Warnings {
 		fmt.Println("  " + faint("! %s", w))
 	}
-	for i, m := range res.Models {
+	idx := 0
+	for _, m := range res.Models {
+		if m.Port == 0 {
+			fmt.Printf("  %s      %s  %s\n", healthGlyph(m.Health), m.Node, faint("%s", m.Err))
+			continue
+		}
+		idx++
 		detail := m.display()
 		if m.Engine != "" {
 			detail += "  " + faint("%s", m.Engine)
@@ -297,11 +300,12 @@ func handleDiscoverCmd(line string, client *Client, rec *Recorder, cmd string) b
 		if m.GpuCount > 0 {
 			detail += "  " + faint("%d gpu", m.GpuCount)
 		}
-		fmt.Printf("  %s %2d  %s  %s\n", healthGlyph(m.Health), i+1, m.Node, detail)
+		fmt.Printf("  %s %2d  %s:%d  %s\n", healthGlyph(m.Health), idx, m.Node, m.Port, detail)
 	}
-	if len(res.Models) == 0 {
-		fmt.Println("  " + faint("no models found"))
-	} else {
+	switch {
+	case len(res.Models) == 0:
+		fmt.Println("  " + faint("no running jobs found"))
+	case idx > 0:
 		fmt.Println("  " + faint("switch: /endpoint <n>  (endpoint + model applied together)"))
 	}
 	return true

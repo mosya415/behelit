@@ -200,6 +200,53 @@ func TestRenderMarkdownLine(t *testing.T) {
 	}
 }
 
+func TestGresGpuCount(t *testing.T) {
+	if n := gresGpuCount(map[string]string{"AllocTRES": "cpu=8,mem=64G,gres/gpu=8"}); n != 8 {
+		t.Fatalf("AllocTRES gpu = %d, want 8", n)
+	}
+	if n := gresGpuCount(map[string]string{"TresPerNode": "gres/gpu:4"}); n != 4 {
+		t.Fatalf("TresPerNode gpu = %d, want 4", n)
+	}
+	if n := gpuFromGres("gpu:a100:4"); n != 4 {
+		t.Fatalf("gpuFromGres = %d, want 4", n)
+	}
+}
+
+func TestScanLog(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "job.log")
+	os.WriteFile(f, []byte("sglang launching\nINFO: Uvicorn running on http://0.0.0.0:8085 (Press CTRL+C)\n"), 0o644)
+	port, engine, _ := scanLog(f)
+	if port != 8085 {
+		t.Fatalf("port = %d, want 8085", port)
+	}
+	if engine != "sglang" {
+		t.Fatalf("engine = %q, want sglang", engine)
+	}
+}
+
+func TestLaunchScriptFromSbatch(t *testing.T) {
+	dir := t.TempDir()
+	host := filepath.Join(dir, "host")
+	os.MkdirAll(host, 0o755)
+	script := filepath.Join(host, "startup.sh")
+	os.WriteFile(script, []byte("#!/bin/bash\nvllm serve --model-path /models/DeepSeek-V4-Flash-FP8 --port 8085 --tp 8\n"), 0o644)
+
+	sbatch := filepath.Join(dir, "job.sbatch")
+	os.WriteFile(sbatch, []byte(
+		"#!/bin/bash\nsrun --container-mounts=\""+host+":/cont\" bash -c \"/cont/startup.sh\"\n"), 0o644)
+
+	// mount translation: /cont/startup.sh -> <host>/startup.sh
+	got := resolveLaunchScript(sbatch)
+	if got != script {
+		t.Fatalf("resolveLaunchScript = %q, want %q", got, script)
+	}
+	port, engine, model := parseLaunchScript(got)
+	if port != 8085 || engine != "vllm" || model != "DeepSeek-V4-Flash-FP8" {
+		t.Fatalf("parseLaunchScript = (%d,%q,%q), want (8085,vllm,DeepSeek-V4-Flash-FP8)", port, engine, model)
+	}
+}
+
 func TestTokenize(t *testing.T) {
 	argv, err := tokenize(`git commit -m "a b c"`)
 	if err != nil {
