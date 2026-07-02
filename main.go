@@ -68,23 +68,24 @@ func main() {
 	}
 	banner(cfg, jail, rec, ap, client, notes)
 
+	ed := NewLineEditor(in)
 	for {
-		fmt.Print("\n " + cFaint + "›" + cReset + " ")
-		line, err := in.ReadString('\n')
-		if err != nil { // EOF (Ctrl-D)
-			fmt.Println()
+		fmt.Print("\n")
+		line, err := ed.ReadLine(" " + cFaint + "›" + cReset + " ")
+		if err == errLineCancel {
+			continue
+		}
+		if err != nil { // EOF (Ctrl-D / stream end)
 			return
 		}
-		line = strings.TrimRight(line, "\r\n")
 		// Backslash line-continuation: a line ending in \ keeps reading, so a
 		// long prompt can be typed across several lines.
 		for strings.HasSuffix(line, "\\") {
-			fmt.Print("   " + cFaint + "…" + cReset + " ")
-			cont, err := in.ReadString('\n')
+			cont, err := ed.ReadLine("   " + cFaint + "…" + cReset + " ")
 			if err != nil {
 				break
 			}
-			line = line[:len(line)-1] + "\n" + strings.TrimRight(cont, "\r\n")
+			line = line[:len(line)-1] + "\n" + cont
 		}
 		line = strings.TrimSpace(line)
 		switch line {

@@ -56,6 +56,12 @@ Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find
 
 REPL commands: `/discover`, `/endpoint [n|url]`, `/model [name]`, `/approve [on|off|run|edit|status]`, `/reset`, `/exit`. A line ending in `\` continues on the next line, so long prompts can be typed across several lines.
 
+The prompt is a small line editor (`lineedit.go`): arrow keys move the cursor,
+↑/↓ walk history, and the usual control keys work (Ctrl-A/E/U/W, Ctrl-C to
+cancel a line, Ctrl-D to exit). Typing `/` pops up a live menu of commands;
+Tab completes. It uses raw terminal mode on Linux only and falls back to a plain
+cooked read when stdin is not a terminal (pipes, one-shot) or off Linux.
+
 ### Endpoints
 
 Start with several endpoints and switch between them at runtime — useful on a
@@ -252,6 +258,7 @@ jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
 context.go    transcript trimming to a token budget (prefill control)
 ui.go         terminal styling: palette, hairlines, status glyphs, labels
+lineedit.go   raw-mode line editor: history, cursor keys, /command menu
 discover.go   native Slurm discovery (squeue/scontrol/log/startup-script + probe)
 stream.go     prose filter: hide tool tags, line-buffer for markdown rendering
 markdown.go   terminal markdown renderer (headings, emphasis, code, lists, math)
