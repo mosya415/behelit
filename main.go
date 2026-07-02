@@ -25,8 +25,9 @@ func main() {
 
 	client := NewClient(cfg)
 	in := bufio.NewReader(os.Stdin)
+	ap := NewApprover(in)
 
-	banner(cfg, jail, rec)
+	banner(cfg, jail, rec, ap)
 	rec.Event("session_start", map[string]any{
 		"root": jail.Root, "model": cfg.Model, "endpoint": cfg.BaseURL,
 	})
@@ -53,10 +54,13 @@ func main() {
 			fmt.Println("(transcript cleared)")
 			continue
 		}
+		if handleApproveCmd(line, ap, rec) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, in, rec, &msgs, cfg.MaxSteps)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps)
 		rec.Transcript(msgs)
 	}
 }
@@ -64,7 +68,31 @@ func main() {
 // runTurn drives the agentic loop for one user message: stream the model, execute
 // any tool blocks, feed results back, repeat until the model stops emitting
 // tools (a final answer) or we hit the step cap.
-func runTurn(client *Client, jail *Jail, in *bufio.Reader, rec *Recorder, msgs *[]Message, maxSteps int) {
+// handleApproveCmd processes the /approve REPL command (on|off|status). Returns
+// true if the line was such a command and has been handled.
+func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
+	if !strings.HasPrefix(line, "/approve") {
+		return false
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(line, "/approve"))
+	switch arg {
+	case "on", "all":
+		ap.SetAuto(true)
+		rec.Event("approve_mode", map[string]any{"auto": true})
+		fmt.Println("auto-approve: ON (every action approved without prompting)")
+	case "off":
+		ap.SetAuto(false)
+		rec.Event("approve_mode", map[string]any{"auto": false})
+		fmt.Println("auto-approve: OFF (prompt for each action)")
+	case "", "status":
+		fmt.Printf("approval mode: %s\n", ap.Mode())
+	default:
+		fmt.Println("usage: /approve [on|off|status]")
+	}
+	return true
+}
+
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps int) {
 	for step := 0; step < maxSteps; step++ {
 		printed := false
 		onDelta := func(s string) {
@@ -90,7 +118,7 @@ func runTurn(client *Client, jail *Jail, in *bufio.Reader, rec *Recorder, msgs *
 			return // final answer
 		}
 
-		results := executeBlocks(jail, in, rec, blocks)
+		results := executeBlocks(jail, ap, rec, blocks)
 		*msgs = append(*msgs, Message{Role: "user", Content: results})
 		rec.Transcript(*msgs)
 	}
@@ -98,7 +126,7 @@ func runTurn(client *Client, jail *Jail, in *bufio.Reader, rec *Recorder, msgs *
 	rec.Event("step_cap", map[string]any{"steps": maxSteps})
 }
 
-func executeBlocks(jail *Jail, in *bufio.Reader, rec *Recorder, blocks []Block) string {
+func executeBlocks(jail *Jail, ap *Approver, rec *Recorder, blocks []Block) string {
 	var out strings.Builder
 	for _, b := range blocks {
 		var res string
@@ -112,11 +140,11 @@ func executeBlocks(jail *Jail, in *bufio.Reader, rec *Recorder, blocks []Block) 
 			res = grepTree(jail, b.Attr["pattern"], b.Attr["path"])
 			rec.Event("grep", map[string]any{"pattern": b.Attr["pattern"], "path": b.Attr["path"], "result": summarize(res)})
 		case "edit":
-			res = gatedEdit(jail, in, rec, b)
+			res = gatedEdit(jail, ap, rec, b)
 		case "write":
-			res = gatedWrite(jail, in, rec, b)
+			res = gatedWrite(jail, ap, rec, b)
 		case "run_command":
-			res = gatedRun(jail, in, rec, b)
+			res = gatedRun(jail, ap, rec, b)
 		default:
 			res = "error: unknown tool " + b.Name
 		}
@@ -126,67 +154,70 @@ func executeBlocks(jail *Jail, in *bufio.Reader, rec *Recorder, blocks []Block) 
 	return out.String()
 }
 
-func gatedEdit(jail *Jail, in *bufio.Reader, rec *Recorder, b Block) string {
+func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	abs, err := jail.Resolve(b.Attr["path"])
 	if err != nil {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "error": err.Error()})
 		return "error: " + err.Error()
 	}
-	approved := askApproval(in, "edit "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
+	approved, auto := ap.Confirm("edit "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
 	if !approved {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this edit"
 	}
 	res, err := applyEdit(abs, b.Search, b.Replace)
 	if err != nil {
-		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "error": err.Error()})
+		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
 		return "error: " + err.Error()
 	}
-	rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "result": res})
+	rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "result": res})
 	return res
 }
 
-func gatedWrite(jail *Jail, in *bufio.Reader, rec *Recorder, b Block) string {
+func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	abs, err := jail.Resolve(b.Attr["path"])
 	if err != nil {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "error": err.Error()})
 		return "error: " + err.Error()
 	}
 	preview := fmt.Sprintf("  write %d bytes to %s", len(b.Body), b.Attr["path"])
-	if !askApproval(in, "write "+b.Attr["path"], preview) {
+	approved, auto := ap.Confirm("write "+b.Attr["path"], preview)
+	if !approved {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this write"
 	}
 	res, err := writeWholeFile(abs, b.Body)
 	if err != nil {
-		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "error": err.Error()})
+		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
 		return "error: " + err.Error()
 	}
-	rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "bytes": len(b.Body)})
+	rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "bytes": len(b.Body)})
 	return res
 }
 
-func gatedRun(jail *Jail, in *bufio.Reader, rec *Recorder, b Block) string {
+func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 	cmd := strings.TrimSpace(b.Body)
-	if !askApproval(in, "run", "  $ "+cmd) {
+	approved, auto := ap.Confirm("run", "  $ "+cmd)
+	if !approved {
 		rec.Event("run_command", map[string]any{"cmd": cmd, "approved": false})
 		return "user denied this command"
 	}
 	res := runCommand(jail, cmd)
-	rec.Event("run_command", map[string]any{"cmd": cmd, "approved": true, "result": summarize(res)})
+	rec.Event("run_command", map[string]any{"cmd": cmd, "approved": true, "auto": auto, "result": summarize(res)})
 	return res
 }
 
-func banner(cfg Config, jail *Jail, rec *Recorder) {
+func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver) {
 	who := "?"
 	if u, err := user.Current(); err == nil {
 		who = fmt.Sprintf("%s (uid %s)", u.Username, u.Uid)
 	}
 	fmt.Println("\033[1mLatent Coding Agent\033[0m")
-	fmt.Printf("  user:  %s\n", who)
-	fmt.Printf("  jail:  %s\n", jail.Root)
-	fmt.Printf("  model: %s @ %s\n", cfg.Model, cfg.BaseURL)
-	fmt.Printf("  audit: %s\n", cfg.Dir)
-	fmt.Printf("  log:   %s\n", rec.SessionPath())
-	fmt.Println("  commands: /reset  /exit")
+	fmt.Printf("  user:    %s\n", who)
+	fmt.Printf("  jail:    %s\n", jail.Root)
+	fmt.Printf("  model:   %s @ %s\n", cfg.Model, cfg.BaseURL)
+	fmt.Printf("  audit:   %s\n", cfg.Dir)
+	fmt.Printf("  log:     %s\n", rec.SessionPath())
+	fmt.Printf("  approve: %s\n", ap.Mode())
+	fmt.Println("  commands: /approve [on|off|status]  /reset  /exit")
 }

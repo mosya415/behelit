@@ -58,6 +58,19 @@ REPL commands: `/reset` (clear transcript), `/exit`.
 `read_file`/`grep` run automatically (no side effects). `edit`/`write`/
 `run_command` require an explicit `y` at the prompt.
 
+### Approval modes — `approval.go`
+
+At each gate the prompt is `[y/N/a=all]`:
+
+- `y` — approve just this action
+- `n` / Enter — deny (the model is told and can adjust)
+- `a` — approve this and auto-approve every later action **this session**
+
+Toggle the session mode any time from the REPL: `/approve on`, `/approve off`,
+`/approve status`. The audit log records `auto: true` on every action granted by
+the trust mode, so an interactive `y` and an auto-approval are always
+distinguishable after the fact.
+
 ## Audit & transcript — `recorder.go`
 
 Both artifacts live under `$LCA_DIR` (default `~/.lca`), created `0600` under the
