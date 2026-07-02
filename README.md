@@ -76,7 +76,9 @@ status for the active model. Adoptions and switches are written to the audit log
 
 2. **Applying edits — `edit.go`.** Strict, verbatim `<search>`/`<replace>`. Zero
    matches or more than one match is reported back to the model as an error so it
-   regenerates — never a silent fuzzy pick. `<write>` for whole small files. No
+   regenerates — never a silent fuzzy pick. `<write>` for whole small or new
+   files — it creates missing parent directories (jail-checked first, so new
+   dirs stay inside the root). No
    unified diff (it drifts on quantized weights).
 
 3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the

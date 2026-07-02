@@ -341,8 +341,12 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "error": err.Error()})
 		return "error: " + err.Error()
 	}
-	preview := fmt.Sprintf("  write %d bytes to %s", len(b.Body), b.Attr["path"])
-	approved, auto := ap.Confirm("write "+b.Attr["path"], preview)
+	action := "overwrite"
+	if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+		action = "create"
+	}
+	preview := fmt.Sprintf("  %s %s (%d bytes)", action, b.Attr["path"], len(b.Body))
+	approved, auto := ap.Confirm(action+" "+b.Attr["path"], preview)
 	if !approved {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this write"

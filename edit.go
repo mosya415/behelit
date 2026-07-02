@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -34,13 +35,27 @@ func applyEdit(path, search, replace string) (string, error) {
 	return fmt.Sprintf("edited %s (1 replacement)", path), nil
 }
 
-// writeWholeFile replaces (or creates) a file with the given content. Intended
-// for small files where a full rewrite is clearer than a search/replace.
+// writeWholeFile replaces (or creates) a file with the given content, creating
+// any missing parent directories along the way. Intended for small files where
+// a full rewrite is clearer than a search/replace. `path` is already
+// jail-resolved by the caller, so the created directories stay inside the jail.
 func writeWholeFile(path, content string) (string, error) {
+	dir := filepath.Dir(path)
+	createdDir := false
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", fmt.Errorf("create dir %s: %w", dir, err)
+		}
+		createdDir = true
+	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", fmt.Errorf("write %s: %w", path, err)
 	}
-	return fmt.Sprintf("wrote %s (%d bytes)", path, len(content)), nil
+	msg := fmt.Sprintf("wrote %s (%d bytes)", path, len(content))
+	if createdDir {
+		msg += ", created parent directory"
+	}
+	return msg, nil
 }
 
 // unifiedPreview renders a minimal, human-readable diff for the approval prompt.
