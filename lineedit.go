@@ -31,9 +31,40 @@ var replCommands = []cmdInfo{
 type LineEditor struct {
 	rd      *bufio.Reader
 	history []string
+	models  func() []string // known model names, for /model completion
 }
 
 func NewLineEditor(rd *bufio.Reader) *LineEditor { return &LineEditor{rd: rd} }
+
+// suggestion is one menu entry: what to show, and the full line Tab completes to.
+type suggestion struct{ name, desc, complete string }
+
+// suggest returns menu items for the current buffer: model names after
+// "/model ", otherwise matching command names.
+func (e *LineEditor) suggest(buf string) []suggestion {
+	if arg, ok := strings.CutPrefix(buf, "/model "); ok {
+		if e.models == nil {
+			return nil
+		}
+		var out []suggestion
+		for _, m := range e.models() {
+			if strings.HasPrefix(strings.ToLower(m), strings.ToLower(arg)) {
+				out = append(out, suggestion{name: m, complete: "/model " + m})
+			}
+		}
+		return out
+	}
+	if strings.HasPrefix(buf, "/") && !strings.Contains(buf, " ") {
+		var out []suggestion
+		for _, c := range replCommands {
+			if strings.HasPrefix(c.name, buf) {
+				out = append(out, suggestion{name: c.name, desc: c.desc, complete: c.name + " "})
+			}
+		}
+		return out
+	}
+	return nil
+}
 
 func (e *LineEditor) out(s string) { fmt.Print(s) }
 
@@ -87,8 +118,8 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 			buf, pos = nil, 0
 		case 23: // Ctrl-W — delete previous word
 			buf, pos = deleteWord(buf, pos)
-		case 9: // Tab — complete a /command
-			buf, pos = completeCommand(buf, pos)
+		case 9: // Tab — complete a command / model name
+			buf, pos = e.complete(buf)
 		case 27: // ESC — an escape sequence (arrows etc.)
 			buf, pos, hist = e.escape(buf, pos, hist)
 		default:
@@ -197,11 +228,15 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 // render redraws the input line and, when the line is a "/command" prefix, a
 // menu of matching commands below it, leaving the cursor at the right column.
 func (e *LineEditor) render(prompt string, buf []rune, pos int) {
-	menu := menuMatches(string(buf))
+	menu := e.suggest(string(buf))
 	e.out("\r\033[J") // clear from line start down (input + any old menu)
 	e.out(prompt + string(buf))
 	for _, m := range menu {
-		e.out("\r\n  " + cFaint + fmt.Sprintf("%-11s", m.name) + cReset + " " + cFaint + m.desc + cReset)
+		line := "\r\n  " + cFaint + fmt.Sprintf("%-11s", m.name) + cReset
+		if m.desc != "" {
+			line += " " + cFaint + m.desc + cReset
+		}
+		e.out(line)
 	}
 	if len(menu) > 0 {
 		e.out(fmt.Sprintf("\033[%dA", len(menu))) // back up to the input line
@@ -222,37 +257,26 @@ func (e *LineEditor) cooked(prompt string) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-func menuMatches(buf string) []cmdInfo {
-	if !strings.HasPrefix(buf, "/") || strings.Contains(buf, " ") {
-		return nil
+// complete completes the buffer against the current suggestions: fully if there
+// is one, else to the longest common prefix.
+func (e *LineEditor) complete(buf []rune) ([]rune, int) {
+	items := e.suggest(string(buf))
+	if len(items) == 0 {
+		return buf, len(buf)
 	}
-	var out []cmdInfo
-	for _, c := range replCommands {
-		if strings.HasPrefix(c.name, buf) {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-func completeCommand(buf []rune, pos int) ([]rune, int) {
-	m := menuMatches(string(buf))
-	if len(m) == 0 {
-		return buf, pos
-	}
-	if len(m) == 1 {
-		s := []rune(m[0].name + " ")
+	if len(items) == 1 {
+		s := []rune(items[0].complete)
 		return s, len(s)
 	}
-	common := m[0].name
-	for _, c := range m[1:] {
-		common = commonPrefix(common, c.name)
+	common := items[0].complete
+	for _, it := range items[1:] {
+		common = commonPrefix(common, it.complete)
 	}
 	if len([]rune(common)) > len(buf) {
 		s := []rune(common)
 		return s, len(s)
 	}
-	return buf, pos
+	return buf, len(buf)
 }
 
 func commonPrefix(a, b string) string {

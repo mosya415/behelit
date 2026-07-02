@@ -69,6 +69,7 @@ func main() {
 	banner(cfg, jail, rec, ap, client, notes)
 
 	ed := NewLineEditor(in)
+	ed.models = client.KnownModels
 	for {
 		fmt.Print("\n")
 		line, err := ed.ReadLine(" " + cFaint + "›" + cReset + " ")

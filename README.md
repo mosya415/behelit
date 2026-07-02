@@ -59,7 +59,8 @@ REPL commands: `/discover`, `/endpoint [n|url]`, `/model [name]`, `/approve [on|
 The prompt is a small line editor (`lineedit.go`): arrow keys move the cursor,
 ↑/↓ walk history, and the usual control keys work (Ctrl-A/E/U/W, Ctrl-C to
 cancel a line, Ctrl-D to exit). Typing `/` pops up a live menu of commands;
-Tab completes. It uses raw terminal mode on Linux only and falls back to a plain
+Tab completes — and after `/model ` the menu suggests the models learned from
+`/discover`. It uses raw terminal mode on Linux only and falls back to a plain
 cooked read when stdin is not a terminal (pipes, one-shot) or off Linux.
 
 The input area is fenced by a hairline above and below, and a submitted prompt

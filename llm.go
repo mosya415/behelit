@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -78,6 +79,21 @@ func (c *Client) SetEndpointModel(url, model string) {
 	c.epModel[strings.TrimRight(url, "/")] = model
 }
 func (c *Client) EndpointModel(url string) string { return c.epModel[strings.TrimRight(url, "/")] }
+
+// KnownModels returns the distinct model names learned from discovery (sorted),
+// for /model completion.
+func (c *Client) KnownModels() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range c.epModel {
+		if m != "" && !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 // SetEndpoint switches the active endpoint and remembers it in the known list.
 // It normalizes a human-typed address: trailing slash trimmed, http:// prepended
