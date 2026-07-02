@@ -284,11 +284,10 @@ func handleDiscoverCmd(line string, client *Client, rec *Recorder, cfg Config) b
 	for _, w := range res.Warnings {
 		fmt.Println("  " + faint("! %s", w))
 	}
-	idx, skipped := 0, 0
+	idx := 0
 	for _, m := range res.Models {
 		if m.Port == 0 {
-			skipped++ // a running job with no inference server — not a model
-			continue
+			continue // a running job with no inference server — not a model
 		}
 		idx++
 		detail := m.display()
@@ -307,9 +306,6 @@ func handleDiscoverCmd(line string, client *Client, rec *Recorder, cfg Config) b
 		fmt.Println("  " + faint("no models found"))
 	} else {
 		fmt.Println("  " + faint("switch: /endpoint <n>  (endpoint + model applied together)"))
-	}
-	if skipped > 0 {
-		fmt.Println("  " + faint("(%d running job(s) without a serving port hidden)", skipped))
 	}
 	return true
 }
