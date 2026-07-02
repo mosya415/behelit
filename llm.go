@@ -24,7 +24,8 @@ type Message struct {
 type Client struct {
 	http      *http.Client
 	baseURL   string
-	endpoints []string // known endpoints, for /endpoint switching
+	endpoints []string          // known endpoints, for /endpoint switching
+	epModel   map[string]string // endpoint URL → model, learned from discovery
 	model     string
 	apiKey    string
 	temp      float64
@@ -39,6 +40,7 @@ func NewClient(cfg Config) *Client {
 		http:      &http.Client{Timeout: 10 * time.Minute},
 		baseURL:   cfg.BaseURL,
 		endpoints: eps,
+		epModel:   map[string]string{},
 		model:     cfg.Model,
 		apiKey:    cfg.APIKey,
 		temp:      cfg.Temperature,
@@ -46,6 +48,35 @@ func NewClient(cfg Config) *Client {
 }
 
 func (c *Client) Endpoints() []string { return c.endpoints }
+
+// SetEndpoints replaces the known-endpoint list (deduped) with the discovered
+// ones first (so their order matches the /discover picker), keeping the current
+// endpoint reachable at the end. A no-op when nothing was discovered.
+func (c *Client) SetEndpoints(urls []string) {
+	seen := map[string]bool{}
+	var list []string
+	for _, u := range urls {
+		u = strings.TrimRight(u, "/")
+		if u != "" && !seen[u] {
+			seen[u] = true
+			list = append(list, u)
+		}
+	}
+	if len(list) == 0 {
+		return // nothing discovered → keep the existing list
+	}
+	if !seen[c.baseURL] {
+		list = append(list, c.baseURL) // keep current reachable, at the end
+	}
+	c.endpoints = list
+}
+
+// SetEndpointModel / EndpointModel remember which model a discovered endpoint
+// serves, so switching to it can select that model automatically.
+func (c *Client) SetEndpointModel(url, model string) {
+	c.epModel[strings.TrimRight(url, "/")] = model
+}
+func (c *Client) EndpointModel(url string) string { return c.epModel[strings.TrimRight(url, "/")] }
 
 // SetEndpoint switches the active endpoint (trailing slash trimmed, http://
 // prepended when no scheme is given) and remembers it in the known list.

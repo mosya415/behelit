@@ -23,6 +23,7 @@ type Config struct {
 	Dir         string   // where the audit log and session transcripts are written
 	Raw         bool     // stream raw model text (show tool tags) — for protocol debugging
 	Discover    bool     // query /models to adopt/validate the model (off = trust configured name)
+	DiscoverCmd string   // external endpoint-discovery command (e.g. modelstat --json)
 }
 
 func env(key, def string) string {
@@ -52,6 +53,7 @@ func loadConfig() Config {
 		CtxTokens:   atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
 		Raw:         os.Getenv("LCA_RAW") != "",
 		Discover:    os.Getenv("LCA_DISCOVER") != "",
+		DiscoverCmd: os.Getenv("LCA_DISCOVER_CMD"),
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

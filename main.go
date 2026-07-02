@@ -93,6 +93,9 @@ func main() {
 		if handleEndpointCmd(line, client, rec, cfg.Discover) {
 			continue
 		}
+		if handleDiscoverCmd(line, client, rec, cfg.DiscoverCmd) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
@@ -216,10 +219,76 @@ func handleEndpointCmd(line string, client *Client, rec *Recorder, discover bool
 	rec.Event("endpoint_change", map[string]any{"from": prev, "to": client.Endpoint()})
 	fmt.Printf("  %sENDPOINT%s %s → %s\n", cFaint, cReset, prev, client.Endpoint())
 
+	// If discovery learned which model this endpoint serves, select it too.
+	if m := client.EndpointModel(client.Endpoint()); m != "" && m != client.Model() {
+		client.SetModel(m)
+		rec.Event("model_change", map[string]any{"from": prev, "to": m, "via": "endpoint"})
+		fmt.Printf("  %sMODEL%s → %s\n", cFaint, cReset, m)
+	}
+
 	if discover {
 		for _, n := range reconcileModel(client, rec) {
 			fmt.Println("  " + n)
 		}
+	}
+	return true
+}
+
+// handleDiscoverCmd runs the external discovery command (LCA_DISCOVER_CMD), then
+// refreshes the endpoint list from its results and prints a picker. Addresses go
+// stale on requeue/preemption, so this is re-run on demand and never cached.
+func handleDiscoverCmd(line string, client *Client, rec *Recorder, cmd string) bool {
+	if _, ok := commandArg(line, "/discover", "/disc"); !ok {
+		return false
+	}
+	if strings.TrimSpace(cmd) == "" {
+		fmt.Println("  " + faint("set LCA_DISCOVER_CMD, e.g."))
+		fmt.Println("  " + faint(`LCA_DISCOVER_CMD='python3 -m modelstat --discovery slurm --json -R gigalearn-test'`))
+		return true
+	}
+
+	fmt.Println(" " + faint("%s DISCOVER  running…", gNone))
+	res, err := runDiscovery(cmd)
+	if err != nil {
+		fmt.Println("  " + warn("%v", err))
+		rec.Event("discover", map[string]any{"error": err.Error()})
+		return true
+	}
+
+	// Refresh the endpoint list and remember model-per-endpoint.
+	var urls []string
+	for _, m := range res.Models {
+		if m.Endpoint == "" {
+			continue
+		}
+		u := m.baseURL()
+		urls = append(urls, u)
+		client.SetEndpointModel(u, m.modelName())
+	}
+	client.SetEndpoints(urls)
+	rec.Event("discover", map[string]any{"count": len(res.Models)})
+
+	eyebrow("discovered")
+	for _, w := range res.Warnings {
+		fmt.Println("  " + faint("! %s", w))
+	}
+	for i, m := range res.Models {
+		detail := m.display()
+		if m.Engine != "" {
+			detail += "  " + faint("%s", m.Engine)
+		}
+		if m.MaxModelLen > 0 {
+			detail += "  " + faint("ctx %d", m.MaxModelLen)
+		}
+		if m.GpuCount > 0 {
+			detail += "  " + faint("%d gpu", m.GpuCount)
+		}
+		fmt.Printf("  %s %2d  %s  %s\n", healthGlyph(m.Health), i+1, m.Node, detail)
+	}
+	if len(res.Models) == 0 {
+		fmt.Println("  " + faint("no models found"))
+	} else {
+		fmt.Println("  " + faint("switch: /endpoint <n>  (endpoint + model applied together)"))
 	}
 	return true
 }
@@ -587,5 +656,5 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	kv("log", rec.SessionPath())
 	kv("approve", strings.ToUpper(ap.Mode()))
 	hr()
-	fmt.Println(" " + faint("/model [name]   /endpoint [n|url]   /approve [on|off|run|edit|status]   /reset   /exit"))
+	fmt.Println(" " + faint("/discover   /endpoint [n|url]   /model [name]   /approve [on|off|run|edit|status]   /reset   /exit"))
 }

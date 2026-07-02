@@ -47,6 +47,7 @@ are denied rather than run unattended.
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
+| `LCA_DISCOVER_CMD` | unset                      | External endpoint-discovery command for `/discover` (e.g. `modelstat --json`) |
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
@@ -68,6 +69,26 @@ route still reads as up) or `✕` down (transport error) for each, current marke
 address (added to the list) — handy when a SLURM allocation hands out a fresh
 `host:port`. A bare `host:port` gets `http://` prepended; include the base path
 (e.g. `.../v1`) the server expects. Switches are audited (`endpoint_change`).
+
+### Discovery via an external command
+
+On a scheduler-driven cluster, endpoints move (requeue/preemption) and the port
+lives in the container startup script, not the router. Rather than reimplement
+that, `lca` shells out to a discovery tool you configure via `LCA_DISCOVER_CMD`
+— e.g. the SLURM-aware `modelstat`:
+
+```sh
+LCA_DISCOVER_CMD='python3 -m modelstat --discovery slurm --json -R gigalearn-test' ./lca
+```
+
+`/discover` runs it, parses its JSON (`{models:[{endpoint,health,model,
+served_names,engine,max_model_len,node,gpu_count,…}]}`), refreshes the endpoint
+list and prints a picker with per-model health (`● up`, `◐ unhealthy`, `✕ down`).
+Each `host:port` becomes `http://host:port/v1`, and the served model name is
+remembered — so `/endpoint <n>` switches endpoint **and** selects that endpoint's
+model together. Nothing is cached: re-run `/discover` whenever addresses may have
+changed. The command is operator-configured (not model-driven) and runs outside
+the tool jail.
 
 ### Model selection
 
@@ -222,6 +243,7 @@ jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
 context.go    transcript trimming to a token budget (prefill control)
 ui.go         terminal styling: palette, hairlines, status glyphs, labels
+discover.go   external endpoint discovery (runs modelstat --json, parses it)
 stream.go     prose filter: hide tool tags, line-buffer for markdown rendering
 markdown.go   terminal markdown renderer (headings, emphasis, code, lists, math)
 math.go       LaTeX-ish → Unicode approximation for inline/display math
