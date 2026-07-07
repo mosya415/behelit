@@ -233,6 +233,11 @@ type chatRequest struct {
 	Temperature float64   `json:"temperature"`
 	Stream      bool      `json:"stream"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
+	// Continue the final (assistant) message verbatim instead of starting a new
+	// turn — used to reassemble a reply that was cut off by the length limit
+	// (vLLM/SGLang honor these; other fields are omitted on a normal request).
+	ContinueFinalMessage bool  `json:"continue_final_message,omitempty"`
+	AddGenerationPrompt  *bool `json:"add_generation_prompt,omitempty"`
 }
 
 type chatResponse struct {
@@ -306,14 +311,20 @@ type streamChunk struct {
 // text fragment, and returns the assembled text plus the finish reason ("stop",
 // "length", …). We parse the token stream ourselves; the tool-call protocol only
 // sees the final text, so streaming is purely a UX layer.
-func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, string, error) {
-	body, err := json.Marshal(chatRequest{
+func (c *Client) CompleteStream(msgs []Message, onDelta func(string), continueFinal bool) (string, string, error) {
+	cr := chatRequest{
 		Model:       c.model,
 		Messages:    msgs,
 		Temperature: c.temp,
 		Stream:      true,
 		MaxTokens:   c.maxTokens,
-	})
+	}
+	if continueFinal {
+		no := false
+		cr.ContinueFinalMessage = true
+		cr.AddGenerationPrompt = &no
+	}
+	body, err := json.Marshal(cr)
 	if err != nil {
 		return "", "", err
 	}

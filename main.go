@@ -469,6 +469,7 @@ func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
 // any tool blocks, feed results back, repeat until the model stops emitting
 // tools (a final answer) or we hit the step cap.
 func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw bool) {
+	continuing := false // the previous step was cut off by length; continue it
 	for step := 0; step < maxSteps; step++ {
 		pw := newProseWriter(raw)
 
@@ -477,25 +478,34 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
-		reply, finish, err := client.CompleteStream(send, pw.feed)
+		reply, finish, err := client.CompleteStream(send, pw.feed, continuing)
 		pw.end()
 		if err != nil {
 			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
 			rec.Event("error", map[string]any{"err": err.Error()})
 			return
 		}
-		*msgs = append(*msgs, Message{Role: "assistant", Content: reply})
 
-		blocks := ParseBlocks(reply)
+		// On a continuation, append verbatim to the same assistant message so a
+		// tool block that was split by the length limit reassembles; otherwise
+		// start a new assistant message.
+		if continuing {
+			(*msgs)[len(*msgs)-1].Content += reply
+		} else {
+			*msgs = append(*msgs, Message{Role: "assistant", Content: reply})
+		}
+		continuing = false
+		full := (*msgs)[len(*msgs)-1].Content
+
+		blocks := ParseBlocks(full)
 		if len(blocks) == 0 {
-			// The model hit the generation length limit mid-thought and produced
-			// no usable tool call — continue automatically instead of ending the
-			// turn and making the user type "continue".
+			// Cut off by the length limit mid-thought with no usable tool call —
+			// continue the same message automatically instead of ending the turn
+			// and making the user type "continue".
 			if finish == "length" {
 				fmt.Println(" " + faint("%s response truncated — continuing…", gNone))
 				rec.Event("auto_continue", map[string]any{"finish": finish})
-				*msgs = append(*msgs, Message{Role: "user", Content: "Continue exactly where you left off. Do not repeat what you already wrote."})
-				rec.Transcript(*msgs)
+				continuing = true
 				continue
 			}
 			return // final answer
