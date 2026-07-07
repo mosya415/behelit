@@ -532,6 +532,19 @@ func looksLikeStrayEdit(s string) bool {
 	return false
 }
 
+// looksStalled reports whether a no-tool reply seems to have announced a next
+// step without doing it — its last non-empty line trails off on a colon or an
+// ellipsis. Used only to auto-continue a stalled turn (bounded).
+func looksStalled(s string) bool {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return strings.HasSuffix(t, ":") || strings.HasSuffix(t, "…") || strings.HasSuffix(t, "...")
+		}
+	}
+	return false
+}
+
 func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink bool, lastReason *string) {
 	*lastReason = ""    // reasoning captured this turn, for /think last
 	continuing := false // the previous step was cut off by length; continue it
@@ -588,6 +601,16 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 				fmt.Println(" " + faint("%s that was a diff, not an edit — asking for a tool call…", gNone))
 				rec.Event("nudge_edit", nil)
 				*msgs = append(*msgs, Message{Role: "user", Content: "That change was shown as a diff / code block, which does NOT modify any file. Redo it now as an <edit> or <write> tool call exactly per the protocol, then stop."})
+				rec.Transcript(*msgs)
+				continue
+			}
+			// The model announced a next step but didn't emit a tool call (its
+			// message trails off) — nudge it to actually act (bounded).
+			if nudges < 2 && looksStalled(full) {
+				nudges++
+				fmt.Println(" " + faint("%s continuing…", gNone))
+				rec.Event("nudge_continue", nil)
+				*msgs = append(*msgs, Message{Role: "user", Content: "Continue with the next step now — emit the tool tag for it. Do not stop until the task is done."})
 				rec.Transcript(*msgs)
 				continue
 			}

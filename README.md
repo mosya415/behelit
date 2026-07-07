@@ -208,6 +208,10 @@ making you type "continue". And if the model *describes* a change as a diff or
 code block instead of emitting an `<edit>`/`<write>` tag (so nothing would be
 applied), the agent asks it to redo the change as a real tool call
 (`nudge_edit`, bounded so a genuine "show me a diff" answer still ends).
+Likewise, if a no-tool reply trails off (ends on a colon/ellipsis) as if it
+announced a next step without doing it, the agent nudges it to continue
+(`nudge_continue`, bounded). The system prompt also tells the model it runs in
+an automatic loop and must emit the next tool call rather than wait.
 
 3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the
    prompt. The model pulls what it needs via auto-running
