@@ -62,7 +62,8 @@ func main() {
 		}
 		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 		msgs = append(msgs, Message{Role: "user", Content: prompt})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking)
+		var reason string
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking, &reason)
 		rec.Transcript(msgs)
 		return
 	}
@@ -75,6 +76,7 @@ func main() {
 	ed := NewLineEditor(in)
 	ed.models = client.KnownModels
 	showThink := cfg.ShowThinking
+	var lastReason string
 	for {
 		fmt.Print("\n")
 		line, err := ed.ReadLine(" " + cFaint + "›" + cReset + " ")
@@ -117,13 +119,13 @@ func main() {
 		if handleDiscoverCmd(line, client, rec, cfg) {
 			continue
 		}
-		if handleThinkCmd(line, &showThink, rec) {
+		if handleThinkCmd(line, &showThink, lastReason, rec) {
 			continue
 		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink, &lastReason)
 		rec.Transcript(msgs)
 	}
 }
@@ -447,10 +449,21 @@ func readyLine(m ModelInfo) string {
 
 // handleThinkCmd toggles whether model reasoning is expanded or collapsed to a
 // compact marker. /think toggles; /think on|off sets it explicitly.
-func handleThinkCmd(line string, show *bool, rec *Recorder) bool {
+func handleThinkCmd(line string, show *bool, lastReason string, rec *Recorder) bool {
 	arg, ok := commandArg(line, "/think")
 	if !ok {
 		return false
+	}
+	if arg == "last" {
+		if strings.TrimSpace(lastReason) == "" {
+			fmt.Println("  " + faint("no reasoning captured for the last answer"))
+			return true
+		}
+		eyebrow("reasoning · last answer")
+		for _, ln := range strings.Split(lastReason, "\n") {
+			fmt.Println("  " + faint("%s", ln))
+		}
+		return true
 	}
 	switch arg {
 	case "on", "show", "expand":
@@ -519,7 +532,8 @@ func looksLikeStrayEdit(s string) bool {
 	return false
 }
 
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink bool) {
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink bool, lastReason *string) {
+	*lastReason = ""    // reasoning captured this turn, for /think last
 	continuing := false // the previous step was cut off by length; continue it
 	nudges := 0         // times we asked the model to redo a stray diff as a tool call
 	for step := 0; step < maxSteps; step++ {
@@ -532,6 +546,12 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 		}
 		reply, finish, err := client.CompleteStream(send, pw.feed, pw.feedReasoning, continuing)
 		pw.end()
+		if len(pw.reasonLog) > 0 {
+			if *lastReason != "" {
+				*lastReason += "\n"
+			}
+			*lastReason += strings.Join(pw.reasonLog, "\n")
+		}
 		if err != nil {
 			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
 			rec.Event("error", map[string]any{"err": err.Error()})

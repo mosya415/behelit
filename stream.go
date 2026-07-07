@@ -37,6 +37,7 @@ type proseWriter struct {
 	reason      strings.Builder // partial line of reasoning_content (separate field)
 	showThink   bool            // expand reasoning; else collapse to a "thinking…" marker
 	thinkMarked bool            // the collapsed "thinking…" marker was already shown
+	reasonLog   []string        // all reasoning lines this step (for /think last)
 }
 
 func newProseWriter(raw, showThink bool) *proseWriter {
@@ -84,10 +85,6 @@ func (p *proseWriter) feedReasoning(s string) {
 		p.out(cFaint + s + cReset)
 		return
 	}
-	if !p.showThink {
-		p.thinkMark()
-		return
-	}
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\n' {
 			p.flushReason()
@@ -98,10 +95,17 @@ func (p *proseWriter) feedReasoning(s string) {
 }
 
 func (p *proseWriter) flushReason() {
-	if t := strings.TrimSpace(p.reason.String()); t != "" {
-		p.printLine(faint("%s", t))
-	}
+	t := strings.TrimSpace(p.reason.String())
 	p.reason.Reset()
+	if t == "" {
+		return
+	}
+	p.reasonLog = append(p.reasonLog, t)
+	if p.showThink {
+		p.printLine(faint("%s", t))
+	} else {
+		p.thinkMark()
+	}
 }
 
 func (p *proseWriter) end() {
@@ -158,6 +162,7 @@ func (p *proseWriter) flushLine(raw string) {
 			return
 		}
 		if trimmed != "" {
+			p.reasonLog = append(p.reasonLog, trimmed)
 			if p.showThink {
 				p.printLine(faint("%s", trimmed))
 			} else {
