@@ -499,7 +499,7 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
-		reply, finish, err := client.CompleteStream(send, pw.feed, continuing)
+		reply, finish, err := client.CompleteStream(send, pw.feed, pw.feedReasoning, continuing)
 		pw.end()
 		if err != nil {
 			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())

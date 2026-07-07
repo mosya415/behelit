@@ -31,8 +31,10 @@ type proseWriter struct {
 	started        bool // the assistant bullet has been printed at least once
 	pendingNewline bool // a line was printed; emit the separator before the next
 
-	line  strings.Builder // current line buffer (until newline)
-	table []string        // buffered consecutive table rows (rendered on flush)
+	line     strings.Builder // current line buffer (until newline)
+	table    []string        // buffered consecutive table rows (rendered on flush)
+	thinking bool            // inside a <think>…</think> reasoning block
+	reason   strings.Builder // partial line of reasoning_content (separate field)
 }
 
 func newProseWriter(raw bool) *proseWriter { return &proseWriter{raw: raw} }
@@ -48,6 +50,7 @@ func (p *proseWriter) feed(s string) {
 		p.out(s)
 		return
 	}
+	p.flushReason() // any pending reasoning line closes before answer content
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\n' {
 			p.flushLine(p.line.String())
@@ -58,6 +61,33 @@ func (p *proseWriter) feed(s string) {
 	}
 }
 
+// feedReasoning consumes reasoning_content deltas (the separate field some
+// reasoning models stream) and renders them dimmed, line by line.
+func (p *proseWriter) feedReasoning(s string) {
+	if p.raw {
+		if !p.started {
+			p.out("\n " + cBold + gUp + cReset + " ")
+			p.started = true
+		}
+		p.out(cFaint + s + cReset)
+		return
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			p.flushReason()
+		} else {
+			p.reason.WriteByte(s[i])
+		}
+	}
+}
+
+func (p *proseWriter) flushReason() {
+	if t := strings.TrimSpace(p.reason.String()); t != "" {
+		p.printLine(faint("%s", t))
+	}
+	p.reason.Reset()
+}
+
 func (p *proseWriter) end() {
 	if p.raw {
 		if p.started {
@@ -65,6 +95,7 @@ func (p *proseWriter) end() {
 		}
 		return
 	}
+	p.flushReason()
 	if p.line.Len() > 0 {
 		p.flushLine(p.line.String())
 		p.line.Reset()
@@ -91,6 +122,23 @@ func (p *proseWriter) flushLine(raw string) {
 		if m[3] != "/" {
 			p.inBlock = true
 			p.closeTag = "</" + m[1] + ">"
+		}
+		return
+	}
+
+	// (1b) reasoning: <think>…</think> in the content — render dimmed, drop tags.
+	if !p.thinking {
+		if trimmed == "<think>" || trimmed == "<thinking>" {
+			p.thinking = true
+			return
+		}
+	} else {
+		if trimmed == "</think>" || trimmed == "</thinking>" {
+			p.thinking = false
+			return
+		}
+		if trimmed != "" {
+			p.printLine(faint("%s", trimmed))
 		}
 		return
 	}

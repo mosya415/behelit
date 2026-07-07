@@ -301,7 +301,8 @@ func (c *Client) Complete(msgs []Message) (string, error) {
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -311,7 +312,7 @@ type streamChunk struct {
 // text fragment, and returns the assembled text plus the finish reason ("stop",
 // "length", …). We parse the token stream ourselves; the tool-call protocol only
 // sees the final text, so streaming is purely a UX layer.
-func (c *Client) CompleteStream(msgs []Message, onDelta func(string), continueFinal bool) (string, string, error) {
+func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), continueFinal bool) (string, string, error) {
 	cr := chatRequest{
 		Model:       c.model,
 		Messages:    msgs,
@@ -366,6 +367,9 @@ func (c *Client) CompleteStream(msgs []Message, onDelta func(string), continueFi
 			}
 			var chunk streamChunk
 			if json.Unmarshal([]byte(data), &chunk) == nil && len(chunk.Choices) > 0 {
+				if r := chunk.Choices[0].Delta.ReasoningContent; r != "" && onReason != nil {
+					onReason(r) // display-only; not part of the returned answer
+				}
 				if d := chunk.Choices[0].Delta.Content; d != "" {
 					sb.WriteString(d)
 					onDelta(d)

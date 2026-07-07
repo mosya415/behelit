@@ -166,6 +166,12 @@ a legible approximation, not true typesetting — for that, use the (not-yet-bui
 HTML report. Rendering is line-buffered (a line is formatted once complete);
 `LCA_RAW=1` disables all of it and streams verbatim.
 
+Reasoning from "thinking" models is rendered dimmed, set apart from the answer:
+a `<think>…</think>` block in the content has its tags dropped and its lines
+shown faint, and a separate `reasoning_content` stream field (vLLM/SGLang
+reasoning parsers) is shown the same way. Reasoning is display-only — it is not
+part of the answer returned to the model.
+
 ## Design (the four non-trivial parts)
 
 1. **Tool-call transport — `protocol.go`.** The model emits line-anchored XML-ish
