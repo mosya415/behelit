@@ -31,25 +31,66 @@ type proseWriter struct {
 	started        bool // the assistant bullet has been printed at least once
 	pendingNewline bool // a line was printed; emit the separator before the next
 
-	line        strings.Builder // current line buffer (until newline)
-	table       []string        // buffered consecutive table rows (rendered on flush)
-	thinking    bool            // inside a <think>…</think> reasoning block
-	reason      strings.Builder // partial line of reasoning_content (separate field)
-	showThink   bool            // expand reasoning; else collapse to a "thinking…" marker
-	thinkMarked bool            // the collapsed "thinking…" marker was already shown
-	reasonLog   []string        // all reasoning lines this step (for /think last)
+	line         strings.Builder // current line buffer (until newline)
+	table        []string        // buffered consecutive table rows (rendered on flush)
+	thinking     bool            // inside a <think>…</think> reasoning block
+	reason       strings.Builder // partial line of reasoning_content (separate field)
+	showThink    bool            // expand reasoning; else collapse to an animated marker
+	reasonLog    []string        // all reasoning lines this step (for /think last)
+	markerActive bool            // the animated "thinking" marker is on the current line
+	markerPrefix string          // gutter prefix used to redraw the marker in place
+	dotPhase     int             // animation phase for the marker's dots
+	anim         bool            // redraw in place (only when stdout is a real terminal)
 }
 
 func newProseWriter(raw, showThink bool) *proseWriter {
-	return &proseWriter{raw: raw, showThink: showThink}
+	return &proseWriter{raw: raw, showThink: showThink, anim: osTermWidth() > 0}
 }
 
-// thinkMark shows the compact collapsed-reasoning marker once per message.
-func (p *proseWriter) thinkMark() {
-	if !p.thinkMarked {
-		p.printLine(faint("thinking…"))
-		p.thinkMarked = true
+// leadMarker opens the marker line with the assistant gutter.
+func (p *proseWriter) leadMarker() {
+	if !p.started {
+		p.markerPrefix = " " + cBold + gUp + cReset + " "
+		p.started = true
+	} else {
+		p.markerPrefix = "   "
 	}
+	p.out("\n" + p.markerPrefix)
+}
+
+// animateThinking shows the collapsed-reasoning marker. On a terminal it redraws
+// in place so the dots move (thinking. → thinking.. → …); when piped it prints a
+// single static marker (no escape codes to pollute the output).
+func (p *proseWriter) animateThinking() {
+	if !p.anim {
+		if !p.markerActive {
+			p.leadMarker()
+			p.out(cFaint + "thinking…" + cReset)
+			p.markerActive = true
+		}
+		return
+	}
+	label := cFaint + "thinking" + strings.Repeat(".", 1+p.dotPhase%3) + cReset
+	p.dotPhase++
+	if !p.markerActive {
+		p.leadMarker()
+		p.out(label)
+		p.markerActive = true
+		return
+	}
+	p.out("\r\033[K" + p.markerPrefix + label) // redraw the same line
+}
+
+// closeMarker finalizes the marker (steady "thinking…") when the answer begins.
+func (p *proseWriter) closeMarker() {
+	if !p.markerActive {
+		return
+	}
+	if p.anim {
+		p.out("\r\033[K" + p.markerPrefix + cFaint + "thinking…" + cReset)
+	}
+	p.markerActive = false
+	p.pendingNewline = true
 }
 
 func (p *proseWriter) out(s string) { fmt.Print(s) }
@@ -92,6 +133,9 @@ func (p *proseWriter) feedReasoning(s string) {
 			p.reason.WriteByte(s[i])
 		}
 	}
+	if !p.showThink {
+		p.animateThinking() // advance the marker per delta so it visibly moves
+	}
 }
 
 func (p *proseWriter) flushReason() {
@@ -100,11 +144,9 @@ func (p *proseWriter) flushReason() {
 	if t == "" {
 		return
 	}
-	p.reasonLog = append(p.reasonLog, t)
+	p.reasonLog = append(p.reasonLog, t) // captured for /think last regardless of mode
 	if p.showThink {
 		p.printLine(faint("%s", t))
-	} else {
-		p.thinkMark()
 	}
 }
 
@@ -120,6 +162,7 @@ func (p *proseWriter) end() {
 		p.flushLine(p.line.String())
 		p.line.Reset()
 	}
+	p.closeMarker()
 	p.flushTable()
 	if p.started {
 		p.out("\n")
@@ -152,7 +195,7 @@ func (p *proseWriter) flushLine(raw string) {
 		if trimmed == "<think>" || trimmed == "<thinking>" {
 			p.thinking = true
 			if !p.showThink {
-				p.thinkMark()
+				p.animateThinking()
 			}
 			return
 		}
@@ -166,11 +209,14 @@ func (p *proseWriter) flushLine(raw string) {
 			if p.showThink {
 				p.printLine(faint("%s", trimmed))
 			} else {
-				p.thinkMark()
+				p.animateThinking()
 			}
 		}
 		return
 	}
+
+	// The answer proper begins — finalize any animated reasoning marker.
+	p.closeMarker()
 
 	// (2) fenced code blocks: toggle on ``` / ~~~, print inner lines verbatim.
 	if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
