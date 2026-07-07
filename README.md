@@ -172,8 +172,8 @@ a `<think>…</think>` block in the content has its tags dropped and its lines
 shown faint, and a separate `reasoning_content` stream field (vLLM/SGLang
 reasoning parsers) is shown the same way. Reasoning is display-only — it is not
 part of the answer returned to the model. `/think` collapses reasoning to a
-compact `thinking…` marker (its dots animate in place while the model is
-thinking) or expands it back; `/think last` reprints the last answer's reasoning
+compact marker with a timer-driven braille spinner (`⠋ thinking`) while the
+model is thinking, or expands it back; `/think last` reprints the last answer's reasoning
 even if it was collapsed (start collapsed with `LCA_HIDE_THINKING`).
 
 ## Design (the four non-trivial parts)

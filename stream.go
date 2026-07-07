@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // proseWriter filters and formats the streamed assistant text for HUMAN display.
@@ -37,10 +38,12 @@ type proseWriter struct {
 	reason       strings.Builder // partial line of reasoning_content (separate field)
 	showThink    bool            // expand reasoning; else collapse to an animated marker
 	reasonLog    []string        // all reasoning lines this step (for /think last)
-	markerActive bool            // the animated "thinking" marker is on the current line
+	markerActive bool            // the "thinking" marker is on the current line
 	markerPrefix string          // gutter prefix used to redraw the marker in place
-	dotPhase     int             // animation phase for the marker's dots
-	anim         bool            // redraw in place (only when stdout is a real terminal)
+	anim         bool            // animate on a real terminal (not when piped)
+	spinning     bool            // the timer-driven spinner goroutine is running
+	spinStop     chan struct{}   // signals the spinner to exit
+	spinDone     chan struct{}   // closed when the spinner goroutine has exited
 }
 
 func newProseWriter(raw, showThink bool) *proseWriter {
@@ -58,35 +61,53 @@ func (p *proseWriter) leadMarker() {
 	p.out("\n" + p.markerPrefix)
 }
 
-// animateThinking shows the collapsed-reasoning marker. On a terminal it redraws
-// in place so the dots move (thinking. → thinking.. → …); when piped it prints a
-// single static marker (no escape codes to pollute the output).
-func (p *proseWriter) animateThinking() {
+// beginReasoning shows the collapsed-reasoning marker once. On a terminal it
+// starts a timer-driven braille spinner (smooth, independent of token speed);
+// piped, it prints a single static marker with no escape codes.
+func (p *proseWriter) beginReasoning() {
+	if p.markerActive {
+		return
+	}
+	p.leadMarker()
+	p.markerActive = true
 	if !p.anim {
-		if !p.markerActive {
-			p.leadMarker()
-			p.out(cFaint + "thinking…" + cReset)
-			p.markerActive = true
+		p.out(cFaint + "thinking…" + cReset)
+		return
+	}
+	p.out(cFaint + "⠋ thinking" + cReset)
+	p.spinning = true
+	p.spinStop = make(chan struct{})
+	p.spinDone = make(chan struct{})
+	prefix := p.markerPrefix
+	go func() {
+		defer close(p.spinDone)
+		frames := []rune("⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋")
+		tk := time.NewTicker(90 * time.Millisecond)
+		defer tk.Stop()
+		i := 0
+		for {
+			select {
+			case <-p.spinStop:
+				return
+			case <-tk.C:
+				p.out("\r\033[K" + prefix + cFaint + string(frames[i%len(frames)]) + " thinking" + cReset)
+				i++
+			}
 		}
-		return
-	}
-	label := cFaint + "thinking" + strings.Repeat(".", 1+p.dotPhase%3) + cReset
-	p.dotPhase++
-	if !p.markerActive {
-		p.leadMarker()
-		p.out(label)
-		p.markerActive = true
-		return
-	}
-	p.out("\r\033[K" + p.markerPrefix + label) // redraw the same line
+	}()
 }
 
-// closeMarker finalizes the marker (steady "thinking…") when the answer begins.
+// closeMarker stops the spinner and finalizes the marker (steady "thinking…")
+// when the answer begins. Waits for the spinner goroutine to exit, so no writes
+// race with the answer output that follows.
 func (p *proseWriter) closeMarker() {
 	if !p.markerActive {
 		return
 	}
-	if p.anim {
+	if p.spinning {
+		close(p.spinStop)
+		<-p.spinDone
+		p.spinning = false
 		p.out("\r\033[K" + p.markerPrefix + cFaint + "thinking…" + cReset)
 	}
 	p.markerActive = false
@@ -134,7 +155,7 @@ func (p *proseWriter) feedReasoning(s string) {
 		}
 	}
 	if !p.showThink {
-		p.animateThinking() // advance the marker per delta so it visibly moves
+		p.beginReasoning() // marker + spinner (started once)
 	}
 }
 
@@ -195,7 +216,7 @@ func (p *proseWriter) flushLine(raw string) {
 		if trimmed == "<think>" || trimmed == "<thinking>" {
 			p.thinking = true
 			if !p.showThink {
-				p.animateThinking()
+				p.beginReasoning()
 			}
 			return
 		}
@@ -209,7 +230,7 @@ func (p *proseWriter) flushLine(raw string) {
 			if p.showThink {
 				p.printLine(faint("%s", trimmed))
 			} else {
-				p.animateThinking()
+				p.beginReasoning()
 			}
 		}
 		return
