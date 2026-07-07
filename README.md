@@ -269,7 +269,7 @@ main.go       REPL + agentic loop + tool dispatch
 config.go     env-based configuration
 llm.go        OpenAI-compatible chat-completions client
 protocol.go   line-anchored tag parser (tool-call transport)
-tools.go      read_file, grep, run_command (no-shell exec)
+tools.go      read_file, grep, run_command (no-shell exec, live output, stdin=EOF)
 edit.go       strict search/replace + whole-file write
 jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode

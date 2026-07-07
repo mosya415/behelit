@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -198,7 +200,11 @@ func isBinary(data []byte) bool {
 
 // runCommand executes an allowlisted command with NO shell — argv is tokenized
 // and exec'd directly, so pipes, redirects and substitutions are inert. Runs
-// with cwd pinned to the jail root under a timeout.
+// with cwd pinned to the jail root under a timeout. Output is streamed to the
+// terminal LIVE (behind a dim gutter) as it is produced — so a slow command
+// looks like it is working, not frozen — and also captured for the model. stdin
+// is the null device, so a command that would wait for input gets EOF instead
+// of hanging until the timeout.
 func runCommand(j *Jail, cmdline string) string {
 	argv, err := tokenize(cmdline)
 	if err != nil {
@@ -211,27 +217,76 @@ func runCommand(j *Jail, cmdline string) string {
 		return fmt.Sprintf("error: command %q is not on the allowlist", argv[0])
 	}
 
+	fmt.Println(" " + faint("%s $ %s", gNone, cmdline))
+
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = j.Root
-	out, err := cmd.CombinedOutput()
+	cmd.Stdin = nil // null device → reads get EOF, no interactive hang
 
-	res := string(out)
+	var buf bytes.Buffer
+	live := &prefixWriter{w: os.Stdout, prefix: "   " + cFaint + "│ " + cReset}
+	mw := io.MultiWriter(&buf, live)
+	cmd.Stdout = mw
+	cmd.Stderr = mw // same writer ⇒ os/exec serializes the two streams for us
+
+	err = cmd.Run()
+	live.flush()
+
+	res := string(buf.Bytes())
 	if len(res) > maxCmdOutput {
 		res = res[:maxCmdOutput] + "\n... (output truncated)"
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		fmt.Println("   " + warn("%s timed out after %s", gDown, cmdTimeout))
 		return res + fmt.Sprintf("\n(command timed out after %s)", cmdTimeout)
-	}
-	if err != nil {
+	case err != nil:
+		fmt.Println("   " + cRed + gDown + cReset + faint(" %s", err.Error()))
 		return res + "\n(exit: " + err.Error() + ")"
+	default:
+		fmt.Println("   " + cGreen + gUp + cReset + faint(" exit 0"))
+		if strings.TrimSpace(res) == "" {
+			return "(no output, exit 0)"
+		}
+		return res
 	}
-	if res == "" {
-		return "(no output, exit 0)"
+}
+
+// prefixWriter writes each line of the command's live output behind a fixed
+// prefix (a dim gutter), tracking whether it is mid-line across Writes.
+type prefixWriter struct {
+	w      io.Writer
+	prefix string
+	mid    bool
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	total := len(b)
+	for len(b) > 0 {
+		if !p.mid {
+			io.WriteString(p.w, p.prefix)
+			p.mid = true
+		}
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			p.w.Write(b[:i+1])
+			p.mid = false
+			b = b[i+1:]
+		} else {
+			p.w.Write(b)
+			b = nil
+		}
 	}
-	return res
+	return total, nil
+}
+
+func (p *prefixWriter) flush() {
+	if p.mid {
+		io.WriteString(p.w, "\n")
+		p.mid = false
+	}
 }
 
 // tokenize splits a command line into argv, honoring single/double quotes. It

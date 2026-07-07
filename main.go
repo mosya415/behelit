@@ -607,9 +607,12 @@ func printOutcome(name, res string) {
 		}
 		toolInfo(plural(n, "entry", "entries"))
 	default: // edit / write / run_command
-		if strings.HasPrefix(res, "user denied") {
+		switch {
+		case strings.HasPrefix(res, "user denied"):
 			toolInfo("denied")
-		} else {
+		case name == "run_command":
+			// output + exit status were already streamed live by runCommand
+		default:
 			toolOK(summarize(res))
 		}
 	}
