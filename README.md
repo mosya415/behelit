@@ -61,8 +61,10 @@ REPL commands: `/discover`, `/endpoint [n|url]`, `/model [name]`, `/approve [on|
 
 The prompt is a small line editor (`lineedit.go`): arrow keys move the cursor,
 ↑/↓ walk history, and the usual control keys work (Ctrl-A/E/U/W, Ctrl-C to
-cancel a line, Ctrl-D to exit). Typing `/` pops up a live menu of commands;
-Tab completes — and after `/model ` the menu suggests the models learned from
+cancel a line, Ctrl-D to exit). Pasting is
+handled via bracketed paste — a large multi-line block is inserted whole (its
+newlines don't submit the line) in a single redraw. Typing `/` pops up a live
+menu of commands; Tab completes — and after `/model ` the menu suggests the models learned from
 `/discover`. Selecting a discovered model with `/model <name>` also switches to
 the endpoint that serves it (so you don't stay pointed at the unreachable
 default). It uses raw terminal mode on Linux only and falls back to a plain

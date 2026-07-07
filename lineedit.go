@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -77,6 +78,8 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 		return e.cooked(prompt)
 	}
 	defer restore()
+	e.out("\033[?2004h") // ask the terminal to bracket pastes
+	defer e.out("\033[?2004l")
 
 	var buf []rune
 	pos := 0
@@ -138,21 +141,53 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 
 func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
 	b1, err := e.rd.ReadByte()
-	if err != nil || (b1 != '[' && b1 != 'O') {
-		return buf, pos, hist
-	}
-	b2, err := e.rd.ReadByte()
 	if err != nil {
 		return buf, pos, hist
 	}
-	switch b2 {
-	case 'A': // ↑ history back
+	if b1 == 'O' { // application cursor keys: ESC O A/B/C/D
+		if b2, err := e.rd.ReadByte(); err == nil {
+			return e.applyKey(string(b2), buf, pos, hist)
+		}
+		return buf, pos, hist
+	}
+	if b1 != '[' {
+		return buf, pos, hist
+	}
+	// read the rest of the CSI sequence up to its final byte
+	var seq []byte
+	for {
+		c, err := e.rd.ReadByte()
+		if err != nil {
+			return buf, pos, hist
+		}
+		seq = append(seq, c)
+		if c >= 0x40 && c <= 0x7e {
+			break
+		}
+	}
+	switch string(seq) {
+	case "200~": // bracketed paste — insert the whole block verbatim
+		rs := []rune(e.readPaste())
+		return insertRunes(buf, pos, rs, hist)
+	case "3~": // Delete
+		if pos < len(buf) {
+			buf = append(buf[:pos], buf[pos+1:]...)
+		}
+		return buf, pos, hist
+	default:
+		return e.applyKey(string(seq), buf, pos, hist)
+	}
+}
+
+func (e *LineEditor) applyKey(k string, buf []rune, pos, hist int) ([]rune, int, int) {
+	switch k {
+	case "A": // ↑ history back
 		if hist > 0 {
 			hist--
 			buf = []rune(e.history[hist])
 			pos = len(buf)
 		}
-	case 'B': // ↓ history forward
+	case "B": // ↓ history forward
 		if hist < len(e.history)-1 {
 			hist++
 			buf = []rune(e.history[hist])
@@ -161,25 +196,63 @@ func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
 			buf = nil
 		}
 		pos = len(buf)
-	case 'C': // → right
+	case "C": // → right
 		if pos < len(buf) {
 			pos++
 		}
-	case 'D': // ← left
+	case "D": // ← left
 		if pos > 0 {
 			pos--
 		}
-	case 'H': // Home
+	case "H":
 		pos = 0
-	case 'F': // End
+	case "F":
 		pos = len(buf)
-	case '3': // Delete (ESC [ 3 ~)
-		e.rd.ReadByte() // consume '~'
-		if pos < len(buf) {
-			buf = append(buf[:pos], buf[pos+1:]...)
-		}
 	}
 	return buf, pos, hist
+}
+
+// readPaste reads a bracketed-paste body up to the end marker (ESC[201~) and
+// returns it with newlines normalized. The block is inserted as literal text —
+// its newlines do NOT submit the line.
+func (e *LineEditor) readPaste() string {
+	var b []byte
+	end := []byte("\x1b[201~")
+	for {
+		c, err := e.rd.ReadByte()
+		if err != nil {
+			break
+		}
+		b = append(b, c)
+		if bytes.HasSuffix(b, end) {
+			b = b[:len(b)-len(end)]
+			break
+		}
+	}
+	s := strings.ReplaceAll(string(b), "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+func insertRunes(buf []rune, pos int, rs []rune, hist int) ([]rune, int, int) {
+	out := make([]rune, 0, len(buf)+len(rs))
+	out = append(out, buf[:pos]...)
+	out = append(out, rs...)
+	out = append(out, buf[pos:]...)
+	return out, pos + len(rs), hist
+}
+
+// displayRunes flattens embedded newlines (from a paste) to a visible marker so
+// the single-line editor renders cleanly while buf keeps the real newlines.
+func displayRunes(buf []rune) string {
+	var b strings.Builder
+	for _, r := range buf {
+		if r == '\n' {
+			b.WriteString("⏎ ")
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // readRune assembles a full UTF-8 rune from its first byte (Cyrillic etc. are
@@ -222,7 +295,7 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 	}
 	w := termWidth()
 	bar := cFaint + strings.Repeat("─", w) + cReset
-	band := cBandBg + padTo(stripANSI(prompt)+string(buf), w, 0) + cReset
+	band := cBandBg + padTo(stripANSI(prompt)+displayRunes(buf), w, 0) + cReset
 	e.out("\r\033[J" + band + "\r\n" + bar + "\r\n")
 }
 
@@ -231,7 +304,7 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 	menu := e.suggest(string(buf))
 	e.out("\r\033[J") // clear from line start down (input + any old menu)
-	e.out(prompt + string(buf))
+	e.out(prompt + displayRunes(buf))
 	for _, m := range menu {
 		line := "\r\n  " + cFaint + fmt.Sprintf("%-11s", m.name) + cReset
 		if m.desc != "" {
@@ -243,7 +316,7 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 		e.out(fmt.Sprintf("\033[%dA", len(menu))) // back up to the input line
 	}
 	e.out("\r")
-	if col := visibleWidth(prompt) + visibleWidth(string(buf[:pos])); col > 0 {
+	if col := visibleWidth(prompt) + visibleWidth(displayRunes(buf[:pos])); col > 0 {
 		e.out(fmt.Sprintf("\033[%dC", col))
 	}
 }
