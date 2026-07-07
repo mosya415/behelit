@@ -26,7 +26,44 @@ const (
 	cCode   = "\033[38;5;73m"       // inline code / code blocks — muted teal, not a box
 	cFgOff  = "\033[39m"            // reset foreground only (composes inside other styles)
 	cBandBg = "\033[48;2;45;60;50m" // gray-green fill for a submitted prompt band
+
+	// Berserk / Behelit theme — blood crimson on near-black.
+	cBlood     = "\033[38;2;186;33;38m" // fill: brand crimson
+	cBloodDark = "\033[38;2;92;14;16m"  // outline / 3D shadow (box-drawing)
 )
+
+// behelitArt is the startup title in the ANSI-Shadow block font.
+const behelitArt = `██████╗ ███████╗██╗  ██╗███████╗██╗     ██╗████████╗
+██╔══██╗██╔════╝██║  ██║██╔════╝██║     ██║╚══██╔══╝
+██████╔╝█████╗  ███████║█████╗  ██║     ██║   ██║
+██╔══██╗██╔══╝  ██╔══██║██╔══╝  ██║     ██║   ██║
+██████╔╝███████╗██║  ██║███████╗███████╗██║   ██║
+╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝   ╚═╝   `
+
+// printBehelit renders the title with a two-tone crimson so the block faces read
+// bright and the box-drawing outline reads as a darker 3D shadow.
+func printBehelit() {
+	for _, line := range strings.Split(behelitArt, "\n") {
+		var b strings.Builder
+		cur := ""
+		for _, r := range line {
+			c := cBlood
+			if r == ' ' {
+				c = ""
+			} else if strings.ContainsRune("╗╔╝╚═║", r) {
+				c = cBloodDark
+			}
+			if c != cur {
+				b.WriteString(cReset)
+				b.WriteString(c)
+				cur = c
+			}
+			b.WriteRune(r)
+		}
+		b.WriteString(cReset)
+		fmt.Println(" " + b.String())
+	}
+}
 
 // stripANSI removes SGR escape sequences, leaving visible text (UTF-8 intact).
 func stripANSI(s string) string {

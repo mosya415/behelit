@@ -1,4 +1,4 @@
-# Latent Coding Agent
+# BEHELIT
 
 Minimal, approval-first CLI coding agent for an air-gapped, single-user
 inference host. One static Go binary, stdlib only (HTTP client + stdlib), no

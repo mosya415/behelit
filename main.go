@@ -749,7 +749,7 @@ func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `Latent Coding Agent — approval-first CLI agent for local LLM endpoints.
+	fmt.Fprint(os.Stderr, `BEHELIT — approval-first CLI coding agent for local LLM endpoints.
 
 usage:
   lca                 start interactive REPL
@@ -769,12 +769,12 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 		who = fmt.Sprintf("%s · uid %s", u.Username, u.Uid)
 	}
 
-	hr()
-	ticket(os.Getenv("LCA_ORG"), gUp+" LIVE ▲")
 	fmt.Println()
-	eyebrow("session")
-	title("Latent Coding Agent")
-	hr()
+	printBehelit()
+	fmt.Println()
+	fmt.Println("  " + cBlood + "⚔  Ready to struggle" + cReset + faint(" — what shall we forge?"))
+	fmt.Println("  " + faint("%s the Egg of the King · sacrifice something to gain something", cBloodDark+"✝"+cReset))
+	fmt.Println()
 
 	kv("user", who)
 	kv("jail", jail.Root)
@@ -786,9 +786,7 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	for _, n := range notes {
 		contValue(n)
 	}
-	kv("audit", cfg.Dir)
-	kv("log", rec.SessionPath())
 	kv("approve", strings.ToUpper(ap.Mode()))
-	hr()
-	fmt.Println(" " + faint("/discover   /endpoint [n|url]   /model [name]   /approve […]   /think   /reset   /exit"))
+	fmt.Println()
+	fmt.Println(" " + faint("Enter submit · \\ newline · /discover · /model · /think · Ctrl-C interrupt · /exit"))
 }
