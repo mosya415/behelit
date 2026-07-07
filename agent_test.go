@@ -46,6 +46,34 @@ if a < b && c > d {
 	}
 }
 
+func TestParseBlocks_GluedTags(t *testing.T) {
+	// MiniMax-M3 glues a reasoning-close tag before the open tag and the command
+	// before the close tag, all off their own lines.
+	text := "reasoning here</mm:think><run_command>\ntail -n 200 logs/x.log</run_command>"
+	blocks := ParseBlocks(text)
+	if len(blocks) != 1 {
+		t.Fatalf("want 1 block, got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Name != "run_command" {
+		t.Fatalf("name = %q, want run_command", blocks[0].Name)
+	}
+	if got := strings.TrimSpace(blocks[0].Body); got != "tail -n 200 logs/x.log" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestNormalizeTags_KeepsWriteBodyIntact(t *testing.T) {
+	// A well-formed write must not gain/lose blank lines around its body.
+	text := "<write path=\"x.go\">\npackage main\n\nfunc main() {}\n</write>"
+	blocks := ParseBlocks(text)
+	if len(blocks) != 1 || blocks[0].Name != "write" {
+		t.Fatalf("bad parse: %+v", blocks)
+	}
+	if blocks[0].Body != "package main\n\nfunc main() {}" {
+		t.Fatalf("write body altered: %q", blocks[0].Body)
+	}
+}
+
 func TestParseBlocks_NoTagsIsFinalAnswer(t *testing.T) {
 	if b := ParseBlocks("All done. The bug was a typo."); len(b) != 0 {
 		t.Fatalf("expected 0 blocks, got %d", len(b))

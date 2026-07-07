@@ -48,13 +48,50 @@ var (
 	// Matches an opening tag line: <name ...attrs...>  or self-closing <name .../>
 	reOpen = regexp.MustCompile(`^<([a-z_]+)((?:\s+[a-z_]+="[^"]*")*)\s*(/?)>$`)
 	reAttr = regexp.MustCompile(`([a-z_]+)="([^"]*)"`)
+
+	// Reasoning tags to strip: <think>, <thinking>, and model-namespaced variants
+	// like <mm:think> (MiniMax) or <reasoning>.
+	reReasonTag   = regexp.MustCompile(`(?i)</?(?:[a-z0-9_]+:)?(?:think(?:ing)?|reason(?:ing)?)>`)
+	reReasonOpen  = regexp.MustCompile(`(?i)<(?:[a-z0-9_]+:)?(?:think(?:ing)?|reason(?:ing)?)>`)
+	reReasonClose = regexp.MustCompile(`(?i)</(?:[a-z0-9_]+:)?(?:think(?:ing)?|reason(?:ing)?)>`)
+
+	// A tool (or edit sub-) tag anywhere in the text — used only to re-separate
+	// tags that a model glued to surrounding text (it is NOT the block grammar).
+	toolTag      = `</?(?:read_file|grep|list_dir|run_command|write|edit|search|replace)(?:\s+[a-z_]+="[^"]*")*\s*/?>`
+	reGlueBefore = regexp.MustCompile(`([^\n])(` + toolTag + `)`)
+	reGlueAfter  = regexp.MustCompile(`(` + toolTag + `)([^\n])`)
 )
+
+// normalizeTags makes the line-anchored grammar tolerant of models that don't
+// put tags on their own line — MiniMax-M3, for instance, emits
+// "</mm:think><run_command>" and "cmd</run_command>". We drop reasoning tags and
+// break any tool tag that is glued to neighbouring text onto its own line. Tags
+// already alone on a line are left untouched, so well-formed <write>/<edit>
+// bodies keep their exact content.
+func normalizeTags(text string) string {
+	return splitGluedTools(reReasonTag.ReplaceAllString(text, "\n"))
+}
+
+// splitGluedTools breaks any tool tag glued to neighbouring text onto its own
+// line, leaving tags that are already alone untouched. Used by the parser and
+// the display so both see the same structure.
+func splitGluedTools(text string) string {
+	for i := 0; i < 4; i++ {
+		before := text
+		text = reGlueBefore.ReplaceAllString(text, "$1\n$2")
+		text = reGlueAfter.ReplaceAllString(text, "$1\n$2")
+		if text == before {
+			break
+		}
+	}
+	return text
+}
 
 // ParseBlocks scans assistant text and returns every well-formed tool block, in
 // order. Malformed or unknown tags are ignored (the model's prose is left
 // alone); if nothing parses, the caller treats the turn as a final answer.
 func ParseBlocks(text string) []Block {
-	lines := strings.Split(text, "\n")
+	lines := strings.Split(normalizeTags(text), "\n")
 	var blocks []Block
 	i := 0
 	for i < len(lines) {

@@ -190,41 +190,56 @@ func (p *proseWriter) end() {
 	}
 }
 
+// flushLine splits a physical line on any glued tool tags (so the display sees
+// the same structure the parser does) and renders each resulting logical line.
 func (p *proseWriter) flushLine(raw string) {
+	for _, part := range strings.Split(splitGluedTools(raw), "\n") {
+		p.flushLogicalLine(part)
+	}
+}
+
+func (p *proseWriter) flushLogicalLine(raw string) {
 	line := strings.TrimRight(raw, " \t\r")
 	trimmed := strings.TrimSpace(line)
 
-	// (1) tool-tag suppression — applied everywhere so the screen can never show
-	// a tag that the parser will nonetheless execute.
+	// (1) inside a tool block: swallow until the close tag — tolerate it glued to
+	// the last body line, e.g. "cmd</run_command>".
 	if p.inBlock {
-		if trimmed == p.closeTag {
+		if trimmed == p.closeTag || strings.Contains(trimmed, p.closeTag) {
 			p.inBlock = false
 		}
 		return
 	}
-	if m := reOpen.FindStringSubmatch(trimmed); m != nil && blockNames[m[1]] {
-		if m[3] != "/" {
-			p.inBlock = true
-			p.closeTag = "</" + m[1] + ">"
-		}
-		return
-	}
 
-	// (1b) reasoning: <think>…</think> in the content — dim when expanded, else a
-	// compact "thinking…" marker; the tags are always dropped.
-	if !p.thinking {
-		if trimmed == "<think>" || trimmed == "<thinking>" {
+	// (1b) reasoning tags — <think>/<thinking> and model-namespaced ones like
+	// </mm:think>, possibly glued to other content. Drop the tag, toggle state;
+	// reasoning text is dimmed (or a spinner when collapsed).
+	if reReasonTag.MatchString(trimmed) {
+		if reReasonClose.MatchString(trimmed) {
+			p.thinking = false
+			p.closeMarker()
+		}
+		if reReasonOpen.MatchString(trimmed) {
 			p.thinking = true
-			if !p.showThink {
+		}
+		rest := strings.TrimSpace(reReasonTag.ReplaceAllString(trimmed, " "))
+		if rest == "" {
+			if p.thinking && !p.showThink {
 				p.beginReasoning()
 			}
 			return
 		}
-	} else {
-		if trimmed == "</think>" || trimmed == "</thinking>" {
-			p.thinking = false
+		if p.thinking {
+			p.reasonLog = append(p.reasonLog, rest)
+			if p.showThink {
+				p.printLine(faint("%s", rest))
+			} else {
+				p.beginReasoning()
+			}
 			return
 		}
+		line, trimmed = rest, rest // remaining text is answer/tool content
+	} else if p.thinking {
 		if trimmed != "" {
 			p.reasonLog = append(p.reasonLog, trimmed)
 			if p.showThink {
@@ -232,6 +247,16 @@ func (p *proseWriter) flushLine(raw string) {
 			} else {
 				p.beginReasoning()
 			}
+		}
+		return
+	}
+
+	// (1c) tool-tag suppression — on the (reasoning-stripped) line, so a tool tag
+	// the model glued after a reasoning tag is still hidden and executed.
+	if m := reOpen.FindStringSubmatch(trimmed); m != nil && blockNames[m[1]] {
+		if m[3] != "/" {
+			p.inBlock = true
+			p.closeTag = "</" + m[1] + ">"
 		}
 		return
 	}

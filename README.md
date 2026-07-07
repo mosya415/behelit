@@ -183,6 +183,13 @@ even if it was collapsed (start collapsed with `LCA_HIDE_THINKING`).
 
 ## Design (the four non-trivial parts)
 
+Some models don't put tags on their own line (MiniMax-M3 emits
+`</mm:think><run_command>` and `cmd</run_command>`). `normalizeTags` drops
+reasoning tags (`<think>`, `<mm:think>`, …) and re-separates any tool tag glued
+to surrounding text onto its own line — leaving tags that are already alone
+untouched, so well-formed `<write>`/`<edit>` bodies keep their exact content.
+The parser and the on-screen filter share this so both agree.
+
 1. **Tool-call transport — `protocol.go`.** The model emits line-anchored XML-ish
    tags in plain text; we parse them ourselves instead of trusting each model's
    native `--tool-call-parser`. Tags must be alone on a line, so code bodies
