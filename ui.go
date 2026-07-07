@@ -40,15 +40,6 @@ const behelitArt = `██████╗ ███████╗██╗  █
 ██████╔╝███████╗██║  ██║███████╗███████╗██║   ██║
 ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝   ╚═╝   `
 
-// behelitFace is the Behelit — the Egg of the King — an egg with scattered
-// human features (two mismatched eyes, a nose, a row of teeth).
-const behelitFace = ` ╭────╮
-╱ ◕ ◔ ╲
-▏  ▼  ▏
-▏ ⌵⌵⌵ ▏
-╲ ▁▁▁ ╱
- ╰────╯ `
-
 // darkOutline are the box-drawing runes rendered as the darker 3D/outline tone;
 // everything else non-blank (block faces, the Behelit's features) reads bright.
 const darkOutline = "╗╔╝╚═║╭╮╰╯╱╲─│▏▕▁▔"
@@ -75,24 +66,10 @@ func colorizeCrimson(line string) string {
 	return b.String()
 }
 
-// printBehelit renders the block title with the Behelit's face beside it. Title
-// rows are padded to a common width so the face aligns in a straight column.
+// printBehelit renders the block title in two-tone crimson.
 func printBehelit() {
-	title := strings.Split(behelitArt, "\n")
-	face := strings.Split(behelitFace, "\n")
-	width := 0
-	for _, t := range title {
-		if w := utf8.RuneCountInString(t); w > width {
-			width = w
-		}
-	}
-	for i, t := range title {
-		t += strings.Repeat(" ", width-utf8.RuneCountInString(t))
-		f := ""
-		if i < len(face) {
-			f = face[i]
-		}
-		fmt.Println(" " + colorizeCrimson(t) + "   " + colorizeCrimson(f))
+	for _, t := range strings.Split(behelitArt, "\n") {
+		fmt.Println(" " + colorizeCrimson(t))
 	}
 }
 

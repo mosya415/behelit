@@ -772,9 +772,6 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	fmt.Println()
 	printBehelit()
 	fmt.Println()
-	fmt.Println("  " + cBlood + "⚔  Ready to struggle" + cReset + faint(" — what shall we forge?"))
-	fmt.Println("  " + faint("%s the Egg of the King · sacrifice something to gain something", cBloodDark+"✝"+cReset))
-	fmt.Println()
 
 	kv("user", who)
 	kv("jail", jail.Root)
