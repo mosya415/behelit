@@ -178,20 +178,13 @@ func clampWidth(n int) int {
 	}
 }
 
-// enterAltScreen switches to the terminal's alternate screen buffer (like vim /
-// less / htop), which has NO scrollback — so the session starts at the top and
-// nothing above it can be scrolled to, on any terminal. leaveAltScreen restores
-// the original screen on exit. Both are no-ops unless stdout is a real terminal,
-// so piped/redirected output is never polluted with escape codes.
-func enterAltScreen() {
+// clearScreen wipes the screen and scrollback and homes the cursor, so an
+// interactive session starts from the top — while staying on the normal screen,
+// so its output stays in the scrollback and can be scrolled back through. No-op
+// unless stdout is a real terminal, so piped output is never polluted.
+func clearScreen() {
 	if osTermWidth() > 0 {
-		fmt.Print("\033[?1049h\033[H\033[2J")
-	}
-}
-
-func leaveAltScreen() {
-	if osTermWidth() > 0 {
-		fmt.Print("\033[?1049l")
+		fmt.Print("\033[3J\033[H\033[2J")
 	}
 }
 

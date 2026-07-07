@@ -72,11 +72,10 @@ cooked read when stdin is not a terminal (pipes, one-shot) or off Linux.
 
 The input area is fenced by a hairline above and below, and a submitted prompt
 is redrawn as a full-width gray-green band — so past turns are easy to pick out
-as you scroll up. An interactive session runs in the terminal's alternate screen buffer (like
-`vim`/`less`), which has no scrollback — so it starts at the top and nothing
-above it can be scrolled to, on any terminal; the original screen is restored on
-exit (the full session is in the transcript). Set `LCA_NO_CLEAR` to stay on the
-normal screen instead.
+as you scroll up. An interactive session clears the screen and scrollback at startup so it begins
+at the top, but stays on the normal screen — so its output remains in the
+scrollback and you can scroll back through it. Set `LCA_NO_CLEAR` to skip the
+clear.
 
 ### Endpoints
 

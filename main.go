@@ -69,8 +69,7 @@ func main() {
 	}
 
 	if os.Getenv("LCA_NO_CLEAR") == "" {
-		enterAltScreen()
-		defer leaveAltScreen()
+		clearScreen()
 	}
 	banner(cfg, jail, rec, ap, client, notes)
 
