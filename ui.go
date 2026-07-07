@@ -188,19 +188,9 @@ func clearScreen() {
 	}
 }
 
-// hr prints a full-width hairline rule.
-func hr() {
-	fmt.Println(cFaint + strings.Repeat("─", termWidth()) + cReset)
-}
-
 // eyebrow prints a faint uppercase super-label with a leading hairline tick.
 func eyebrow(s string) {
 	fmt.Printf(" %s─ %s%s\n", cFaint, strings.ToUpper(s), cReset)
-}
-
-// title prints the big bold uppercase heading (terminal analog of the clamp title).
-func title(s string) {
-	fmt.Printf(" %s%s%s\n", cBold, strings.ToUpper(s), cReset)
 }
 
 // kv prints a key/value row: faint uppercase label, verbatim value.
@@ -211,18 +201,6 @@ func kv(label, value string) {
 // contValue prints a continuation line aligned under the value column.
 func contValue(value string) {
 	fmt.Printf("  %-8s %s\n", "", value)
-}
-
-// ticket prints the top "ticket header" bar: optional left brand and a
-// right-aligned est/live marker (green LIVE dot), spread to the full width.
-func ticket(left, right string) {
-	w := termWidth()
-	coloredRight := strings.Replace(right, gUp, cGreen+gUp+cFaint, 1)
-	pad := w - 1 - utf8.RuneCountInString(left) - utf8.RuneCountInString(right)
-	if pad < 1 {
-		pad = 1
-	}
-	fmt.Printf(" %s%s%s%s%s\n", cFaint, left, strings.Repeat(" ", pad), coloredRight, cReset)
 }
 
 // statusText wraps a status word in its color with a leading glyph.
