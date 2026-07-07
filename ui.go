@@ -40,28 +40,59 @@ const behelitArt = `██████╗ ███████╗██╗  █
 ██████╔╝███████╗██║  ██║███████╗███████╗██║   ██║
 ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝   ╚═╝   `
 
-// printBehelit renders the title with a two-tone crimson so the block faces read
-// bright and the box-drawing outline reads as a darker 3D shadow.
-func printBehelit() {
-	for _, line := range strings.Split(behelitArt, "\n") {
-		var b strings.Builder
-		cur := ""
-		for _, r := range line {
-			c := cBlood
-			if r == ' ' {
-				c = ""
-			} else if strings.ContainsRune("╗╔╝╚═║", r) {
-				c = cBloodDark
-			}
-			if c != cur {
-				b.WriteString(cReset)
-				b.WriteString(c)
-				cur = c
-			}
-			b.WriteRune(r)
+// behelitFace is the Behelit — the Egg of the King — an egg with scattered
+// human features (two mismatched eyes, a nose, a row of teeth).
+const behelitFace = ` ╭────╮
+╱ ◕ ◔ ╲
+▏  ▼  ▏
+▏ ⌵⌵⌵ ▏
+╲ ▁▁▁ ╱
+ ╰────╯ `
+
+// darkOutline are the box-drawing runes rendered as the darker 3D/outline tone;
+// everything else non-blank (block faces, the Behelit's features) reads bright.
+const darkOutline = "╗╔╝╚═║╭╮╰╯╱╲─│▏▕▁▔"
+
+// colorizeCrimson two-tones a line: bright crimson for solid faces/features,
+// dark crimson for the outline runes.
+func colorizeCrimson(line string) string {
+	var b strings.Builder
+	cur := ""
+	for _, r := range line {
+		c := cBlood
+		if r == ' ' {
+			c = ""
+		} else if strings.ContainsRune(darkOutline, r) {
+			c = cBloodDark
 		}
-		b.WriteString(cReset)
-		fmt.Println(" " + b.String())
+		if c != cur {
+			b.WriteString(cReset + c)
+			cur = c
+		}
+		b.WriteRune(r)
+	}
+	b.WriteString(cReset)
+	return b.String()
+}
+
+// printBehelit renders the block title with the Behelit's face beside it. Title
+// rows are padded to a common width so the face aligns in a straight column.
+func printBehelit() {
+	title := strings.Split(behelitArt, "\n")
+	face := strings.Split(behelitFace, "\n")
+	width := 0
+	for _, t := range title {
+		if w := utf8.RuneCountInString(t); w > width {
+			width = w
+		}
+	}
+	for i, t := range title {
+		t += strings.Repeat(" ", width-utf8.RuneCountInString(t))
+		f := ""
+		if i < len(face) {
+			f = face[i]
+		}
+		fmt.Println(" " + colorizeCrimson(t) + "   " + colorizeCrimson(f))
 	}
 }
 
