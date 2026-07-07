@@ -9,10 +9,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 func main() {
 	cfg := loadConfig()
+	if cfg.CmdTimeout > 0 {
+		cmdTimeout = time.Duration(cfg.CmdTimeout) * time.Second
+	}
 
 	yes := flag.Bool("y", false, "auto-approve side-effecting actions (for one-shot / non-interactive use)")
 	yesLong := flag.Bool("yes", false, "alias for -y")

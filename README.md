@@ -45,6 +45,7 @@ are denied rather than run unattended.
 | `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
 | `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
 | `LCA_MAX_TOKENS` | unset                        | `max_tokens` per request (0/unset = let the server decide) |
+| `LCA_CMD_TIMEOUT` | `120`                       | `run_command` timeout in seconds |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
@@ -203,7 +204,10 @@ applied), the agent asks it to redo the change as a real tool call
    the hard gate (reach). Both are required.
 
 `read_file`/`grep` run automatically (no side effects). `edit`/`write`/
-`run_command` require an explicit `y` at the prompt.
+`run_command` require an explicit `y` at the prompt. A running command streams
+its output live behind a dim `│` gutter, its stdin is the null device (so it
+can't hang waiting for input), it is bounded by `LCA_CMD_TIMEOUT`, and Ctrl-C
+interrupts just that command — not the agent.
 
 ### Approval modes — `approval.go`
 

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -20,8 +21,10 @@ const (
 	maxGrepMatches = 200
 	maxListEntries = 400
 	maxCmdOutput   = 64_000
-	cmdTimeout     = 60 * time.Second
 )
+
+// cmdTimeout bounds run_command; overridable via LCA_CMD_TIMEOUT (see main).
+var cmdTimeout = 120 * time.Second
 
 // listDir renders a bounded, indented tree of a directory (default: jail root)
 // so the model can orient itself without dumping the repo. Skips .git, marks
@@ -217,7 +220,7 @@ func runCommand(j *Jail, cmdline string) string {
 		return fmt.Sprintf("error: command %q is not on the allowlist", argv[0])
 	}
 
-	fmt.Println(" " + faint("%s $ %s", gNone, cmdline))
+	fmt.Println(" " + faint("%s $ %s   %s", gNone, cmdline, faint("(Ctrl-C to interrupt)")))
 
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	defer cancel()
@@ -232,7 +235,22 @@ func runCommand(j *Jail, cmdline string) string {
 	cmd.Stdout = mw
 	cmd.Stderr = mw // same writer ⇒ os/exec serializes the two streams for us
 
+	// Ctrl-C interrupts just this command (cancels its context), not the agent.
+	sigch := make(chan os.Signal, 1)
+	signal.Notify(sigch, os.Interrupt)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sigch:
+			cancel()
+		case <-done:
+		}
+	}()
+
 	err = cmd.Run()
+	cancelled := ctx.Err() == context.Canceled
+	close(done)
+	signal.Stop(sigch)
 	live.flush()
 
 	res := string(buf.Bytes())
@@ -240,6 +258,9 @@ func runCommand(j *Jail, cmdline string) string {
 		res = res[:maxCmdOutput] + "\n... (output truncated)"
 	}
 	switch {
+	case cancelled:
+		fmt.Println("   " + warn("%s interrupted", gDown))
+		return res + "\n(interrupted by user)"
 	case ctx.Err() == context.DeadlineExceeded:
 		fmt.Println("   " + warn("%s timed out after %s", gDown, cmdTimeout))
 		return res + fmt.Sprintf("\n(command timed out after %s)", cmdTimeout)
