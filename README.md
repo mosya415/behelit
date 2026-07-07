@@ -61,7 +61,9 @@ The prompt is a small line editor (`lineedit.go`): arrow keys move the cursor,
 ↑/↓ walk history, and the usual control keys work (Ctrl-A/E/U/W, Ctrl-C to
 cancel a line, Ctrl-D to exit). Typing `/` pops up a live menu of commands;
 Tab completes — and after `/model ` the menu suggests the models learned from
-`/discover`. It uses raw terminal mode on Linux only and falls back to a plain
+`/discover`. Selecting a discovered model with `/model <name>` also switches to
+the endpoint that serves it (so you don't stay pointed at the unreachable
+default). It uses raw terminal mode on Linux only and falls back to a plain
 cooked read when stdin is not a terminal (pipes, one-shot) or off Linux.
 
 The input area is fenced by a hairline above and below, and a submitted prompt

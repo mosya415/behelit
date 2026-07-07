@@ -184,6 +184,16 @@ func handleModelCmd(line string, client *Client, rec *Recorder, discover bool) b
 	client.SetModel(arg)
 	rec.Event("model_change", map[string]any{"from": prev, "to": arg})
 	fmt.Printf("  %sMODEL%s %s → %s\n", cFaint, cReset, prev, arg)
+
+	// If discovery knows which endpoint serves this model, route there too — so
+	// picking a model also points the session at where it actually runs (the
+	// default endpoint is usually the unreachable localhost placeholder).
+	if ep := client.EndpointForModel(arg); ep != "" && ep != client.Endpoint() {
+		client.SetEndpoint(ep)
+		rec.Event("endpoint_change", map[string]any{"from": client.Endpoint(), "to": ep, "via": "model"})
+		fmt.Printf("  %sENDPOINT%s → %s\n", cFaint, cReset, client.Endpoint())
+	}
+
 	if discover {
 		if models, err := client.ListModels(); err == nil && len(models) > 0 {
 			if _, ok := findModel(models, arg); !ok {

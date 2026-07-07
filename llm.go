@@ -82,6 +82,17 @@ func (c *Client) SetEndpointModel(url, model string) {
 }
 func (c *Client) EndpointModel(url string) string { return c.epModel[strings.TrimRight(url, "/")] }
 
+// EndpointForModel returns a discovered endpoint that serves the given model, or
+// "" if none is known. Used so /model can route to where the model actually runs.
+func (c *Client) EndpointForModel(model string) string {
+	for url, m := range c.epModel {
+		if m == model {
+			return url
+		}
+	}
+	return ""
+}
+
 // KnownModels returns the distinct model names learned from discovery (sorted),
 // for /model completion.
 func (c *Client) KnownModels() []string {
