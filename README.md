@@ -44,6 +44,7 @@ are denied rather than run unattended.
 | `LCA_ALLOW`    | see below                      | Comma-separated command allowlist         |
 | `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
 | `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
+| `LCA_MAX_TOKENS` | unset                        | `max_tokens` per request (0/unset = let the server decide) |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
@@ -175,6 +176,11 @@ HTML report. Rendering is line-buffered (a line is formatted once complete);
    files — it creates missing parent directories (jail-checked first, so new
    dirs stay inside the root). No
    unified diff (it drifts on quantized weights).
+
+When a response is cut off by the generation length limit
+(`finish_reason == "length"`) with no usable tool call, the agent continues
+automatically (a `auto_continue` audit event) instead of ending the turn and
+making you type "continue".
 
 3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the
    prompt. The model pulls what it needs via auto-running

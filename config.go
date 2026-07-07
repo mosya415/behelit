@@ -18,6 +18,7 @@ type Config struct {
 	APIKey       string   // optional; most local servers accept any token
 	Temperature  float64  // low by default for deterministic tool use
 	MaxSteps     int      // safety cap on tool-call iterations per user turn
+	MaxTokens    int      // max_tokens per request (0 = let the server decide)
 	CtxTokens    int      // approximate token budget for the transcript sent to the model
 	Allowed      []string // command allowlist (matched against basename of argv[0])
 	Dir          string   // where the audit log and session transcripts are written
@@ -53,6 +54,7 @@ func loadConfig() Config {
 		Temperature:  0.2,
 		MaxSteps:     25,
 		CtxTokens:    atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
+		MaxTokens:    atoiDefault(os.Getenv("LCA_MAX_TOKENS"), 0),
 		Raw:          os.Getenv("LCA_RAW") != "",
 		Discover:     os.Getenv("LCA_DISCOVER") != "",
 		Reservation:  os.Getenv("LCA_RESERVATION"),

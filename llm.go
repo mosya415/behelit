@@ -31,6 +31,7 @@ type Client struct {
 	model     string
 	apiKey    string
 	temp      float64
+	maxTokens int
 }
 
 func NewClient(cfg Config) *Client {
@@ -46,6 +47,7 @@ func NewClient(cfg Config) *Client {
 		model:     cfg.Model,
 		apiKey:    cfg.APIKey,
 		temp:      cfg.Temperature,
+		maxTokens: cfg.MaxTokens,
 	}
 }
 
@@ -219,6 +221,7 @@ type chatRequest struct {
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature"`
 	Stream      bool      `json:"stream"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
 }
 
 type chatResponse struct {
@@ -284,27 +287,29 @@ type streamChunk struct {
 		Delta struct {
 			Content string `json:"content"`
 		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
 // CompleteStream streams the assistant reply over SSE, calling onDelta for each
-// text fragment as it arrives, and returns the fully assembled text. We parse
-// the token stream ourselves; the tool-call protocol only sees the final text,
-// so streaming is purely a UX layer and cannot affect correctness.
-func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, error) {
+// text fragment, and returns the assembled text plus the finish reason ("stop",
+// "length", …). We parse the token stream ourselves; the tool-call protocol only
+// sees the final text, so streaming is purely a UX layer.
+func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, string, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       c.model,
 		Messages:    msgs,
 		Temperature: c.temp,
 		Stream:      true,
+		MaxTokens:   c.maxTokens,
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -314,7 +319,7 @@ func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, e
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request to %s failed: %w", c.baseURL, err)
+		return "", "", fmt.Errorf("request to %s failed: %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -324,11 +329,12 @@ func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, e
 		if resp.StatusCode == http.StatusNotFound {
 			msg += "  (check the endpoint URL includes the right base path, e.g. .../v1)"
 		}
-		return "", fmt.Errorf("%s", msg)
+		return "", "", fmt.Errorf("%s", msg)
 	}
 
 	reader := bufio.NewReader(resp.Body)
 	var sb strings.Builder
+	finish := ""
 	for {
 		line, err := reader.ReadString('\n')
 		if s := strings.TrimSpace(line); strings.HasPrefix(s, "data:") {
@@ -342,16 +348,19 @@ func (c *Client) CompleteStream(msgs []Message, onDelta func(string)) (string, e
 					sb.WriteString(d)
 					onDelta(d)
 				}
+				if fr := chunk.Choices[0].FinishReason; fr != nil && *fr != "" {
+					finish = *fr
+				}
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return sb.String(), err
+			return sb.String(), finish, err
 		}
 	}
-	return sb.String(), nil
+	return sb.String(), finish, nil
 }
 
 func truncate(s string, n int) string {

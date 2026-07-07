@@ -467,7 +467,7 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
-		reply, err := client.CompleteStream(send, pw.feed)
+		reply, finish, err := client.CompleteStream(send, pw.feed)
 		pw.end()
 		if err != nil {
 			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
@@ -478,6 +478,16 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 
 		blocks := ParseBlocks(reply)
 		if len(blocks) == 0 {
+			// The model hit the generation length limit mid-thought and produced
+			// no usable tool call — continue automatically instead of ending the
+			// turn and making the user type "continue".
+			if finish == "length" {
+				fmt.Println(" " + faint("%s response truncated — continuing…", gNone))
+				rec.Event("auto_continue", map[string]any{"finish": finish})
+				*msgs = append(*msgs, Message{Role: "user", Content: "Continue exactly where you left off. Do not repeat what you already wrote."})
+				rec.Transcript(*msgs)
+				continue
+			}
 			return // final answer
 		}
 
