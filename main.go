@@ -468,8 +468,25 @@ func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
 // runTurn drives the agentic loop for one user message: stream the model, execute
 // any tool blocks, feed results back, repeat until the model stops emitting
 // tools (a final answer) or we hit the step cap.
+// looksLikeStrayEdit reports whether a reply describes a file change in a format
+// that does NOT apply — a diff fence, unified diff, or SEARCH/REPLACE markers —
+// rather than an <edit>/<write> tool call. Kept to strong signals to avoid
+// nudging a legitimate "show me a diff" answer.
+func looksLikeStrayEdit(s string) bool {
+	switch {
+	case strings.Contains(s, "```diff"):
+		return true
+	case strings.Contains(s, "<<<<<<< SEARCH"), strings.Contains(s, ">>>>>>> REPLACE"):
+		return true
+	case strings.Contains(s, "\n@@ ") && (strings.Contains(s, "\n--- ") || strings.Contains(s, "\n+++ ")):
+		return true
+	}
+	return false
+}
+
 func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw bool) {
 	continuing := false // the previous step was cut off by length; continue it
+	nudges := 0         // times we asked the model to redo a stray diff as a tool call
 	for step := 0; step < maxSteps; step++ {
 		pw := newProseWriter(raw)
 
@@ -506,6 +523,17 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 				fmt.Println(" " + faint("%s response truncated — continuing…", gNone))
 				rec.Event("auto_continue", map[string]any{"finish": finish})
 				continuing = true
+				continue
+			}
+			// The model described a change as a diff / code block instead of an
+			// <edit>/<write> tag, so nothing was applied — ask it to redo it as a
+			// real tool call (bounded, so a genuine "show me a diff" answer ends).
+			if nudges < 2 && looksLikeStrayEdit(full) {
+				nudges++
+				fmt.Println(" " + faint("%s that was a diff, not an edit — asking for a tool call…", gNone))
+				rec.Event("nudge_edit", nil)
+				*msgs = append(*msgs, Message{Role: "user", Content: "That change was shown as a diff / code block, which does NOT modify any file. Redo it now as an <edit> or <write> tool call exactly per the protocol, then stop."})
+				rec.Transcript(*msgs)
 				continue
 			}
 			return // final answer

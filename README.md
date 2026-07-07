@@ -182,7 +182,10 @@ HTML report. Rendering is line-buffered (a line is formatted once complete);
 When a response is cut off by the generation length limit
 (`finish_reason == "length"`) with no usable tool call, the agent continues
 automatically (a `auto_continue` audit event) instead of ending the turn and
-making you type "continue".
+making you type "continue". And if the model *describes* a change as a diff or
+code block instead of emitting an `<edit>`/`<write>` tag (so nothing would be
+applied), the agent asks it to redo the change as a real tool call
+(`nudge_edit`, bounded so a genuine "show me a diff" answer still ends).
 
 3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the
    prompt. The model pulls what it needs via auto-running

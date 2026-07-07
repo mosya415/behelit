@@ -50,6 +50,32 @@ new code
 </replace>
 </edit>
 
+# CRITICAL: how to change files
+A file is changed ONLY by emitting an <edit> or <write> tag. NOTHING else
+touches the disk. In particular:
+- Do NOT print the change as a fenced code block, a unified diff, or
+  "SEARCH/REPLACE" text. Those are displayed and then discarded — the file is
+  NOT modified. Showing a diff instead of an <edit> tag is the #1 mistake.
+- Do NOT say "I've updated the file" unless you actually emitted an <edit>/<write>
+  tag and saw a successful <tool_result>.
+
+Example of the ONLY correct way to change a file:
+
+  I'll add the nil check.
+  <edit path="parse.go">
+  <search>
+  func Parse(b []byte) (*Doc, error) {
+  </search>
+  <replace>
+  func Parse(b []byte) (*Doc, error) {
+      if b == nil {
+          return nil, errors.New("nil input")
+      }
+  </replace>
+  </edit>
+
+Then STOP and wait for the <tool_result>.
+
 # Rules
 - Gather context yourself with list_dir/grep/read_file before editing. Never
   assume file contents — read them.
