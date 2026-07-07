@@ -24,6 +24,7 @@ var replCommands = []cmdInfo{
 	{"/endpoint", "list / switch endpoints"},
 	{"/model", "show / set the model"},
 	{"/approve", "approval mode (on|off|run|edit)"},
+	{"/think", "show / hide model reasoning"},
 	{"/reset", "clear the transcript"},
 	{"/exit", "quit"},
 }

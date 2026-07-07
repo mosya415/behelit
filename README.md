@@ -48,6 +48,7 @@ are denied rather than run unattended.
 | `LCA_CMD_TIMEOUT` | `120`                       | `run_command` timeout in seconds |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
+| `LCA_HIDE_THINKING` | unset                     | Start with model reasoning collapsed (toggle with `/think`) |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
 | `LCA_RESERVATION` | unset                       | Slurm reservation to scope `/discover` (e.g. `gigalearn-test`) |
@@ -170,7 +171,9 @@ Reasoning from "thinking" models is rendered dimmed, set apart from the answer:
 a `<think>…</think>` block in the content has its tags dropped and its lines
 shown faint, and a separate `reasoning_content` stream field (vLLM/SGLang
 reasoning parsers) is shown the same way. Reasoning is display-only — it is not
-part of the answer returned to the model.
+part of the answer returned to the model. `/think` collapses reasoning to a
+compact `thinking…` marker or expands it back (start collapsed with
+`LCA_HIDE_THINKING`).
 
 ## Design (the four non-trivial parts)
 

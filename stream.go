@@ -31,13 +31,25 @@ type proseWriter struct {
 	started        bool // the assistant bullet has been printed at least once
 	pendingNewline bool // a line was printed; emit the separator before the next
 
-	line     strings.Builder // current line buffer (until newline)
-	table    []string        // buffered consecutive table rows (rendered on flush)
-	thinking bool            // inside a <think>…</think> reasoning block
-	reason   strings.Builder // partial line of reasoning_content (separate field)
+	line        strings.Builder // current line buffer (until newline)
+	table       []string        // buffered consecutive table rows (rendered on flush)
+	thinking    bool            // inside a <think>…</think> reasoning block
+	reason      strings.Builder // partial line of reasoning_content (separate field)
+	showThink   bool            // expand reasoning; else collapse to a "thinking…" marker
+	thinkMarked bool            // the collapsed "thinking…" marker was already shown
 }
 
-func newProseWriter(raw bool) *proseWriter { return &proseWriter{raw: raw} }
+func newProseWriter(raw, showThink bool) *proseWriter {
+	return &proseWriter{raw: raw, showThink: showThink}
+}
+
+// thinkMark shows the compact collapsed-reasoning marker once per message.
+func (p *proseWriter) thinkMark() {
+	if !p.thinkMarked {
+		p.printLine(faint("thinking…"))
+		p.thinkMarked = true
+	}
+}
 
 func (p *proseWriter) out(s string) { fmt.Print(s) }
 
@@ -70,6 +82,10 @@ func (p *proseWriter) feedReasoning(s string) {
 			p.started = true
 		}
 		p.out(cFaint + s + cReset)
+		return
+	}
+	if !p.showThink {
+		p.thinkMark()
 		return
 	}
 	for i := 0; i < len(s); i++ {
@@ -126,10 +142,14 @@ func (p *proseWriter) flushLine(raw string) {
 		return
 	}
 
-	// (1b) reasoning: <think>…</think> in the content — render dimmed, drop tags.
+	// (1b) reasoning: <think>…</think> in the content — dim when expanded, else a
+	// compact "thinking…" marker; the tags are always dropped.
 	if !p.thinking {
 		if trimmed == "<think>" || trimmed == "<thinking>" {
 			p.thinking = true
+			if !p.showThink {
+				p.thinkMark()
+			}
 			return
 		}
 	} else {
@@ -138,7 +158,11 @@ func (p *proseWriter) flushLine(raw string) {
 			return
 		}
 		if trimmed != "" {
-			p.printLine(faint("%s", trimmed))
+			if p.showThink {
+				p.printLine(faint("%s", trimmed))
+			} else {
+				p.thinkMark()
+			}
 		}
 		return
 	}

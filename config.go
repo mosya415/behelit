@@ -28,6 +28,7 @@ type Config struct {
 	Reservation  string   // Slurm reservation to scope /discover (LCA_RESERVATION)
 	DiscoverUser string   // Slurm user filter for /discover (LCA_USER; "$me" = you)
 	Scheme       string   // http|https for discovered endpoints (LCA_SCHEME)
+	ShowThinking bool     // expand model reasoning (LCA_HIDE_THINKING to start collapsed)
 }
 
 func env(key, def string) string {
@@ -62,6 +63,7 @@ func loadConfig() Config {
 		Reservation:  os.Getenv("LCA_RESERVATION"),
 		DiscoverUser: os.Getenv("LCA_USER"),
 		Scheme:       env("LCA_SCHEME", "http"),
+		ShowThinking: os.Getenv("LCA_HIDE_THINKING") == "",
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

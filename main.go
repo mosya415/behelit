@@ -62,7 +62,7 @@ func main() {
 		}
 		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 		msgs = append(msgs, Message{Role: "user", Content: prompt})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking)
 		rec.Transcript(msgs)
 		return
 	}
@@ -74,6 +74,7 @@ func main() {
 
 	ed := NewLineEditor(in)
 	ed.models = client.KnownModels
+	showThink := cfg.ShowThinking
 	for {
 		fmt.Print("\n")
 		line, err := ed.ReadLine(" " + cFaint + "›" + cReset + " ")
@@ -116,10 +117,13 @@ func main() {
 		if handleDiscoverCmd(line, client, rec, cfg) {
 			continue
 		}
+		if handleThinkCmd(line, &showThink, rec) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink)
 		rec.Transcript(msgs)
 	}
 }
@@ -441,6 +445,33 @@ func readyLine(m ModelInfo) string {
 	return s
 }
 
+// handleThinkCmd toggles whether model reasoning is expanded or collapsed to a
+// compact marker. /think toggles; /think on|off sets it explicitly.
+func handleThinkCmd(line string, show *bool, rec *Recorder) bool {
+	arg, ok := commandArg(line, "/think")
+	if !ok {
+		return false
+	}
+	switch arg {
+	case "on", "show", "expand":
+		*show = true
+	case "off", "hide", "collapse":
+		*show = false
+	case "", "toggle":
+		*show = !*show
+	default:
+		fmt.Println("  " + faint("usage: /think [on|off]"))
+		return true
+	}
+	state := "collapsed"
+	if *show {
+		state = "expanded"
+	}
+	rec.Event("think_mode", map[string]any{"show": *show})
+	kv("reasoning", strings.ToUpper(state))
+	return true
+}
+
 // handleApproveCmd processes the /approve REPL command (on|off|status). Returns
 // true if the line was such a command and has been handled.
 func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
@@ -488,11 +519,11 @@ func looksLikeStrayEdit(s string) bool {
 	return false
 }
 
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw bool) {
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink bool) {
 	continuing := false // the previous step was cut off by length; continue it
 	nudges := 0         // times we asked the model to redo a stray diff as a tool call
 	for step := 0; step < maxSteps; step++ {
-		pw := newProseWriter(raw)
+		pw := newProseWriter(raw, showThink)
 
 		send, trimmed := trimForContext(*msgs, ctxTokens)
 		if trimmed > 0 {
@@ -739,5 +770,5 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	kv("log", rec.SessionPath())
 	kv("approve", strings.ToUpper(ap.Mode()))
 	hr()
-	fmt.Println(" " + faint("/discover   /endpoint [n|url]   /model [name]   /approve [on|off|run|edit|status]   /reset   /exit"))
+	fmt.Println(" " + faint("/discover   /endpoint [n|url]   /model [name]   /approve […]   /think   /reset   /exit"))
 }
