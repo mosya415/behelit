@@ -64,7 +64,7 @@ func main() {
 		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 		msgs = append(msgs, Message{Role: "user", Content: prompt})
 		var reason string
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking, cfg.Loop, &reason)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking, cfg.Loop, false, &reason)
 		rec.Transcript(msgs)
 		return
 	}
@@ -93,21 +93,29 @@ func main() {
 	}
 	for {
 		fmt.Print("\n")
-		line, err := ed.ReadLine(" " + cFaint + "›" + cReset + " ")
-		if err == errLineCancel {
-			continue
-		}
-		if err != nil { // EOF (Ctrl-D / stream end)
-			return
-		}
-		// Backslash line-continuation: a line ending in \ keeps reading, so a
-		// long prompt can be typed across several lines.
-		for strings.HasSuffix(line, "\\") {
-			cont, err := ed.ReadLine("   " + cFaint + "…" + cReset + " ")
-			if err != nil {
-				break
+		var line string
+		if q, ok := takeQueuedLine(); ok {
+			// The user typed this during the previous turn's streaming.
+			line = q
+			echoQueued(line)
+		} else {
+			l, err := ed.ReadLine(" "+cFaint+"›"+cReset+" ", takePartial())
+			if err == errLineCancel {
+				continue
 			}
-			line = line[:len(line)-1] + "\n" + cont
+			if err != nil { // EOF (Ctrl-D / stream end)
+				return
+			}
+			line = l
+			// Backslash line-continuation: a line ending in \ keeps reading, so a
+			// long prompt can be typed across several lines.
+			for strings.HasSuffix(line, "\\") {
+				cont, err := ed.ReadLine("   "+cFaint+"…"+cReset+" ", "")
+				if err != nil {
+					break
+				}
+				line = line[:len(line)-1] + "\n" + cont
+			}
 		}
 		line = strings.TrimSpace(line)
 		switch line {
@@ -145,7 +153,7 @@ func main() {
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink, loop, &lastReason)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink, loop, true, &lastReason)
 		rec.Transcript(msgs)
 	}
 }
@@ -620,11 +628,27 @@ func looksStalled(s string) bool {
 
 const doneMarker = "TASK_DONE"
 
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink, loop bool, lastReason *string) {
+// echoQueued shows a message the user typed during streaming as a submitted
+// band, so it's clear which queued input is now running.
+func echoQueued(line string) {
+	w := termWidth()
+	bar := cFaint + strings.Repeat("─", w) + cReset
+	band := cBandBg + padTo(" › "+strings.ReplaceAll(line, "\n", "⏎ "), w, 0) + cReset
+	fmt.Println(bar)
+	fmt.Println(band)
+	fmt.Println(bar)
+}
+
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink, loop, interactive bool, lastReason *string) {
 	*lastReason = ""    // reasoning captured this turn, for /think last
 	continuing := false // the previous step was cut off by length; continue it
 	nudges := 0         // times we asked the model to redo a stray diff as a tool call
 	for step := 0; step < maxSteps; step++ {
+		// The user typed a new message during the previous step's streaming —
+		// hand control back to the REPL to run it instead of pressing on.
+		if interactive && hasQueuedLine() {
+			return
+		}
 		pw := newProseWriter(raw, showThink)
 
 		send, trimmed := trimForContext(*msgs, ctxTokens)
@@ -632,7 +656,12 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
+		var f *footer
+		if interactive {
+			f = startFooter(" "+cFaint+"›"+cReset+" ", takePartial())
+		}
 		reply, finish, err := client.CompleteStream(send, pw.feed, pw.feedReasoning, continuing)
+		f.stop()
 		pw.end()
 		if len(pw.reasonLog) > 0 {
 			if *lastReason != "" {

@@ -75,7 +75,7 @@ func (e *LineEditor) out(s string) { fmt.Print(s) }
 
 // ReadLine prints prompt and returns the entered line. Returns errLineCancel on
 // Ctrl-C (caller should just continue) and io.EOF on Ctrl-D / stream end.
-func (e *LineEditor) ReadLine(prompt string) (string, error) {
+func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 	restore, err := makeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return e.cooked(prompt)
@@ -84,8 +84,8 @@ func (e *LineEditor) ReadLine(prompt string) (string, error) {
 	e.out("\033[?2004h") // ask the terminal to bracket pastes
 	defer e.out("\033[?2004l")
 
-	var buf []rune
-	pos := 0
+	buf := []rune(initial)
+	pos := len(buf)
 	hist := len(e.history)
 
 	// top fence of the input area

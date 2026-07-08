@@ -190,6 +190,37 @@ func TestTrimForContext(t *testing.T) {
 	}
 }
 
+func TestDedupeReads(t *testing.T) {
+	rd := func(path, body string) Message {
+		return Message{Role: "user", Content: "<tool_result name=\"read_file\" path=\"" + path + "\">\n" + body + "\n</tool_result>"}
+	}
+	msgs := []Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "fix it"},
+		rd("a.go", strings.Repeat("x", 4000)), // superseded by the later read of a.go
+		{Role: "assistant", Content: "editing"},
+		rd("b.go", "small"),
+		rd("a.go", strings.Repeat("y", 4000)), // authoritative read of a.go
+		{Role: "user", Content: "keep going"},
+	}
+	out, trimmed := trimForContext(msgs, 0) // budget off — only dedup runs
+	if trimmed != 1 {
+		t.Fatalf("trimmed = %d, want 1", trimmed)
+	}
+	if out[2].Content != supersededStub {
+		t.Fatalf("older a.go read not collapsed: %q", out[2].Content)
+	}
+	if !strings.Contains(out[5].Content, "yyyy") {
+		t.Fatal("latest a.go read must be kept intact")
+	}
+	if !strings.Contains(out[4].Content, "small") {
+		t.Fatal("b.go read (read once) must be kept")
+	}
+	if msgs[2].Content == supersededStub {
+		t.Fatal("must not mutate the input slice")
+	}
+}
+
 var reAnsiTest = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func stripAnsi(s string) string { return reAnsiTest.ReplaceAllString(s, "") }

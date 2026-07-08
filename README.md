@@ -185,6 +185,14 @@ display-only — it is not part of the answer returned to the model.
 While typing, a status line under the input shows the current model, working
 mode (`approve:…`, plus `loop`/`unsafe` when on), and directory.
 
+While the model is streaming, an input line stays pinned to the terminal's
+bottom row (a DECSTBM scroll region keeps the answer scrolling above it), so you
+can read the answer forming AND type the next message without waiting. Press
+Enter and it queues: the current turn finishes, then your message runs (in loop
+mode this also breaks the loop to handle you promptly). Anything typed but not
+submitted carries over to pre-fill the next prompt. Linux-only; elsewhere the
+session just falls back to prompting after each turn.
+
 ## Design (the four non-trivial parts)
 
 Some models don't put tags on their own line (MiniMax-M3 emits
@@ -227,10 +235,13 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
    prompt. The model pulls what it needs via auto-running
    `list_dir`/`grep`/`read_file`. The
    full transcript is kept on disk for audit, but the copy *sent* to the model is
-   trimmed to an approximate token budget (`LCA_CTX_TOKENS`): the oldest
-   `tool_result` outputs are collapsed to a stub first (the model already
-   extracted what it needed), while user instructions and the assistant's own
-   reasoning are preserved. Keeps prefill bounded across long sessions.
+   trimmed in two passes. First, superseded reads are deduped: if a file is read
+   again later, the earlier `read_file` result is collapsed (the newer copy is
+   authoritative) — always, regardless of budget, which is the big win in loops
+   that re-read a file after editing it. Then, if still over the token budget
+   (`LCA_CTX_TOKENS`), the oldest remaining `tool_result` outputs are collapsed
+   to a stub, while user instructions and the assistant's own reasoning are
+   preserved. Keeps prefill bounded across long sessions.
 
 4. **Scope as defense-in-depth — `jail.go` + `approval.go`.** A realpath jail
    (symlink-resolved, prefix-checked) confines every path to the root, and
