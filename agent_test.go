@@ -105,7 +105,7 @@ func TestApplyEdit_Strict(t *testing.T) {
 
 func TestJail_Escape(t *testing.T) {
 	root := t.TempDir()
-	j, err := NewJail(root, []string{"ls"})
+	j, err := NewJail(root, []string{"ls"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +120,23 @@ func TestJail_Escape(t *testing.T) {
 	}
 }
 
+func TestJail_Unsafe(t *testing.T) {
+	root := t.TempDir()
+	j, err := NewJail(root, []string{"ls"}, true) // unsafe
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Resolve("../../etc/passwd"); err != nil {
+		t.Fatalf("unsafe jail must allow escape, got %v", err)
+	}
+	if p, _ := j.Resolve("/etc/hostname"); p != "/etc/hostname" {
+		t.Fatalf("unsafe absolute path = %q", p)
+	}
+	if !j.AllowCommand("rm") {
+		t.Fatal("unsafe jail must allow any command")
+	}
+}
+
 func TestJail_SymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -128,7 +145,7 @@ func TestJail_SymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Skip("symlinks unsupported")
 	}
-	j, _ := NewJail(root, nil)
+	j, _ := NewJail(root, nil, false)
 	if _, err := j.Resolve("link/secret"); err == nil {
 		t.Fatal("symlink escape should be rejected")
 	}

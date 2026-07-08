@@ -13,10 +13,11 @@ import (
 type Jail struct {
 	Root    string   // absolute, symlink-resolved root
 	Allowed []string // command allowlist, for display
+	Unsafe  bool     // OFF the jail: any path, any command (see /unsafe)
 	allowed map[string]bool
 }
 
-func NewJail(root string, allowed []string) (*Jail, error) {
+func NewJail(root string, allowed []string, unsafe bool) (*Jail, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
@@ -29,7 +30,7 @@ func NewJail(root string, allowed []string) (*Jail, error) {
 	for _, c := range allowed {
 		set[c] = true
 	}
-	return &Jail{Root: real, Allowed: allowed, allowed: set}, nil
+	return &Jail{Root: real, Allowed: allowed, Unsafe: unsafe, allowed: set}, nil
 }
 
 // Resolve turns a tool-supplied path into an absolute path guaranteed to be
@@ -45,6 +46,9 @@ func (j *Jail) Resolve(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err
+	}
+	if j.Unsafe {
+		return abs, nil // no confinement — any path
 	}
 
 	// Walk up to the nearest existing ancestor and resolve its symlinks, then
@@ -74,8 +78,12 @@ func (j *Jail) Resolve(p string) (string, error) {
 	return resolved, nil
 }
 
-// AllowCommand reports whether argv[0]'s basename is on the allowlist.
+// AllowCommand reports whether argv[0]'s basename is on the allowlist (always
+// true in unsafe mode).
 func (j *Jail) AllowCommand(argv0 string) bool {
+	if j.Unsafe {
+		return true
+	}
 	return j.allowed[filepath.Base(argv0)]
 }
 

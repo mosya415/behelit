@@ -50,6 +50,7 @@ are denied rather than run unattended.
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_HIDE_THINKING` | unset                     | Start with model reasoning collapsed (toggle with `/think`) |
 | `LCA_LOOP`     | unset                          | Start in autonomous loop mode (toggle with `/loop`) |
+| `LCA_UNSAFE`   | unset                          | Start with the jail + allowlist off (toggle with `/unsafe`; also `-unsafe`) |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
 | `LCA_RESERVATION` | unset                       | Slurm reservation to scope `/discover` (e.g. `gigalearn-test`) |
@@ -235,7 +236,14 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
    the hard gate (reach). Both are required.
 
 `read_file`/`grep` run automatically (no side effects). `edit`/`write`/
-`run_command` require an explicit `y` at the prompt. A running command streams
+`run_command` require an explicit `y` at the prompt.
+
+**Unsafe mode** (`/unsafe`, `LCA_UNSAFE`, or `-unsafe`) turns the hard boundary
+OFF: paths are no longer confined to the root (any file), the command allowlist
+is bypassed and commands run through a shell (any command, pipes/redirects). It
+is loudly flagged in the banner and audited (`unsafe_mode`). The approval gate is
+independent — combine with `/approve on` (or `-y`) and `/loop` for a fully
+autonomous, unrestricted agent. Off by default. A running command streams
 its output live behind a dim `│` gutter, its stdin is the null device (so it
 can't hang waiting for input), it is bounded by `LCA_CMD_TIMEOUT`, and Ctrl-C
 interrupts just that command — not the agent.

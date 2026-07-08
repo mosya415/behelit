@@ -20,11 +20,12 @@ func main() {
 
 	yes := flag.Bool("y", false, "auto-approve side-effecting actions (for one-shot / non-interactive use)")
 	yesLong := flag.Bool("yes", false, "alias for -y")
+	unsafe := flag.Bool("unsafe", false, "disable the jail + command allowlist (any path, any command)")
 	flag.Usage = usage
 	flag.Parse()
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
 
-	jail, err := NewJail(cfg.Root, cfg.Allowed)
+	jail, err := NewJail(cfg.Root, cfg.Allowed, cfg.Unsafe || *unsafe)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "jail init failed:", err)
 		os.Exit(1)
@@ -124,6 +125,9 @@ func main() {
 			continue
 		}
 		if handleLoopCmd(line, &loop, rec) {
+			continue
+		}
+		if handleUnsafeCmd(line, jail, rec) {
 			continue
 		}
 
@@ -489,6 +493,33 @@ func handleThinkCmd(line string, show *bool, lastReason string, rec *Recorder) b
 	return true
 }
 
+// handleUnsafeCmd toggles unsafe mode: the realpath jail and command allowlist
+// are turned off (any path, any command via a shell). Loudly warned + audited.
+func handleUnsafeCmd(line string, jail *Jail, rec *Recorder) bool {
+	arg, ok := commandArg(line, "/unsafe")
+	if !ok {
+		return false
+	}
+	switch arg {
+	case "on":
+		jail.Unsafe = true
+	case "off":
+		jail.Unsafe = false
+	case "", "toggle":
+		jail.Unsafe = !jail.Unsafe
+	default:
+		fmt.Println("  " + faint("usage: /unsafe [on|off]"))
+		return true
+	}
+	rec.Event("unsafe_mode", map[string]any{"on": jail.Unsafe})
+	if jail.Unsafe {
+		fmt.Println("  " + cBlood + "⚠ UNSAFE ON" + cReset + faint(" — jail + allowlist OFF: any path, any command"))
+	} else {
+		kv("unsafe", "OFF")
+	}
+	return true
+}
+
 // handleLoopCmd toggles autonomous loop mode. /loop toggles; /loop on|off sets.
 func handleLoopCmd(line string, loop *bool, rec *Recorder) bool {
 	arg, ok := commandArg(line, "/loop")
@@ -822,6 +853,7 @@ usage:
 
 flags:
   -y, -yes            auto-approve side-effecting actions (edit/write/run_command)
+  -unsafe             disable the jail + command allowlist (any path, any command)
 
 config is via environment (see README): LCA_BASE_URL, LCA_MODEL, LCA_ROOT,
 LCA_ALLOW, LCA_DIR, LCA_CTX_TOKENS.
@@ -851,6 +883,9 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 	kv("approve", strings.ToUpper(ap.Mode()))
 	if cfg.Loop {
 		kv("loop", "ON — agent runs until TASK_DONE")
+	}
+	if jail.Unsafe {
+		fmt.Println("  " + cFaint + "UNSAFE   " + cReset + cBlood + "⚠ jail + allowlist OFF: any path, any command" + cReset)
 	}
 	fmt.Println()
 	fmt.Println(" " + faint("Enter submit · \\ newline · /discover · /model · /think · /loop · Ctrl-C · /exit"))

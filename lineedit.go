@@ -27,6 +27,7 @@ var replCommands = []cmdInfo{
 	{"/approve", "approval mode (on|off|run|edit)"},
 	{"/think", "show / hide model reasoning"},
 	{"/loop", "autonomous mode: run until done"},
+	{"/unsafe", "disable jail + allowlist (danger)"},
 	{"/reset", "clear the transcript"},
 	{"/exit", "quit"},
 }

@@ -209,23 +209,29 @@ func isBinary(data []byte) bool {
 // is the null device, so a command that would wait for input gets EOF instead
 // of hanging until the timeout.
 func runCommand(j *Jail, cmdline string) string {
-	argv, err := tokenize(cmdline)
-	if err != nil {
-		return "error: " + err.Error()
-	}
-	if len(argv) == 0 {
-		return "error: empty command"
-	}
-	if !j.AllowCommand(argv[0]) {
-		return fmt.Sprintf("error: command %q is not on the allowlist", argv[0])
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if j.Unsafe {
+		// unsafe: run through a shell, so pipes/redirects/substitutions work
+		cmd = exec.CommandContext(ctx, "sh", "-c", cmdline)
+	} else {
+		argv, err := tokenize(cmdline)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		if len(argv) == 0 {
+			return "error: empty command"
+		}
+		if !j.AllowCommand(argv[0]) {
+			return fmt.Sprintf("error: command %q is not on the allowlist", argv[0])
+		}
+		cmd = exec.CommandContext(ctx, argv[0], argv[1:]...)
 	}
 
 	fmt.Println(" " + faint("%s $ %s   %s", gNone, cmdline, faint("(Ctrl-C to interrupt)")))
 
-	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = j.Root
 	cmd.Stdin = nil // null device → reads get EOF, no interactive hang
 
@@ -247,7 +253,7 @@ func runCommand(j *Jail, cmdline string) string {
 		}
 	}()
 
-	err = cmd.Run()
+	err := cmd.Run()
 	cancelled := ctx.Err() == context.Canceled
 	close(done)
 	signal.Stop(sigch)
