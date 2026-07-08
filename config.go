@@ -29,6 +29,7 @@ type Config struct {
 	DiscoverUser string   // Slurm user filter for /discover (LCA_USER; "$me" = you)
 	Scheme       string   // http|https for discovered endpoints (LCA_SCHEME)
 	ShowThinking bool     // expand model reasoning (LCA_HIDE_THINKING to start collapsed)
+	Loop         bool     // autonomous loop mode: keep going until TASK_DONE (LCA_LOOP)
 }
 
 func env(key, def string) string {
@@ -64,6 +65,7 @@ func loadConfig() Config {
 		DiscoverUser: os.Getenv("LCA_USER"),
 		Scheme:       env("LCA_SCHEME", "http"),
 		ShowThinking: os.Getenv("LCA_HIDE_THINKING") == "",
+		Loop:         os.Getenv("LCA_LOOP") != "",
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

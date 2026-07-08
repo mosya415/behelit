@@ -26,6 +26,7 @@ var replCommands = []cmdInfo{
 	{"/model", "show / set the model"},
 	{"/approve", "approval mode (on|off|run|edit)"},
 	{"/think", "show / hide model reasoning"},
+	{"/loop", "autonomous mode: run until done"},
 	{"/reset", "clear the transcript"},
 	{"/exit", "quit"},
 }

@@ -87,6 +87,9 @@ Then end the message; the <tool_result> comes back and you continue.
   control back to the user and stalls the task.
 - A message with NO tags ENDS your turn. Send one only when the WHOLE task is
   finished; then give a short summary.
+- In autonomous "loop" mode you will be nudged to keep going after a tagless
+  message; when the task is genuinely complete, reply with just TASK_DONE on its
+  own line to stop the loop.
 
 # Rules
 - Gather context yourself with list_dir/grep/read_file before editing. Never

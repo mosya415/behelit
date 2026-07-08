@@ -63,7 +63,7 @@ func main() {
 		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 		msgs = append(msgs, Message{Role: "user", Content: prompt})
 		var reason string
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking, &reason)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking, cfg.Loop, &reason)
 		rec.Transcript(msgs)
 		return
 	}
@@ -76,6 +76,7 @@ func main() {
 	ed := NewLineEditor(in)
 	ed.models = client.KnownModels
 	showThink := cfg.ShowThinking
+	loop := cfg.Loop
 	var lastReason string
 	for {
 		fmt.Print("\n")
@@ -122,10 +123,13 @@ func main() {
 		if handleThinkCmd(line, &showThink, lastReason, rec) {
 			continue
 		}
+		if handleLoopCmd(line, &loop, rec) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink, &lastReason)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink, loop, &lastReason)
 		rec.Transcript(msgs)
 	}
 }
@@ -485,6 +489,32 @@ func handleThinkCmd(line string, show *bool, lastReason string, rec *Recorder) b
 	return true
 }
 
+// handleLoopCmd toggles autonomous loop mode. /loop toggles; /loop on|off sets.
+func handleLoopCmd(line string, loop *bool, rec *Recorder) bool {
+	arg, ok := commandArg(line, "/loop")
+	if !ok {
+		return false
+	}
+	switch arg {
+	case "on":
+		*loop = true
+	case "off":
+		*loop = false
+	case "", "toggle":
+		*loop = !*loop
+	default:
+		fmt.Println("  " + faint("usage: /loop [on|off]"))
+		return true
+	}
+	state := "OFF"
+	if *loop {
+		state = "ON — agent runs until TASK_DONE"
+	}
+	rec.Event("loop_mode", map[string]any{"on": *loop})
+	kv("loop", state)
+	return true
+}
+
 // handleApproveCmd processes the /approve REPL command (on|off|status). Returns
 // true if the line was such a command and has been handled.
 func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
@@ -545,7 +575,9 @@ func looksStalled(s string) bool {
 	return false
 }
 
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink bool, lastReason *string) {
+const doneMarker = "TASK_DONE"
+
+func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink, loop bool, lastReason *string) {
 	*lastReason = ""    // reasoning captured this turn, for /think last
 	continuing := false // the previous step was cut off by length; continue it
 	nudges := 0         // times we asked the model to redo a stray diff as a tool call
@@ -591,6 +623,16 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 				fmt.Println(" " + faint("%s response truncated — continuing…", gNone))
 				rec.Event("auto_continue", map[string]any{"finish": finish})
 				continuing = true
+				continue
+			}
+			// Loop mode: keep working autonomously until the model signals it is
+			// finished with TASK_DONE (or we hit the step cap). Not bounded by the
+			// heuristic nudge counter — this is an explicit, opt-in mode.
+			if loop && !strings.Contains(full, doneMarker) {
+				fmt.Println(" " + faint("%s loop — continuing…", gNone))
+				rec.Event("loop_continue", nil)
+				*msgs = append(*msgs, Message{Role: "user", Content: "Keep going — take the next action and emit its tool tag. When the ENTIRE task is truly finished, reply with just " + doneMarker + " on its own line."})
+				rec.Transcript(*msgs)
 				continue
 			}
 			// The model described a change as a diff / code block instead of an
@@ -807,6 +849,9 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 		contValue(n)
 	}
 	kv("approve", strings.ToUpper(ap.Mode()))
+	if cfg.Loop {
+		kv("loop", "ON — agent runs until TASK_DONE")
+	}
 	fmt.Println()
-	fmt.Println(" " + faint("Enter submit · \\ newline · /discover · /model · /think · Ctrl-C interrupt · /exit"))
+	fmt.Println(" " + faint("Enter submit · \\ newline · /discover · /model · /think · /loop · Ctrl-C · /exit"))
 }

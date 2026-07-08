@@ -49,6 +49,7 @@ are denied rather than run unattended.
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_HIDE_THINKING` | unset                     | Start with model reasoning collapsed (toggle with `/think`) |
+| `LCA_LOOP`     | unset                          | Start in autonomous loop mode (toggle with `/loop`) |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
 | `LCA_RESERVATION` | unset                       | Slurm reservation to scope `/discover` (e.g. `gigalearn-test`) |
@@ -212,6 +213,11 @@ Likewise, if a no-tool reply trails off (ends on a colon/ellipsis) as if it
 announced a next step without doing it, the agent nudges it to continue
 (`nudge_continue`, bounded). The system prompt also tells the model it runs in
 an automatic loop and must emit the next tool call rather than wait.
+
+`/loop` (or `LCA_LOOP`) turns on **autonomous loop mode**: after any tagless
+reply the agent keeps prompting the model to take the next action — unbounded by
+the heuristic nudge counter — until the model replies `TASK_DONE` or the step cap
+is hit. Use it to hand off a whole task and let the agent run it to completion.
 
 3. **Context — `tools.go` + `context.go`.** The repo is never dumped into the
    prompt. The model pulls what it needs via auto-running
