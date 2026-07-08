@@ -36,6 +36,7 @@ type LineEditor struct {
 	rd      *bufio.Reader
 	history []string
 	models  func() []string // known model names, for /model completion
+	status  func() string   // one-line status shown under the input (model · mode · dir)
 }
 
 func NewLineEditor(rd *bufio.Reader) *LineEditor { return &LineEditor{rd: rd} }
@@ -305,17 +306,26 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 // menu of matching commands below it, leaving the cursor at the right column.
 func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 	menu := e.suggest(string(buf))
-	e.out("\r\033[J") // clear from line start down (input + any old menu)
+	e.out("\r\033[J") // clear from line start down (input + any old menu / status)
 	e.out(prompt + displayRunes(buf))
+	below := 0
 	for _, m := range menu {
 		line := "\r\n  " + cFaint + fmt.Sprintf("%-11s", m.name) + cReset
 		if m.desc != "" {
 			line += " " + cFaint + m.desc + cReset
 		}
 		e.out(line)
+		below++
 	}
-	if len(menu) > 0 {
-		e.out(fmt.Sprintf("\033[%dA", len(menu))) // back up to the input line
+	// With no command menu open, show the persistent status line under the input.
+	if below == 0 && e.status != nil {
+		if s := e.status(); s != "" {
+			e.out("\r\n  " + cFaint + s + cReset)
+			below++
+		}
+	}
+	if below > 0 {
+		e.out(fmt.Sprintf("\033[%dA", below)) // back up to the input line
 	}
 	e.out("\r")
 	if col := visibleWidth(prompt) + visibleWidth(displayRunes(buf[:pos])); col > 0 {

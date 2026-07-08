@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,10 +45,38 @@ type proseWriter struct {
 	spinning     bool            // the timer-driven spinner goroutine is running
 	spinStop     chan struct{}   // signals the spinner to exit
 	spinDone     chan struct{}   // closed when the spinner goroutine has exited
+
+	genStart time.Time // when the first delta of this response arrived
+	tok      int64     // approx tokens streamed this response (atomic; ~1 per delta)
 }
 
 func newProseWriter(raw, showThink bool) *proseWriter {
 	return &proseWriter{raw: raw, showThink: showThink, anim: osTermWidth() > 0}
+}
+
+// noteTok records that a stream delta arrived: starts the generation clock on
+// the first one and bumps the running token estimate (~one token per delta).
+func (p *proseWriter) noteTok() {
+	if p.genStart.IsZero() {
+		p.genStart = time.Now()
+	}
+	atomic.AddInt64(&p.tok, 1)
+}
+
+// thinkStat renders the live "elapsed · tokens" suffix for the thinking line.
+func (p *proseWriter) thinkStat() string {
+	el := time.Duration(0)
+	if !p.genStart.IsZero() {
+		el = time.Since(p.genStart)
+	}
+	s := int(el.Seconds())
+	var d string
+	if s < 60 {
+		d = fmt.Sprintf("%ds", s)
+	} else {
+		d = fmt.Sprintf("%dm%02ds", s/60, s%60)
+	}
+	return fmt.Sprintf("%s · %d tok", d, atomic.LoadInt64(&p.tok))
 }
 
 // leadMarker opens the marker line with the assistant gutter.
@@ -74,7 +103,7 @@ func (p *proseWriter) beginReasoning() {
 		p.out(cFaint + "thinking…" + cReset)
 		return
 	}
-	p.out(cFaint + "⠋ thinking" + cReset)
+	p.out(cFaint + "⠋ thinking · " + p.thinkStat() + cReset)
 	p.spinning = true
 	p.spinStop = make(chan struct{})
 	p.spinDone = make(chan struct{})
@@ -90,7 +119,7 @@ func (p *proseWriter) beginReasoning() {
 			case <-p.spinStop:
 				return
 			case <-tk.C:
-				p.out("\r\033[K" + prefix + cFaint + string(frames[i%len(frames)]) + " thinking" + cReset)
+				p.out("\r\033[K" + prefix + cFaint + string(frames[i%len(frames)]) + " thinking · " + p.thinkStat() + cReset)
 				i++
 			}
 		}
@@ -108,7 +137,7 @@ func (p *proseWriter) closeMarker() {
 		close(p.spinStop)
 		<-p.spinDone
 		p.spinning = false
-		p.out("\r\033[K" + p.markerPrefix + cFaint + "thinking…" + cReset)
+		p.out("\r\033[K" + p.markerPrefix + cFaint + "thought " + p.thinkStat() + cReset)
 	}
 	p.markerActive = false
 	p.pendingNewline = true
@@ -125,6 +154,7 @@ func (p *proseWriter) feed(s string) {
 		p.out(s)
 		return
 	}
+	p.noteTok()
 	p.flushReason() // any pending reasoning line closes before answer content
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\n' {
@@ -147,6 +177,7 @@ func (p *proseWriter) feedReasoning(s string) {
 		p.out(cFaint + s + cReset)
 		return
 	}
+	p.noteTok()
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\n' {
 			p.flushReason()

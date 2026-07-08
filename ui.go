@@ -227,3 +227,16 @@ func warn(format string, a ...any) string {
 func faint(format string, a ...any) string {
 	return cFaint + fmt.Sprintf(format, a...) + cReset
 }
+
+// shortDir abbreviates the home directory to ~ for a compact status display.
+func shortDir(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if p == home {
+			return "~"
+		}
+		if strings.HasPrefix(p, home+string(os.PathSeparator)) {
+			return "~" + p[len(home):]
+		}
+	}
+	return p
+}

@@ -65,7 +65,7 @@ func loadConfig() Config {
 		Reservation:  os.Getenv("LCA_RESERVATION"),
 		DiscoverUser: os.Getenv("LCA_USER"),
 		Scheme:       env("LCA_SCHEME", "http"),
-		ShowThinking: os.Getenv("LCA_HIDE_THINKING") == "",
+		ShowThinking: os.Getenv("LCA_SHOW_THINKING") != "", // default: reasoning collapsed into the live status line
 		Loop:         os.Getenv("LCA_LOOP") != "",
 		Unsafe:       os.Getenv("LCA_UNSAFE") != "",
 		Allowed: []string{

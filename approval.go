@@ -119,3 +119,17 @@ func (a *Approver) Mode() string {
 		return "auto-approve: " + strings.Join(cs, ", ")
 	}
 }
+
+// ModeShort is a compact form of Mode for the status line: "ask", "auto", or
+// "auto:run,edit".
+func (a *Approver) ModeShort() string {
+	cs := a.TrustedClasses()
+	switch {
+	case len(cs) == 0:
+		return "ask"
+	case len(cs) == len(allClasses):
+		return "auto"
+	default:
+		return "auto:" + strings.Join(cs, ",")
+	}
+}

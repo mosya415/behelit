@@ -48,7 +48,7 @@ are denied rather than run unattended.
 | `LCA_CMD_TIMEOUT` | `120`                       | `run_command` timeout in seconds |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
-| `LCA_HIDE_THINKING` | unset                     | Start with model reasoning collapsed (toggle with `/think`) |
+| `LCA_SHOW_THINKING` | unset                     | Start with reasoning expanded to full text (default: collapsed to the live status line; toggle with `/think`) |
 | `LCA_LOOP`     | unset                          | Start in autonomous loop mode (toggle with `/loop`) |
 | `LCA_UNSAFE`   | unset                          | Start with the jail + allowlist off (toggle with `/unsafe`; also `-unsafe`) |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
@@ -173,14 +173,17 @@ a legible approximation, not true typesetting — for that, use the (not-yet-bui
 HTML report. Rendering is line-buffered (a line is formatted once complete);
 `LCA_RAW=1` disables all of it and streams verbatim.
 
-Reasoning from "thinking" models is rendered dimmed, set apart from the answer:
-a `<think>…</think>` block in the content has its tags dropped and its lines
-shown faint, and a separate `reasoning_content` stream field (vLLM/SGLang
-reasoning parsers) is shown the same way. Reasoning is display-only — it is not
-part of the answer returned to the model. `/think` collapses reasoning to a
-compact marker with a timer-driven braille spinner (`⠋ thinking`) while the
-model is thinking, or expands it back; `/think last` reprints the last answer's reasoning
-even if it was collapsed (start collapsed with `LCA_HIDE_THINKING`).
+Reasoning from "thinking" models is, by default, collapsed into a single live
+status line that updates in place — a timer-driven braille spinner with the
+elapsed time and a running token estimate (`⠋ thinking · 12s · 340 tok`) — so
+the reasoning text never scrolls into the output. When the answer begins the
+line is finalized (`thought 12s · 340 tok`). `/think` (or `LCA_SHOW_THINKING`)
+expands reasoning to show the full dimmed text instead; `/think last` reprints
+the last answer's reasoning even when it was collapsed. Reasoning is
+display-only — it is not part of the answer returned to the model.
+
+While typing, a status line under the input shows the current model, working
+mode (`approve:…`, plus `loop`/`unsafe` when on), and directory.
 
 ## Design (the four non-trivial parts)
 

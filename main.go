@@ -79,6 +79,18 @@ func main() {
 	showThink := cfg.ShowThinking
 	loop := cfg.Loop
 	var lastReason string
+	// Persistent status line under the input: current model, working mode, dir.
+	ed.status = func() string {
+		parts := []string{client.Model(), "approve:" + ap.ModeShort()}
+		if loop {
+			parts = append(parts, "loop")
+		}
+		if jail.Unsafe {
+			parts = append(parts, cBlood+"unsafe"+cFaint)
+		}
+		parts = append(parts, shortDir(jail.Root))
+		return strings.Join(parts, "  ·  ")
+	}
 	for {
 		fmt.Print("\n")
 		line, err := ed.ReadLine(" " + cFaint + "›" + cReset + " ")
