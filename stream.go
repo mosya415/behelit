@@ -289,7 +289,7 @@ func (p *proseWriter) flushLogicalLine(raw string) {
 	// (1c) tool-tag suppression — on the (reasoning-stripped) line, so a tool tag
 	// the model glued after a reasoning tag is still hidden and executed.
 	if m := reOpen.FindStringSubmatch(trimmed); m != nil && blockNames[m[1]] {
-		if m[3] != "/" {
+		if m[3] != "/" && !voidTools[m[1]] {
 			p.inBlock = true
 			p.closeTag = "</" + m[1] + ">"
 		}

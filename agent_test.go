@@ -74,6 +74,33 @@ func TestNormalizeTags_KeepsWriteBodyIntact(t *testing.T) {
 	}
 }
 
+func TestParseBlocks_DirtyAttrs(t *testing.T) {
+	cases := []struct{ name, text, wantPath string }{
+		{"single-quotes", `<read_file path='main.go'/>`, "main.go"},
+		{"spaced-equals", `<read_file path = "main.go" />`, "main.go"},
+		{"no-self-close", `<read_file path="main.go">`, "main.go"}, // forgot the trailing /
+		{"list_dir-no-close", `<list_dir path="."/>`, "."},
+	}
+	for _, c := range cases {
+		blocks := ParseBlocks(c.text)
+		if len(blocks) != 1 {
+			t.Fatalf("%s: want 1 block, got %d (%+v)", c.name, len(blocks), blocks)
+		}
+		if blocks[0].Attr["path"] != c.wantPath {
+			t.Fatalf("%s: path = %q, want %q", c.name, blocks[0].Attr["path"], c.wantPath)
+		}
+	}
+}
+
+func TestParseBlocks_VoidNoCloseKeepsFollowingProse(t *testing.T) {
+	// A read_file that forgot its "/" must not swallow the rest as a body.
+	text := "<read_file path=\"a.go\">\nsome later prose\n<grep pattern=\"x\" path=\".\"/>"
+	blocks := ParseBlocks(text)
+	if len(blocks) != 2 || blocks[0].Name != "read_file" || blocks[1].Name != "grep" {
+		t.Fatalf("void tolerance broke framing: %+v", blocks)
+	}
+}
+
 func TestParseBlocks_NoTagsIsFinalAnswer(t *testing.T) {
 	if b := ParseBlocks("All done. The bug was a typo."); len(b) != 0 {
 		t.Fatalf("expected 0 blocks, got %d", len(b))

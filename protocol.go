@@ -45,9 +45,15 @@ var (
 		"read_file": true, "grep": true, "list_dir": true,
 		"run_command": true, "write": true, "edit": true,
 	}
-	// Matches an opening tag line: <name ...attrs...>  or self-closing <name .../>
-	reOpen = regexp.MustCompile(`^<([a-z_]+)((?:\s+[a-z_]+="[^"]*")*)\s*(/?)>$`)
-	reAttr = regexp.MustCompile(`([a-z_]+)="([^"]*)"`)
+	// voidTools have no body and are semantically self-closing; we accept them
+	// even when a model forgets the trailing "/" (a common dirty-output case).
+	voidTools = map[string]bool{"read_file": true, "grep": true, "list_dir": true}
+
+	// Matches an opening tag line: <name ...attrs...>  or self-closing <name .../>.
+	// Attribute values may be double- OR single-quoted, with optional spaces
+	// around "=", to tolerate models that don't emit the canonical form.
+	reOpen = regexp.MustCompile(`^<([a-z_]+)((?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(/?)>$`)
+	reAttr = regexp.MustCompile(`([a-z_]+)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
 
 	// Reasoning tags to strip: <think>, <thinking>, and model-namespaced variants
 	// like <mm:think> (MiniMax) or <reasoning>.
@@ -57,7 +63,7 @@ var (
 
 	// A tool (or edit sub-) tag anywhere in the text — used only to re-separate
 	// tags that a model glued to surrounding text (it is NOT the block grammar).
-	toolTag      = `</?(?:read_file|grep|list_dir|run_command|write|edit|search|replace)(?:\s+[a-z_]+="[^"]*")*\s*/?>`
+	toolTag      = `</?(?:read_file|grep|list_dir|run_command|write|edit|search|replace)(?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*/?>`
 	reGlueBefore = regexp.MustCompile(`([^\n])(` + toolTag + `)`)
 	reGlueAfter  = regexp.MustCompile(`(` + toolTag + `)([^\n])`)
 )
@@ -101,7 +107,7 @@ func ParseBlocks(text string) []Block {
 			i++
 			continue
 		}
-		name, attrs, selfClose := m[1], m[2], m[3] == "/"
+		name, attrs, selfClose := m[1], m[2], m[3] == "/" || voidTools[m[1]]
 		b := Block{Name: name, Attr: parseAttrs(attrs)}
 
 		if selfClose {
@@ -141,7 +147,7 @@ func ParseBlocks(text string) []Block {
 func parseAttrs(s string) map[string]string {
 	out := map[string]string{}
 	for _, m := range reAttr.FindAllStringSubmatch(s, -1) {
-		out[m[1]] = m[2]
+		out[m[1]] = m[2] + m[3] // exactly one of the (double|single)-quoted groups is set
 	}
 	return out
 }

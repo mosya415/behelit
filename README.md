@@ -219,6 +219,12 @@ The parser and the on-screen filter share this so both agree.
    tags in plain text; we parse them ourselves instead of trusting each model's
    native `--tool-call-parser`. Tags must be alone on a line, so code bodies
    containing `<`, `>` or quotes don't break parsing. No native function calling.
+   The parser is deliberately tolerant of dirty output: reasoning tags glued to
+   tool tags are re-separated (`normalizeTags`), attribute values may be double-
+   or single-quoted with loose spacing (`path = 'x.go'`), and the void tools
+   (`read_file`/`grep`/`list_dir`, which have no body) parse even when the model
+   forgets the self-closing `/` — the display mirrors all of this so what's hidden
+   on screen is exactly what executes.
 
 2. **Applying edits — `edit.go`.** Strict, verbatim `<search>`/`<replace>`. Zero
    matches or more than one match is reported back to the model as an error so it
