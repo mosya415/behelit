@@ -62,12 +62,13 @@ func takePartial() string {
 }
 
 type footer struct {
-	prompt  string
-	rows    int
-	cols    int
-	restore func()
-	stopc   chan struct{}
-	donec   chan struct{}
+	prompt      string
+	rows        int
+	cols        int
+	restore     func()
+	onInterrupt func() // Ctrl-C during streaming aborts the turn
+	stopc       chan struct{}
+	donec       chan struct{}
 
 	mu  sync.Mutex // guards buf
 	buf []byte
@@ -77,7 +78,7 @@ type footer struct {
 // nil (and changes nothing) when stdout/stdin is not a suitable terminal, so
 // piped and non-linux use is unaffected. initial pre-seeds the line with a
 // fragment carried over from a previous prompt.
-func startFooter(prompt, initial string) *footer {
+func startFooter(prompt, initial string, onInterrupt func()) *footer {
 	cols, rows := osTermSize()
 	if rows < 3 || cols < 4 {
 		return nil
@@ -87,13 +88,14 @@ func startFooter(prompt, initial string) *footer {
 		return nil
 	}
 	f := &footer{
-		prompt:  prompt,
-		rows:    rows,
-		cols:    cols,
-		restore: restore,
-		stopc:   make(chan struct{}),
-		donec:   make(chan struct{}),
-		buf:     []byte(initial),
+		prompt:      prompt,
+		rows:        rows,
+		cols:        cols,
+		restore:     restore,
+		onInterrupt: onInterrupt,
+		stopc:       make(chan struct{}),
+		donec:       make(chan struct{}),
+		buf:         []byte(initial),
 	}
 	screenMu.Lock()
 	// Reserve the bottom row for the footer: save the cursor, set the scroll
@@ -151,7 +153,14 @@ func (f *footer) handle(b byte) {
 			_, size := utf8.DecodeLastRune(f.buf)
 			f.buf = f.buf[:n-size]
 		}
-	case 3, 21: // Ctrl-C / Ctrl-U — clear the typed line
+	case 3: // Ctrl-C — interrupt the running turn
+		f.buf = nil
+		f.mu.Unlock()
+		if f.onInterrupt != nil {
+			f.onInterrupt()
+		}
+		return
+	case 21: // Ctrl-U — clear the typed line
 		f.buf = nil
 	default:
 		if b >= 32 || b >= 0x80 { // printable ASCII or a UTF-8 continuation byte

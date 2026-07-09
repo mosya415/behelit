@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -927,12 +929,20 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
+		// A cancelable context lets Ctrl-C (caught by the footer, which owns stdin
+		// while streaming) abort a runaway generation or loop mid-flight.
+		ctx, cancel := context.WithCancel(context.Background())
+		var interrupted atomic.Bool
 		var f *footer
 		if interactive {
-			f = startFooter(" "+cFaint+"›"+cReset+" ", takePartial())
+			f = startFooter(" "+cFaint+"›"+cReset+" ", takePartial(), func() {
+				interrupted.Store(true)
+				cancel()
+			})
 		}
-		reply, finish, usage, err := client.CompleteStream(send, pw.feed, pw.feedReasoning, continuing)
+		reply, finish, usage, err := client.CompleteStream(ctx, send, pw.feed, pw.feedReasoning, continuing)
 		f.stop()
+		cancel()
 		pw.end()
 		printPerf(usage)
 		if usage.PromptTokens > 0 {
@@ -947,21 +957,29 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			}
 			*lastReason += strings.Join(pw.reasonLog, "\n")
 		}
+
+		// On a continuation, append verbatim to the same assistant message so a
+		// tool block that was split by the length limit reassembles; otherwise
+		// start a new assistant message. (Keep the partial reply on interrupt too,
+		// so the transcript alternates cleanly.)
+		if continuing {
+			(*msgs)[len(*msgs)-1].Content += reply
+		} else if reply != "" || !interrupted.Load() {
+			*msgs = append(*msgs, Message{Role: "assistant", Content: reply})
+		}
+		continuing = false
+
+		if interrupted.Load() {
+			fmt.Println(" " + faint("%s interrupted", gNone))
+			rec.Event("interrupt", map[string]any{"partial_bytes": len(reply)})
+			rec.Transcript(*msgs)
+			return
+		}
 		if err != nil {
 			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
 			rec.Event("error", map[string]any{"err": err.Error()})
 			return
 		}
-
-		// On a continuation, append verbatim to the same assistant message so a
-		// tool block that was split by the length limit reassembles; otherwise
-		// start a new assistant message.
-		if continuing {
-			(*msgs)[len(*msgs)-1].Content += reply
-		} else {
-			*msgs = append(*msgs, Message{Role: "assistant", Content: reply})
-		}
-		continuing = false
 		full := (*msgs)[len(*msgs)-1].Content
 
 		blocks := ParseBlocks(full)

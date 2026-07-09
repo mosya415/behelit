@@ -357,7 +357,7 @@ type streamChunk struct {
 // text fragment, and returns the assembled text plus the finish reason ("stop",
 // "length", …). We parse the token stream ourselves; the tool-call protocol only
 // sees the final text, so streaming is purely a UX layer.
-func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), continueFinal bool) (string, string, Usage, error) {
+func (c *Client) CompleteStream(ctx context.Context, msgs []Message, onDelta, onReason func(string), continueFinal bool) (string, string, Usage, error) {
 	cr := chatRequest{
 		Model:         c.model,
 		Messages:      msgs,
@@ -377,7 +377,7 @@ func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), 
 		return "", "", usage, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", "", usage, err
 	}

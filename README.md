@@ -302,6 +302,11 @@ its output live behind a dim `│` gutter, its stdin is the null device (so it
 can't hang waiting for input), it is bounded by `LCA_CMD_TIMEOUT`, and Ctrl-C
 interrupts just that command — not the agent.
 
+While the model is streaming, **Ctrl-C aborts the turn**: the request's context
+is cancelled and control returns to the prompt (the partial reply is kept so the
+transcript stays clean). This is the escape hatch for a runaway generation or a
+`/loop` that won't stop.
+
 ### Approval modes — `approval.go`
 
 At each gate the prompt is `[y/N/a=all]`:
