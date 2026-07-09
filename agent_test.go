@@ -262,6 +262,57 @@ func TestHeadTail(t *testing.T) {
 	}
 }
 
+func TestLineDiff(t *testing.T) {
+	a := "one\ntwo\nthree\nfour\n"
+	b := "one\nTWO\nthree\nfour\nfive\n"
+	added, removed, body := lineDiff(a, b)
+	if added != 2 { // "TWO" and "five"
+		t.Fatalf("added = %d, want 2", added)
+	}
+	if removed != 1 { // "two"
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	plain := stripAnsi(body)
+	if !strings.Contains(plain, "- two") || !strings.Contains(plain, "+ TWO") || !strings.Contains(plain, "+ five") {
+		t.Fatalf("diff body missing changes:\n%s", plain)
+	}
+}
+
+func TestUndoLast(t *testing.T) {
+	resetChanges()
+	defer resetChanges()
+	dir := t.TempDir()
+
+	// edit of an existing file → undo restores prior bytes
+	f := filepath.Join(dir, "a.txt")
+	os.WriteFile(f, []byte("original\n"), 0o644)
+	before, existed := snapshot(f)
+	os.WriteFile(f, []byte("changed\n"), 0o644)
+	recordChange("a.txt", f, "edit", before, existed)
+
+	// create of a new file → undo deletes it
+	g := filepath.Join(dir, "new.txt")
+	nb, ne := snapshot(g)
+	os.WriteFile(g, []byte("created\n"), 0o644)
+	recordChange("new.txt", g, "write", nb, ne)
+
+	if _, ok := undoLast(); !ok { // undo the create
+		t.Fatal("undo create failed")
+	}
+	if _, err := os.Stat(g); !os.IsNotExist(err) {
+		t.Fatal("undo of a create must delete the file")
+	}
+	if _, ok := undoLast(); !ok { // undo the edit
+		t.Fatal("undo edit failed")
+	}
+	if got, _ := os.ReadFile(f); string(got) != "original\n" {
+		t.Fatalf("undo edit didn't restore: %q", got)
+	}
+	if _, ok := undoLast(); ok {
+		t.Fatal("undo on empty log should report nothing to undo")
+	}
+}
+
 var reAnsiTest = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func stripAnsi(s string) string { return reAnsiTest.ReplaceAllString(s, "") }

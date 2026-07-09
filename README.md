@@ -260,6 +260,15 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
 `read_file`/`grep` run automatically (no side effects). `edit`/`write`/
 `run_command` require an explicit `y` at the prompt.
 
+Every applied `edit`/`write` is tracked: the file's prior bytes are snapshotted
+in memory so you can review and revert the agent's work. `/diff` shows a colored,
+context-collapsed line diff (LCS-based, `diff.go`) of every file changed this
+session — first-touch state vs. what's on disk now, with `+`/`-` counts and
+`(new)`/`(deleted)` tags. `/undo` reverts the most recent change (restoring the
+prior bytes, or deleting a file the agent created); repeat it to walk back
+further. Display-only — the apply layer still uses strict verbatim
+search/replace, and the model is never shown or asked to produce a diff.
+
 **Unsafe mode** (`/unsafe`, `LCA_UNSAFE`, or `-unsafe`) turns the hard boundary
 OFF: paths are no longer confined to the root (any file), the command allowlist
 is bypassed and commands run through a shell (any command, pipes/redirects). It

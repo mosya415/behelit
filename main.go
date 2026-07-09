@@ -126,6 +126,7 @@ func main() {
 			return
 		case "/reset":
 			msgs = msgs[:1]
+			resetChanges()
 			rec.Event("reset", nil)
 			fmt.Println(" " + faint("%s TRANSCRIPT CLEARED", gNone))
 			continue
@@ -152,6 +153,12 @@ func main() {
 			continue
 		}
 		if handleContextCmd(line, msgs, ctxBudget(cfg.CtxTokens, client.CtxLen())) {
+			continue
+		}
+		if handleDiffCmd(line) {
+			continue
+		}
+		if handleUndoCmd(line, rec) {
 			continue
 		}
 
@@ -594,6 +601,43 @@ func handleContextCmd(line string, msgs []Message, ctxTokens int) bool {
 	return true
 }
 
+// handleDiffCmd shows a per-file diff of everything the agent changed this
+// session (first-touch state → current on disk).
+func handleDiffCmd(line string) bool {
+	if _, ok := commandArg(line, "/diff"); !ok {
+		return false
+	}
+	diffs := sessionDiffs()
+	if len(diffs) == 0 {
+		fmt.Println("  " + faint("no file changes this session"))
+		return true
+	}
+	eyebrow("changes this session")
+	for _, l := range diffs {
+		fmt.Println(l)
+	}
+	return true
+}
+
+// handleUndoCmd reverts the most recent applied edit/write.
+func handleUndoCmd(line string, rec *Recorder) bool {
+	if _, ok := commandArg(line, "/undo"); !ok {
+		return false
+	}
+	msg, ok := undoLast()
+	if !ok {
+		fmt.Println("  " + faint("nothing to undo"))
+		return true
+	}
+	rec.Event("undo", map[string]any{"result": msg})
+	if strings.HasPrefix(msg, "error") {
+		toolErr(msg)
+	} else {
+		toolOK(msg)
+	}
+	return true
+}
+
 // handleLoopCmd toggles autonomous loop mode. /loop toggles; /loop on|off sets.
 func handleLoopCmd(line string, loop *bool, rec *Recorder) bool {
 	arg, ok := commandArg(line, "/loop")
@@ -961,11 +1005,13 @@ func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this edit"
 	}
+	before, existed := snapshot(abs)
 	res, err := applyEdit(abs, b.Attr["path"], b.Search, b.Replace)
 	if err != nil {
 		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
 		return "error: " + err.Error()
 	}
+	recordChange(b.Attr["path"], abs, "edit", before, existed)
 	rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "result": res})
 	return res
 }
@@ -986,11 +1032,13 @@ func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
 		return "user denied this write"
 	}
+	before, existed := snapshot(abs)
 	res, err := writeWholeFile(abs, b.Attr["path"], b.Body)
 	if err != nil {
 		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
 		return "error: " + err.Error()
 	}
+	recordChange(b.Attr["path"], abs, "write", before, existed)
 	rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "bytes": len(b.Body)})
 	return res
 }
