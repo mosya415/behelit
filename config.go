@@ -57,7 +57,7 @@ func loadConfig() Config {
 		APIKey:       env("LCA_API_KEY", "sk-noauth"),
 		Temperature:  0.2,
 		MaxSteps:     25,
-		CtxTokens:    atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 24000),
+		CtxTokens:    atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 0), // 0 = auto: derive from the model's window
 		MaxTokens:    atoiDefault(os.Getenv("LCA_MAX_TOKENS"), 0),
 		CmdTimeout:   atoiDefault(os.Getenv("LCA_CMD_TIMEOUT"), 120),
 		Raw:          os.Getenv("LCA_RAW") != "",

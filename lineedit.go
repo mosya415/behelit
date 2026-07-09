@@ -28,6 +28,7 @@ var replCommands = []cmdInfo{
 	{"/think", "show / hide model reasoning"},
 	{"/loop", "autonomous mode: run until done"},
 	{"/unsafe", "disable jail + allowlist (danger)"},
+	{"/context", "context size, cache, big outputs"},
 	{"/reset", "clear the transcript"},
 	{"/exit", "quit"},
 }

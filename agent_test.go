@@ -203,7 +203,9 @@ func TestDedupeReads(t *testing.T) {
 		rd("a.go", strings.Repeat("y", 4000)), // authoritative read of a.go
 		{Role: "user", Content: "keep going"},
 	}
-	out, trimmed := trimForContext(msgs, 0) // budget off — only dedup runs
+	// Over budget so compression engages; the two 4k reads (~1k tok each) exceed
+	// 1500, and deduping the superseded a.go read alone brings it back under.
+	out, trimmed := trimForContext(msgs, 1500)
 	if trimmed != 1 {
 		t.Fatalf("trimmed = %d, want 1", trimmed)
 	}
@@ -218,6 +220,45 @@ func TestDedupeReads(t *testing.T) {
 	}
 	if msgs[2].Content == supersededStub {
 		t.Fatal("must not mutate the input slice")
+	}
+}
+
+func TestTrimForContext_CacheAligned(t *testing.T) {
+	rd := func(p string) Message {
+		return Message{Role: "user", Content: "<tool_result name=\"read_file\" path=\"" + p + "\">\nbody\n</tool_result>"}
+	}
+	// Two reads of the same file, but comfortably under budget: nothing is
+	// rewritten, so the prefix stays byte-identical and the KV cache hits.
+	msgs := []Message{{Role: "system", Content: "sys"}, rd("a.go"), {Role: "assistant", Content: "x"}, rd("a.go")}
+	out, trimmed := trimForContext(msgs, 1_000_000)
+	if trimmed != 0 {
+		t.Fatalf("trimmed = %d, want 0 under budget (cache alignment)", trimmed)
+	}
+	for i := range msgs {
+		if out[i].Content != msgs[i].Content {
+			t.Fatalf("message %d changed under budget — prefix not byte-identical", i)
+		}
+	}
+}
+
+func TestHeadTail(t *testing.T) {
+	s := "HEAD_START\n" + strings.Repeat("filler line\n", 5000) + "TAIL_END\n"
+	got := headTail(s, 200)
+	if len(got) > 400 {
+		t.Fatalf("headTail not bounded: %d bytes", len(got))
+	}
+	if !strings.Contains(got, "HEAD_START") {
+		t.Fatal("head lost")
+	}
+	if !strings.Contains(got, "TAIL_END") {
+		t.Fatal("tail lost (this is the whole point — errors live at the end)")
+	}
+	if !strings.Contains(got, "elided") {
+		t.Fatal("missing elision marker")
+	}
+	// short input is returned untouched
+	if headTail("small", 200) != "small" {
+		t.Fatal("short input must pass through")
 	}
 }
 

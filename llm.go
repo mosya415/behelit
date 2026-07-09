@@ -32,6 +32,7 @@ type Client struct {
 	apiKey    string
 	temp      float64
 	maxTokens int
+	ctxLen    int // active model's context window (max_model_len), 0 if unknown
 }
 
 func NewClient(cfg Config) *Client {
@@ -132,6 +133,8 @@ func (c *Client) SetEndpoint(u string) {
 func (c *Client) Model() string     { return c.model }
 func (c *Client) SetModel(m string) { c.model = m }
 func (c *Client) Endpoint() string  { return c.baseURL }
+func (c *Client) CtxLen() int       { return c.ctxLen }
+func (c *Client) SetCtxLen(n int)   { c.ctxLen = n }
 
 // ModelInfo is what we surface about a served model. Fields beyond ID are
 // best-effort: vLLM populates owned_by and max_model_len; leaner servers (e.g.
@@ -228,16 +231,51 @@ func (c *Client) ProbeHealth(baseURL string) (up bool, models []ModelInfo) {
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
-	Stream      bool      `json:"stream"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Temperature   float64        `json:"temperature"`
+	Stream        bool           `json:"stream"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 	// Continue the final (assistant) message verbatim instead of starting a new
 	// turn — used to reassemble a reply that was cut off by the length limit
 	// (vLLM/SGLang honor these; other fields are omitted on a normal request).
 	ContinueFinalMessage bool  `json:"continue_final_message,omitempty"`
 	AddGenerationPrompt  *bool `json:"add_generation_prompt,omitempty"`
+}
+
+// streamOptions asks the server to emit a final usage chunk on the stream, so we
+// can report real prompt/completion token counts and the prefix-cache hit rate
+// (vLLM/SGLang report prompt_tokens_details.cached_tokens).
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// Usage is the token accounting + timing for one streamed completion. Cached is
+// how many prompt tokens the server served from its KV prefix cache (0 if the
+// server doesn't report it); it's the payoff of keeping the prefix byte-stable.
+type Usage struct {
+	PromptTokens     int
+	CachedTokens     int
+	CompletionTokens int
+	TTFT             time.Duration // time to first token
+	GenDur           time.Duration // first token → last token
+}
+
+// CacheHitPct is the fraction of the prompt served from the KV prefix cache.
+func (u Usage) CacheHitPct() int {
+	if u.PromptTokens <= 0 {
+		return 0
+	}
+	return u.CachedTokens * 100 / u.PromptTokens
+}
+
+// TokPerSec is decode throughput over the generation window.
+func (u Usage) TokPerSec() int {
+	if u.GenDur <= 0 || u.CompletionTokens <= 0 {
+		return 0
+	}
+	return int(float64(u.CompletionTokens) / u.GenDur.Seconds())
 }
 
 type chatResponse struct {
@@ -306,33 +344,42 @@ type streamChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *struct {
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} `json:"usage"`
 }
 
 // CompleteStream streams the assistant reply over SSE, calling onDelta for each
 // text fragment, and returns the assembled text plus the finish reason ("stop",
 // "length", …). We parse the token stream ourselves; the tool-call protocol only
 // sees the final text, so streaming is purely a UX layer.
-func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), continueFinal bool) (string, string, error) {
+func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), continueFinal bool) (string, string, Usage, error) {
 	cr := chatRequest{
-		Model:       c.model,
-		Messages:    msgs,
-		Temperature: c.temp,
-		Stream:      true,
-		MaxTokens:   c.maxTokens,
+		Model:         c.model,
+		Messages:      msgs,
+		Temperature:   c.temp,
+		Stream:        true,
+		MaxTokens:     c.maxTokens,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 	if continueFinal {
 		no := false
 		cr.ContinueFinalMessage = true
 		cr.AddGenerationPrompt = &no
 	}
+	var usage Usage
 	body, err := json.Marshal(cr)
 	if err != nil {
-		return "", "", err
+		return "", "", usage, err
 	}
 
 	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", "", err
+		return "", "", usage, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -340,9 +387,10 @@ func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), 
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
+	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("request to %s failed: %w", c.baseURL, err)
+		return "", "", usage, fmt.Errorf("request to %s failed: %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -352,12 +400,14 @@ func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), 
 		if resp.StatusCode == http.StatusNotFound {
 			msg += "  (check the endpoint URL includes the right base path, e.g. .../v1)"
 		}
-		return "", "", fmt.Errorf("%s", msg)
+		return "", "", usage, fmt.Errorf("%s", msg)
 	}
 
 	reader := bufio.NewReader(resp.Body)
 	var sb strings.Builder
 	finish := ""
+	var firstTok time.Time
+	deltas := 0
 	for {
 		line, err := reader.ReadString('\n')
 		if s := strings.TrimSpace(line); strings.HasPrefix(s, "data:") {
@@ -366,27 +416,52 @@ func (c *Client) CompleteStream(msgs []Message, onDelta, onReason func(string), 
 				break
 			}
 			var chunk streamChunk
-			if json.Unmarshal([]byte(data), &chunk) == nil && len(chunk.Choices) > 0 {
-				if r := chunk.Choices[0].Delta.ReasoningContent; r != "" && onReason != nil {
-					onReason(r) // display-only; not part of the returned answer
+			if json.Unmarshal([]byte(data), &chunk) == nil {
+				if len(chunk.Choices) > 0 {
+					if r := chunk.Choices[0].Delta.ReasoningContent; r != "" {
+						if firstTok.IsZero() {
+							firstTok = time.Now()
+						}
+						if onReason != nil {
+							onReason(r) // display-only; not part of the returned answer
+						}
+					}
+					if d := chunk.Choices[0].Delta.Content; d != "" {
+						if firstTok.IsZero() {
+							firstTok = time.Now()
+						}
+						deltas++
+						sb.WriteString(d)
+						onDelta(d)
+					}
+					if fr := chunk.Choices[0].FinishReason; fr != nil && *fr != "" {
+						finish = *fr
+					}
 				}
-				if d := chunk.Choices[0].Delta.Content; d != "" {
-					sb.WriteString(d)
-					onDelta(d)
-				}
-				if fr := chunk.Choices[0].FinishReason; fr != nil && *fr != "" {
-					finish = *fr
+				if u := chunk.Usage; u != nil {
+					usage.PromptTokens = u.PromptTokens
+					usage.CompletionTokens = u.CompletionTokens
+					if u.PromptTokensDetails != nil {
+						usage.CachedTokens = u.PromptTokensDetails.CachedTokens
+					}
 				}
 			}
 		}
 		if err != nil {
-			if err == io.EOF {
-				break
+			if err != io.EOF {
+				return sb.String(), finish, usage, err
 			}
-			return sb.String(), finish, err
+			break
 		}
 	}
-	return sb.String(), finish, nil
+	if !firstTok.IsZero() {
+		usage.TTFT = firstTok.Sub(start)
+		usage.GenDur = time.Since(firstTok)
+	}
+	if usage.CompletionTokens == 0 {
+		usage.CompletionTokens = deltas // fallback when the server omits usage
+	}
+	return sb.String(), finish, usage, nil
 }
 
 func truncate(s string, n int) string {

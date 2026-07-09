@@ -110,10 +110,46 @@ func readFile(j *Jail, path, lines string) string {
 	}
 
 	if len(content) > maxReadBytes {
-		return fmt.Sprintf("%s (truncated to %d bytes — request a line range for more):\n%s",
-			path, maxReadBytes, content[:maxReadBytes])
+		return fmt.Sprintf("%s (truncated, head+tail kept — request a line range for the middle):\n%s",
+			path, headTail(content, maxReadBytes))
 	}
 	return fmt.Sprintf("%s:\n%s", path, content)
+}
+
+// headTail shrinks s to about max bytes while keeping BOTH ends, with a marker
+// for the elided middle, and snaps the cuts to line boundaries. Errors and
+// summaries usually sit at the END of logs/command output, so a head-only cut
+// (which is what a naive s[:max] does) would hide exactly what matters.
+func headTail(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	head := max * 2 / 3
+	tail := max - head
+	if i := strings.LastIndexByte(s[:head], '\n'); i > 0 {
+		head = i
+	}
+	tailStart := len(s) - tail
+	if i := strings.IndexByte(s[tailStart:], '\n'); i >= 0 && i+1 < tail {
+		tailStart += i + 1
+	}
+	elided := tailStart - head
+	if elided <= 0 {
+		return s
+	}
+	return fmt.Sprintf("%s\n… %s elided (head+tail kept) …\n%s", s[:head], byteCount(elided), s[tailStart:])
+}
+
+// byteCount formats a byte length compactly (e.g. 4.2K, 1.1M).
+func byteCount(n int) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%dB", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1fK", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/(1024*1024))
+	}
 }
 
 func parseRange(s string, max int) (lo, hi int, ok bool) {
@@ -259,10 +295,7 @@ func runCommand(j *Jail, cmdline string) string {
 	signal.Stop(sigch)
 	live.flush()
 
-	res := string(buf.Bytes())
-	if len(res) > maxCmdOutput {
-		res = res[:maxCmdOutput] + "\n... (output truncated)"
-	}
+	res := headTail(string(buf.Bytes()), maxCmdOutput)
 	switch {
 	case cancelled:
 		fmt.Println("   " + warn("%s interrupted", gDown))

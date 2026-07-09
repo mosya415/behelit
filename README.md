@@ -43,7 +43,7 @@ are denied rather than run unattended.
 | `LCA_ROOT`     | current dir                    | Jail root                                 |
 | `LCA_ALLOW`    | see below                      | Comma-separated command allowlist         |
 | `LCA_DIR`      | `~/.lca`                       | Audit log + session transcripts location  |
-| `LCA_CTX_TOKENS` | `24000`                      | Approx. token budget for the sent transcript |
+| `LCA_CTX_TOKENS` | auto                         | Approx. token budget for the sent transcript before it's compressed. Auto = 75% of the model's context window (from `/models`), or 24k if unknown |
 | `LCA_MAX_TOKENS` | unset                        | `max_tokens` per request (0/unset = let the server decide) |
 | `LCA_CMD_TIMEOUT` | `120`                       | `run_command` timeout in seconds |
 | `LCA_RAW`      | unset                          | If set, stream raw model text (show tool tags) for protocol debugging |
@@ -235,13 +235,21 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
    prompt. The model pulls what it needs via auto-running
    `list_dir`/`grep`/`read_file`. The
    full transcript is kept on disk for audit, but the copy *sent* to the model is
-   trimmed in two passes. First, superseded reads are deduped: if a file is read
-   again later, the earlier `read_file` result is collapsed (the newer copy is
-   authoritative) — always, regardless of budget, which is the big win in loops
-   that re-read a file after editing it. Then, if still over the token budget
-   (`LCA_CTX_TOKENS`), the oldest remaining `tool_result` outputs are collapsed
-   to a stub, while user instructions and the assistant's own reasoning are
-   preserved. Keeps prefill bounded across long sessions.
+   compressed only when it has to be. **Cache alignment:** while under the token
+   budget nothing is rewritten, so each request is a byte-identical extension of
+   the last one and the server's KV *prefix cache* hits — near-free prefill on a
+   local GPU, where the payoff is latency, not dollars. The budget itself is the
+   model's real context window × 0.75 (from `/models`, overridable with
+   `LCA_CTX_TOKENS`), so compression only kicks in near the true limit. Once over
+   budget, two passes run: superseded reads are deduped (a `read_file` for a path
+   read again later is collapsed — the big win in loops that re-read after
+   editing), then the oldest remaining `tool_result` outputs are collapsed to a
+   stub, while user instructions and the assistant's reasoning are preserved.
+   Oversized reads and command output are kept **head+tail** (with an elision
+   marker), since errors live at the end. After each streamed step a dim perf
+   line reports prompt tokens and the **KV cache hit rate**, completion tokens,
+   decode throughput, and time-to-first-token; `/context` shows the live budget,
+   cache-alignment state, and the biggest outputs.
 
 4. **Scope as defense-in-depth — `jail.go` + `approval.go`.** A realpath jail
    (symlink-resolved, prefix-checked) confines every path to the root, and

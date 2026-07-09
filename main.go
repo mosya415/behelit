@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,7 +65,7 @@ func main() {
 		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 		msgs = append(msgs, Message{Role: "user", Content: prompt})
 		var reason string
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, cfg.ShowThinking, cfg.Loop, false, &reason)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, cfg.ShowThinking, cfg.Loop, false, &reason)
 		rec.Transcript(msgs)
 		return
 	}
@@ -150,10 +151,13 @@ func main() {
 		if handleUnsafeCmd(line, jail, rec) {
 			continue
 		}
+		if handleContextCmd(line, msgs, ctxBudget(cfg.CtxTokens, client.CtxLen())) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, cfg.CtxTokens, cfg.Raw, showThink, loop, true, &lastReason)
+		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, showThink, loop, true, &lastReason)
 		rec.Transcript(msgs)
 	}
 }
@@ -172,11 +176,13 @@ func reconcileModel(client *Client, rec *Recorder) []string {
 		return []string{warn("endpoint advertises no models — using configured name as-is")}
 	}
 	if info, ok := findModel(models, client.Model()); ok {
+		client.SetCtxLen(info.MaxLen)
 		return []string{readyLine(info)}
 	}
 	if len(models) == 1 {
 		prev := client.Model()
 		client.SetModel(models[0].ID)
+		client.SetCtxLen(models[0].MaxLen)
 		rec.Event("model_adopt", map[string]any{"from": prev, "to": models[0].ID})
 		return []string{
 			readyLine(models[0]),
@@ -540,6 +546,54 @@ func handleUnsafeCmd(line string, jail *Jail, rec *Recorder) bool {
 	return true
 }
 
+// handleContextCmd prints what the transcript costs and whether the prefix is
+// currently cache-aligned, plus the biggest tool outputs eating the budget.
+func handleContextCmd(line string, msgs []Message, ctxTokens int) bool {
+	if _, ok := commandArg(line, "/context"); !ok {
+		return false
+	}
+	tok := estimateTokens(msgs)
+	eyebrow("context")
+	kv("messages", strconv.Itoa(len(msgs)))
+	pct := 0
+	if ctxTokens > 0 {
+		pct = tok * 100 / ctxTokens
+	}
+	kv("tokens", fmt.Sprintf("~%s of ~%s budget (%d%%)", kfmt(tok), kfmt(ctxTokens), pct))
+	if ctxTokens <= 0 || tok <= ctxTokens {
+		kv("cache", statusText(cGreen, gUp, "aligned")+faint(" prefix sent byte-identical — KV cache stays warm"))
+	} else {
+		kv("cache", statusText(cYellow, gPartial, "compressing")+faint(" over budget — prefix rewritten to fit"))
+	}
+
+	// The biggest tool outputs still carried in full.
+	type item struct {
+		label string
+		bytes int
+	}
+	var items []item
+	for _, m := range msgs {
+		if name, path, ok := toolResultKey(m); ok && !isStub(m.Content) {
+			lbl := name
+			if path != "" {
+				lbl += " " + path
+			}
+			items = append(items, item{lbl, len(m.Content)})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].bytes > items[j].bytes })
+	if len(items) > 0 {
+		fmt.Println("  " + faint("largest tool outputs:"))
+		for i, it := range items {
+			if i == 5 {
+				break
+			}
+			contValue(faint("%-7s %s", byteCount(it.bytes), it.label))
+		}
+	}
+	return true
+}
+
 // handleLoopCmd toggles autonomous loop mode. /loop toggles; /loop on|off sets.
 func handleLoopCmd(line string, loop *bool, rec *Recorder) bool {
 	arg, ok := commandArg(line, "/loop")
@@ -628,6 +682,67 @@ func looksStalled(s string) bool {
 
 const doneMarker = "TASK_DONE"
 
+// ctxBudget resolves the trim budget in tokens. An explicit LCA_CTX_TOKENS wins;
+// otherwise we derive it from the model's real context window (reserving ~25%
+// for the reply), so we only compress near the true limit and keep the KV cache
+// warm as long as possible. Falls back to 24k when the window is unknown.
+func ctxBudget(explicit, modelCtxLen int) int {
+	if explicit > 0 {
+		return explicit
+	}
+	if modelCtxLen > 0 {
+		return modelCtxLen * 3 / 4
+	}
+	return 24000
+}
+
+// printPerf prints a dim one-line performance summary after a streamed step:
+// prompt tokens and how many hit the server's KV prefix cache (the payoff of
+// keeping the prefix byte-stable), completion tokens, decode throughput, and
+// time-to-first-token. Silent when the server reports no usage.
+func printPerf(u Usage) {
+	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
+		return
+	}
+	var parts []string
+	if u.PromptTokens > 0 {
+		s := kfmt(u.PromptTokens) + "↑"
+		if u.CachedTokens > 0 {
+			s += fmt.Sprintf(" %d%% cached", u.CacheHitPct())
+		}
+		parts = append(parts, s)
+	}
+	if u.CompletionTokens > 0 {
+		parts = append(parts, kfmt(u.CompletionTokens)+"↓")
+	}
+	if tps := u.TokPerSec(); tps > 0 {
+		parts = append(parts, fmt.Sprintf("%d tok/s", tps))
+	}
+	if u.TTFT > 0 {
+		parts = append(parts, "ttft "+fmtDurShort(u.TTFT))
+	}
+	fmt.Println(" " + faint("%s %s", gNone, strings.Join(parts, "  ·  ")))
+}
+
+// kfmt formats a token count compactly: 873, 12.3k, 128k.
+func kfmt(n int) string {
+	switch {
+	case n < 1000:
+		return strconv.Itoa(n)
+	case n < 10000:
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	default:
+		return strconv.Itoa(n/1000) + "k"
+	}
+}
+
+func fmtDurShort(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
+}
+
 // echoQueued shows a message the user typed during streaming as a submitted
 // band, so it's clear which queued input is now running.
 func echoQueued(line string) {
@@ -660,9 +775,16 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 		if interactive {
 			f = startFooter(" "+cFaint+"›"+cReset+" ", takePartial())
 		}
-		reply, finish, err := client.CompleteStream(send, pw.feed, pw.feedReasoning, continuing)
+		reply, finish, usage, err := client.CompleteStream(send, pw.feed, pw.feedReasoning, continuing)
 		f.stop()
 		pw.end()
+		printPerf(usage)
+		if usage.PromptTokens > 0 {
+			rec.Event("usage", map[string]any{
+				"prompt": usage.PromptTokens, "cached": usage.CachedTokens,
+				"completion": usage.CompletionTokens, "tok_s": usage.TokPerSec(),
+			})
+		}
 		if len(pw.reasonLog) > 0 {
 			if *lastReason != "" {
 				*lastReason += "\n"

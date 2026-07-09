@@ -38,27 +38,35 @@ func estimateTokens(msgs []Message) int {
 }
 
 // trimForContext returns a copy of msgs whose estimated size fits within
-// budgetTokens (best effort), plus how many messages were collapsed. It only
-// ever collapses synthetic tool_result messages and never touches the system
-// prompt or the most recent `keepRecent` messages.
+// budgetTokens (best effort), plus how many messages were collapsed.
+//
+// Cache alignment: while we're comfortably under budget we DON'T rewrite
+// anything — the request is byte-identical to the growing prefix of the previous
+// one, so the server's KV prefix cache hits and prefill is near-free. We only
+// start compressing (which necessarily changes the prefix, a one-time cache
+// bust) once the transcript would blow the budget. On a local GPU where tokens
+// are "free" but prefill time is not, warm cache beats a smaller prompt.
 func trimForContext(msgs []Message, budgetTokens int) ([]Message, int) {
+	if budgetTokens <= 0 || estimateTokens(msgs) <= budgetTokens {
+		return msgs, 0 // under budget → send the byte-identical prefix, keep cache warm
+	}
+
 	out := make([]Message, len(msgs))
 	copy(out, msgs)
 
+	// Over budget: first drop reads made redundant by a later read of the same
+	// file, then, if still over, collapse the oldest remaining tool outputs.
 	trimmed := dedupeReads(out)
-
-	if budgetTokens > 0 && estimateTokens(out) > budgetTokens {
-		const keepRecent = 6
-		limit := len(out) - keepRecent
-		for i := 1; i < limit && estimateTokens(out) > budgetTokens; i++ {
-			if isToolResult(out[i]) && !isStub(out[i].Content) {
-				out[i].Content = trimStub
-				trimmed++
-			}
+	const keepRecent = 6
+	limit := len(out) - keepRecent
+	for i := 1; i < limit && estimateTokens(out) > budgetTokens; i++ {
+		if isToolResult(out[i]) && !isStub(out[i].Content) {
+			out[i].Content = trimStub
+			trimmed++
 		}
 	}
 	if trimmed == 0 {
-		return msgs, 0 // nothing changed — hand back the original slice
+		return msgs, 0
 	}
 	return out, trimmed
 }
