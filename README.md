@@ -274,6 +274,11 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
    system prompt is kept (protocol/project instructions may have changed) and the
    saved conversation appended.
 
+   `/retry` drops the last exchange and re-runs the last user turn — handy after
+   a `/model` switch or just to regenerate. `/edit` pulls the last user message
+   back into the prompt (pre-filled) to amend and resend, dropping the old
+   exchange.
+
 4. **Scope as defense-in-depth — `jail.go` + `approval.go`.** A realpath jail
    (symlink-resolved, prefix-checked) confines every path to the root, and
    `run_command` execs argv directly with **no shell** against an allowlist

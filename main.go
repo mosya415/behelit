@@ -95,6 +95,7 @@ func main() {
 	ed.files = func(frag string) []string { return jailFiles(jail, frag) }
 	showThink := cfg.ShowThinking
 	loop := cfg.Loop
+	editPrefill := "" // set by /edit to pre-fill the next prompt with the last message
 	var lastReason string
 	// Persistent status line under the input: current model, working mode, dir.
 	ed.status = func() string {
@@ -116,7 +117,11 @@ func main() {
 			line = q
 			echoQueued(line)
 		} else {
-			l, err := ed.ReadLine(" "+cFaint+"›"+cReset+" ", takePartial())
+			prefill := takePartial()
+			if editPrefill != "" {
+				prefill, editPrefill = editPrefill, ""
+			}
+			l, err := ed.ReadLine(" "+cFaint+"›"+cReset+" ", prefill)
 			if err == errLineCancel {
 				continue
 			}
@@ -145,6 +150,33 @@ func main() {
 			resetChanges()
 			rec.Event("reset", nil)
 			fmt.Println(" " + faint("%s TRANSCRIPT CLEARED", gNone))
+			continue
+		case "/retry":
+			// Drop the last exchange and re-run the last user turn (e.g. after a
+			// /model switch, or to just regenerate).
+			idx := lastUserTurn(msgs)
+			if idx < 0 {
+				fmt.Println("  " + faint("nothing to retry"))
+				continue
+			}
+			msgs = msgs[:idx+1]
+			rec.Event("retry", nil)
+			runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, showThink, loop, true, &lastReason)
+			rec.Transcript(msgs)
+			continue
+		case "/edit":
+			// Pull the last user message back into the prompt to amend and resend.
+			idx := lastUserTurn(msgs)
+			if idx < 0 {
+				fmt.Println("  " + faint("nothing to edit"))
+				continue
+			}
+			orig := msgs[idx].Content
+			if i := strings.Index(orig, "\n<file "); i >= 0 {
+				orig = orig[:i] // shed any @-attached file blocks; keep the typed text
+			}
+			editPrefill = orig
+			msgs = msgs[:idx]
 			continue
 		}
 		if handleApproveCmd(line, ap, rec) {
@@ -839,6 +871,17 @@ func looksStalled(s string) bool {
 }
 
 const doneMarker = "TASK_DONE"
+
+// lastUserTurn is the index of the most recent real user message (not a synthetic
+// tool_result), or -1 if there is none — the anchor for /retry and /edit.
+func lastUserTurn(msgs []Message) int {
+	for i := len(msgs) - 1; i >= 1; i-- {
+		if msgs[i].Role == "user" && !strings.HasPrefix(msgs[i].Content, "<tool_result") {
+			return i
+		}
+	}
+	return -1
+}
 
 // ctxBudget resolves the trim budget in tokens. An explicit LCA_CTX_TOKENS wins;
 // otherwise we derive it from the model's real context window (reserving ~25%

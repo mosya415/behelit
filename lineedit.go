@@ -31,6 +31,8 @@ var replCommands = []cmdInfo{
 	{"/context", "context size, cache, big outputs"},
 	{"/compact", "summarize to reclaim context"},
 	{"/resume", "continue a previous session"},
+	{"/retry", "regenerate the last turn"},
+	{"/edit", "amend & resend the last message"},
 	{"/diff", "review files the agent changed"},
 	{"/undo", "revert the agent's last change"},
 	{"/reset", "clear the transcript"},
