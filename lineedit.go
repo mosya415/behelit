@@ -21,6 +21,7 @@ var errLineCancel = errors.New("line cancelled") // Ctrl-C on a line
 type cmdInfo struct{ name, desc string }
 
 var replCommands = []cmdInfo{
+	{"/help", "show all commands"},
 	{"/discover", "find live models on the cluster"},
 	{"/endpoint", "list / switch endpoints"},
 	{"/model", "show / set the model"},

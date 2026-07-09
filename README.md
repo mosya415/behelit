@@ -51,6 +51,7 @@ are denied rather than run unattended.
 | `LCA_SHOW_THINKING` | unset                     | Start with reasoning expanded to full text (default: collapsed to the live status line; toggle with `/think`) |
 | `LCA_LOOP`     | unset                          | Start in autonomous loop mode (toggle with `/loop`) |
 | `LCA_INSTRUCTIONS` | unset                      | Path to a project instructions file (overrides the `BEHELIT.md`/`AGENTS.md`/`CLAUDE.md` search) |
+| `LCA_KEEP_SESSIONS` | `200`                     | Max transcript files to retain; older ones are pruned at startup (0 disables) |
 | `LCA_UNSAFE`   | unset                          | Start with the jail + allowlist off (toggle with `/unsafe`; also `-unsafe`) |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
@@ -60,7 +61,11 @@ are denied rather than run unattended.
 
 Default allowlist: `ls, cat, pwd, head, tail, wc, git, go, gofmt, grep, rg, find, echo`.
 
-REPL commands: `/discover`, `/endpoint [n|url]`, `/model [name]`, `/approve [on|off|run|edit|status]`, `/reset`, `/exit`. A line ending in `\` continues on the next line, so long prompts can be typed across several lines.
+REPL commands: `/help` prints the full grouped cheat sheet; the rest are
+`/discover`, `/endpoint`, `/model`, `/approve`, `/think`, `/loop`, `/unsafe`,
+`/context`, `/compact`, `/resume`, `/retry`, `/edit`, `/diff`, `/undo`, `/reset`,
+`/exit`. A line ending in `\` continues on the next line, so long prompts can be
+typed across several lines.
 
 The prompt is a small line editor (`lineedit.go`): arrow keys move the cursor,
 ↑/↓ walk history, and the usual control keys work (Ctrl-A/E/U/W, Ctrl-C to

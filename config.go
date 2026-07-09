@@ -31,6 +31,7 @@ type Config struct {
 	ShowThinking bool     // expand model reasoning (LCA_HIDE_THINKING to start collapsed)
 	Loop         bool     // autonomous loop mode: keep going until TASK_DONE (LCA_LOOP)
 	Unsafe       bool     // disable the jail + command allowlist (LCA_UNSAFE / -unsafe)
+	KeepSessions int      // max transcript files to retain (LCA_KEEP_SESSIONS)
 }
 
 func env(key, def string) string {
@@ -68,6 +69,7 @@ func loadConfig() Config {
 		ShowThinking: os.Getenv("LCA_SHOW_THINKING") != "", // default: reasoning collapsed into the live status line
 		Loop:         os.Getenv("LCA_LOOP") != "",
 		Unsafe:       os.Getenv("LCA_UNSAFE") != "",
+		KeepSessions: atoiDefault(os.Getenv("LCA_KEEP_SESSIONS"), 200),
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

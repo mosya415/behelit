@@ -64,6 +64,40 @@ func listSessions(dir, exclude string) []sessionMeta {
 	return out
 }
 
+// pruneTranscripts keeps only the `keep` most recent transcript files, deleting
+// older ones so transcripts/ doesn't grow without bound. keep<=0 disables it.
+func pruneTranscripts(dir string, keep int) {
+	if keep <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type ent struct {
+		path  string
+		mtime time.Time
+	}
+	var files []ent
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, ent{filepath.Join(dir, e.Name()), info.ModTime()})
+	}
+	if len(files) <= keep {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mtime.After(files[j].mtime) })
+	for _, x := range files[keep:] {
+		os.Remove(x.path)
+	}
+}
+
 func loadSession(path string) ([]Message, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

@@ -57,6 +57,7 @@ func main() {
 		"root": jail.Root, "model": client.Model(), "endpoint": cfg.BaseURL,
 	})
 	defer rec.Event("session_end", nil)
+	pruneTranscripts(filepath.Join(cfg.Dir, "transcripts"), cfg.KeepSessions)
 
 	msgs := []Message{{Role: "system", Content: systemPrompt(jail)}}
 
@@ -213,6 +214,9 @@ func main() {
 			continue
 		}
 		if handleResumeCmd(line, cfg, rec, &msgs) {
+			continue
+		}
+		if handleHelpCmd(line) {
 			continue
 		}
 
@@ -704,6 +708,57 @@ func handleCompactCmd(line string, client *Client, rec *Recorder, msgs *[]Messag
 	rec.Event("compact", map[string]any{"before_tokens": before, "after_tokens": after})
 	rec.Transcript(*msgs)
 	kv("compact", fmt.Sprintf("~%s → ~%s tokens", kfmt(before), kfmt(after)))
+	return true
+}
+
+// handleHelpCmd prints a grouped cheat sheet of every command and key binding.
+func handleHelpCmd(line string) bool {
+	if _, ok := commandArg(line, "/help"); !ok {
+		if strings.TrimSpace(line) != "/?" {
+			return false
+		}
+	}
+	type item struct{ syntax, desc string }
+	groups := []struct {
+		title string
+		items []item
+	}{
+		{"session", []item{
+			{"/resume [list|<n>]", "continue a previous session"},
+			{"/compact", "summarize the thread to reclaim context"},
+			{"/reset", "clear the transcript (and change log)"},
+			{"/exit", "quit"},
+		}},
+		{"model & endpoint", []item{
+			{"/model [<name>]", "show / set the model"},
+			{"/endpoint [<n>|url]", "list / switch endpoints"},
+			{"/discover", "find live models on the cluster"},
+		}},
+		{"turn", []item{
+			{"/retry", "regenerate the last turn"},
+			{"/edit", "amend & resend the last message"},
+		}},
+		{"context & review", []item{
+			{"/context", "size, cache-alignment, biggest outputs"},
+			{"/diff", "review files the agent changed"},
+			{"/undo", "revert the agent's last change"},
+		}},
+		{"modes", []item{
+			{"/approve [on|off|run|edit]", "approval gate"},
+			{"/think [on|off|last]", "model reasoning display"},
+			{"/loop [on|off]", "autonomous: run until TASK_DONE"},
+			{"/unsafe [on|off]", "disable jail + allowlist (danger)"},
+		}},
+	}
+	eyebrow("commands")
+	for _, g := range groups {
+		fmt.Printf("  %s%s%s\n", cFaint, g.title, cReset)
+		for _, it := range g.items {
+			fmt.Printf("    %-26s %s\n", it.syntax, faint("%s", it.desc))
+		}
+	}
+	fmt.Println("  " + faint("input") + "  @path attaches a file · Enter submits · \\ newline · ↑/↓ history")
+	fmt.Println("         " + faint("Ctrl-C interrupts the model · type ahead while it streams"))
 	return true
 }
 
