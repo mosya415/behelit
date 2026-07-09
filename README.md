@@ -183,6 +183,13 @@ expands reasoning to show the full dimmed text instead; `/think last` reprints
 the last answer's reasoning even when it was collapsed. Reasoning is
 display-only — it is not part of the answer returned to the model.
 
+Type `@path` in a prompt to attach a file: the line editor completes `@` against
+files in the jail (prefix matches first, heavy dirs like `.git`/`node_modules`
+skipped), and at submit the referenced files are injected as `<file>` blocks, so
+the model has them immediately without spending a `read_file` round-trip.
+Mentions that don't resolve to a real file inside the jail are left as plain
+text.
+
 While typing, a status line under the input shows the current model, working
 mode (`approve:…`, plus `loop`/`unsafe` when on), and directory.
 

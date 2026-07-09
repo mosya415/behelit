@@ -39,8 +39,9 @@ var replCommands = []cmdInfo{
 type LineEditor struct {
 	rd      *bufio.Reader
 	history []string
-	models  func() []string // known model names, for /model completion
-	status  func() string   // one-line status shown under the input (model · mode · dir)
+	models  func() []string       // known model names, for /model completion
+	files   func(string) []string // jail files matching a fragment, for @-completion
+	status  func() string         // one-line status shown under the input (model · mode · dir)
 }
 
 func NewLineEditor(rd *bufio.Reader) *LineEditor { return &LineEditor{rd: rd} }
@@ -71,6 +72,16 @@ func (e *LineEditor) suggest(buf string) []suggestion {
 			}
 		}
 		return out
+	}
+	// @path file mention, anywhere in the line: complete the current @token.
+	if at := strings.LastIndexByte(buf, '@'); at >= 0 && e.files != nil && (at == 0 || buf[at-1] == ' ') {
+		if frag := buf[at+1:]; !strings.ContainsAny(frag, " \t") {
+			var out []suggestion
+			for _, f := range e.files(frag) {
+				out = append(out, suggestion{name: "@" + f, complete: buf[:at] + "@" + f})
+			}
+			return out
+		}
 	}
 	return nil
 }

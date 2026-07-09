@@ -77,6 +77,7 @@ func main() {
 
 	ed := NewLineEditor(in)
 	ed.models = client.KnownModels
+	ed.files = func(frag string) []string { return jailFiles(jail, frag) }
 	showThink := cfg.ShowThinking
 	loop := cfg.Loop
 	var lastReason string
@@ -165,8 +166,14 @@ func main() {
 			continue
 		}
 
-		msgs = append(msgs, Message{Role: "user", Content: line})
-		rec.Event("user", map[string]any{"text": line})
+		content := line
+		blocks, names := expandMentions(jail, line)
+		if len(names) > 0 {
+			content += blocks
+			fmt.Println(" " + faint("%s attached @%s", gNone, strings.Join(names, " @")))
+		}
+		msgs = append(msgs, Message{Role: "user", Content: content})
+		rec.Event("user", map[string]any{"text": line, "attached": names})
 		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, showThink, loop, true, &lastReason)
 		rec.Transcript(msgs)
 	}

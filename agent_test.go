@@ -313,6 +313,28 @@ func TestUndoLast(t *testing.T) {
 	}
 }
 
+func TestExpandMentions(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "greet.go"), []byte("package main\nfunc greet() {}\n"), 0o644)
+	j, _ := NewJail(dir, nil, false)
+
+	blocks, names := expandMentions(j, "please explain @greet.go, thanks")
+	if len(names) != 1 || names[0] != "greet.go" {
+		t.Fatalf("names = %v, want [greet.go]", names)
+	}
+	if !strings.Contains(blocks, `<file path="greet.go">`) || !strings.Contains(blocks, "func greet()") {
+		t.Fatalf("blocks missing file content: %q", blocks)
+	}
+	// a mention that isn't a real file is left alone (no injection)
+	if _, n := expandMentions(j, "ping @someone about it"); len(n) != 0 {
+		t.Fatalf("attached a non-file mention: %v", n)
+	}
+	// escaping the jail is refused
+	if _, n := expandMentions(j, "read @../../etc/passwd"); len(n) != 0 {
+		t.Fatalf("attached a path outside the jail: %v", n)
+	}
+}
+
 var reAnsiTest = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func stripAnsi(s string) string { return reAnsiTest.ReplaceAllString(s, "") }
