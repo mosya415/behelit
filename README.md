@@ -267,6 +267,13 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
    commands run, open tasks), reclaiming context while keeping the thread of
    work; the system prompt and the `/undo` backups survive it.
 
+   Every turn rewrites the session transcript to `transcripts/<id>.json`, so a
+   closed or crashed session can be picked up later: `/resume` reloads the most
+   recent one, `/resume list` shows a dated picker (turn count + preview), and
+   `/resume <n>` picks one; `-resume` does the same at startup. The current
+   system prompt is kept (protocol/project instructions may have changed) and the
+   saved conversation appended.
+
 4. **Scope as defense-in-depth — `jail.go` + `approval.go`.** A realpath jail
    (symlink-resolved, prefix-checked) confines every path to the root, and
    `run_command` execs argv directly with **no shell** against an allowlist

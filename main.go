@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ func main() {
 	yes := flag.Bool("y", false, "auto-approve side-effecting actions (for one-shot / non-interactive use)")
 	yesLong := flag.Bool("yes", false, "alias for -y")
 	unsafe := flag.Bool("unsafe", false, "disable the jail + command allowlist (any path, any command)")
+	resume := flag.Bool("resume", false, "resume the most recent previous session")
 	flag.Usage = usage
 	flag.Parse()
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -74,6 +76,17 @@ func main() {
 		clearScreen()
 	}
 	banner(cfg, jail, rec, ap, client, notes)
+
+	if *resume {
+		if ss := listSessions(filepath.Join(cfg.Dir, "transcripts"), rec.SessionPath()); len(ss) > 0 {
+			if n, err := resumeInto(&msgs, ss[0]); err == nil {
+				rec.Event("resume", map[string]any{"from": ss[0].id, "messages": n})
+				fmt.Println("  " + faint("%s resumed %s · %d messages", gNone, sessionWhen(ss[0].id), n))
+			}
+		} else {
+			fmt.Println("  " + faint("-resume: no previous session found"))
+		}
+	}
 
 	ed := NewLineEditor(in)
 	ed.models = client.KnownModels
@@ -163,6 +176,9 @@ func main() {
 			continue
 		}
 		if handleCompactCmd(line, client, rec, &msgs) {
+			continue
+		}
+		if handleResumeCmd(line, cfg, rec, &msgs) {
 			continue
 		}
 
@@ -657,6 +673,46 @@ func handleCompactCmd(line string, client *Client, rec *Recorder, msgs *[]Messag
 	return true
 }
 
+// handleResumeCmd reloads a previous session's transcript. "/resume" resumes the
+// most recent one; "/resume list" shows a picker; "/resume <n>" picks the nth.
+func handleResumeCmd(line string, cfg Config, rec *Recorder, msgs *[]Message) bool {
+	arg, ok := commandArg(line, "/resume")
+	if !ok {
+		return false
+	}
+	sessions := listSessions(filepath.Join(cfg.Dir, "transcripts"), rec.SessionPath())
+	if len(sessions) == 0 {
+		fmt.Println("  " + faint("no previous sessions found"))
+		return true
+	}
+	if arg == "list" || arg == "ls" {
+		eyebrow("previous sessions")
+		for _, l := range sessionLines(sessions) {
+			fmt.Println(l)
+		}
+		fmt.Println("  " + faint("resume with /resume <n>  (default = most recent)"))
+		return true
+	}
+	idx := 0
+	if arg != "" {
+		n, err := strconv.Atoi(arg)
+		if err != nil || n < 1 || n > len(sessions) {
+			fmt.Println("  " + faint("usage: /resume [list|<n>]"))
+			return true
+		}
+		idx = n - 1
+	}
+	restored, err := resumeInto(msgs, sessions[idx])
+	if err != nil {
+		toolErr("resume failed: " + err.Error())
+		return true
+	}
+	rec.Event("resume", map[string]any{"from": sessions[idx].id, "messages": restored})
+	rec.Transcript(*msgs)
+	kv("resumed", fmt.Sprintf("%s  ·  %d messages", sessionWhen(sessions[idx].id), restored))
+	return true
+}
+
 // handleDiffCmd shows a per-file diff of everything the agent changed this
 // session (first-touch state → current on disk).
 func handleDiffCmd(line string) bool {
@@ -1121,6 +1177,7 @@ usage:
 flags:
   -y, -yes            auto-approve side-effecting actions (edit/write/run_command)
   -unsafe             disable the jail + command allowlist (any path, any command)
+  -resume             resume the most recent previous session
 
 config is via environment (see README): LCA_BASE_URL, LCA_MODEL, LCA_ROOT,
 LCA_ALLOW, LCA_DIR, LCA_CTX_TOKENS.
