@@ -2,14 +2,53 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
+// projectFiles are the instruction filenames we look for in the jail root, in
+// priority order — the agent reads the first present into its system prompt, so
+// a repo can teach it local conventions (build/test commands, style, do-nots)
+// the way CLAUDE.md / AGENTS.md do. LCA_INSTRUCTIONS overrides the search.
+var projectFiles = []string{"BEHELIT.md", "AGENTS.md", "CLAUDE.md", ".lca/instructions.md"}
+
+const maxProjectBytes = 32 * 1024
+
+// loadProjectInstructions returns the name and contents of the first project
+// instruction file found (capped to a sane size). ok=false when none exists.
+func loadProjectInstructions(j *Jail) (name, content string, ok bool) {
+	candidates := projectFiles
+	if p := os.Getenv("LCA_INSTRUCTIONS"); p != "" {
+		candidates = []string{p}
+	}
+	for _, rel := range candidates {
+		p := rel
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(j.Root, rel)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := strings.TrimSpace(string(data))
+		if s == "" {
+			continue
+		}
+		if len(s) > maxProjectBytes {
+			s = s[:maxProjectBytes] + "\n… (truncated)"
+		}
+		return rel, s, true
+	}
+	return "", "", false
+}
+
 // systemPrompt teaches the model our text-based tool protocol. It is the single
 // source of truth the model sees; the parser in protocol.go must stay in sync
-// with the grammar described here.
+// with the grammar described here. Any project instruction file is appended at
+// the end (a stable suffix, so it doesn't disturb the cached prefix).
 func systemPrompt(j *Jail) string {
-	return fmt.Sprintf(`You are a coding agent working inside a single directory on an air-gapped host.
+	base := fmt.Sprintf(`You are a coding agent working inside a single directory on an air-gapped host.
 You act on the user's behalf and must never take a side-effecting action without it being approved.
 
 # How you use tools
@@ -104,4 +143,10 @@ Then end the message; the <tool_result> comes back and you continue.
   All paths are relative to here. You cannot read or write outside it.
 - Allowlisted commands: %s
 `, j.Root, strings.Join(j.Allowed, ", "))
+
+	if name, content, ok := loadProjectInstructions(j); ok {
+		base += fmt.Sprintf("\n# Project instructions (from %s)\n"+
+			"The user maintains these project-specific instructions. Follow them; they take precedence over your defaults where they conflict.\n\n%s\n", name, content)
+	}
+	return base
 }

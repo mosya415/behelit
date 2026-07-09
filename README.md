@@ -50,6 +50,7 @@ are denied rather than run unattended.
 | `LCA_ORG`      | unset                          | Optional brand shown in the banner's ticket header |
 | `LCA_SHOW_THINKING` | unset                     | Start with reasoning expanded to full text (default: collapsed to the live status line; toggle with `/think`) |
 | `LCA_LOOP`     | unset                          | Start in autonomous loop mode (toggle with `/loop`) |
+| `LCA_INSTRUCTIONS` | unset                      | Path to a project instructions file (overrides the `BEHELIT.md`/`AGENTS.md`/`CLAUDE.md` search) |
 | `LCA_UNSAFE`   | unset                          | Start with the jail + allowlist off (toggle with `/unsafe`; also `-unsafe`) |
 | `LCA_NO_CLEAR` | unset                          | If set, don't clear the screen on interactive startup |
 | `LCA_DISCOVER` | unset                          | If set, query `/models` to adopt/validate the model (off = trust the configured name) |
@@ -250,6 +251,14 @@ is hit. Use it to hand off a whole task and let the agent run it to completion.
    line reports prompt tokens and the **KV cache hit rate**, completion tokens,
    decode throughput, and time-to-first-token; `/context` shows the live budget,
    cache-alignment state, and the biggest outputs.
+
+   A **project instructions file** in the root (`BEHELIT.md`, `AGENTS.md`,
+   `CLAUDE.md`, or `.lca/instructions.md`, first found; or `LCA_INSTRUCTIONS`) is
+   appended to the system prompt, so a repo can teach the agent its build/test
+   commands, style, and do-nots. For long sessions, `/compact` replaces the
+   transcript with an LLM-generated brief (goal, decisions, files changed,
+   commands run, open tasks), reclaiming context while keeping the thread of
+   work; the system prompt and the `/undo` backups survive it.
 
 4. **Scope as defense-in-depth — `jail.go` + `approval.go`.** A realpath jail
    (symlink-resolved, prefix-checked) confines every path to the root, and

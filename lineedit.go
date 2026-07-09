@@ -29,6 +29,7 @@ var replCommands = []cmdInfo{
 	{"/loop", "autonomous mode: run until done"},
 	{"/unsafe", "disable jail + allowlist (danger)"},
 	{"/context", "context size, cache, big outputs"},
+	{"/compact", "summarize to reclaim context"},
 	{"/diff", "review files the agent changed"},
 	{"/undo", "revert the agent's last change"},
 	{"/reset", "clear the transcript"},

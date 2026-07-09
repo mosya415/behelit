@@ -161,6 +161,9 @@ func main() {
 		if handleUndoCmd(line, rec) {
 			continue
 		}
+		if handleCompactCmd(line, client, rec, &msgs) {
+			continue
+		}
 
 		msgs = append(msgs, Message{Role: "user", Content: line})
 		rec.Event("user", map[string]any{"text": line})
@@ -598,6 +601,52 @@ func handleContextCmd(line string, msgs []Message, ctxTokens int) bool {
 			contValue(faint("%-7s %s", byteCount(it.bytes), it.label))
 		}
 	}
+	return true
+}
+
+const compactInstruction = "Summarize the conversation below into a compact, factual brief that preserves: " +
+	"the user's goal and constraints; key decisions and why; files created/edited and how; " +
+	"commands run and their outcomes; and any open tasks or next steps. " +
+	"Write it so work can continue from the brief alone. Be concise. Output only the brief."
+
+// handleCompactCmd replaces the transcript with an LLM-generated summary,
+// reclaiming context on a long session while keeping the thread of work. The
+// system prompt is preserved; file backups (/undo) are untouched.
+func handleCompactCmd(line string, client *Client, rec *Recorder, msgs *[]Message) bool {
+	if _, ok := commandArg(line, "/compact"); !ok {
+		return false
+	}
+	if len(*msgs) <= 2 {
+		fmt.Println("  " + faint("nothing to compact yet"))
+		return true
+	}
+	before := estimateTokens(*msgs)
+	fmt.Println(" " + faint("%s compacting conversation…", gNone))
+
+	var b strings.Builder
+	for _, m := range (*msgs)[1:] { // skip the system prompt
+		b.WriteString(strings.ToUpper(m.Role) + ": " + m.Content + "\n\n")
+	}
+	summary, err := client.Complete([]Message{
+		{Role: "system", Content: "You compress coding-assistant conversations into a compact, factual brief."},
+		{Role: "user", Content: compactInstruction + "\n\n---\n" + b.String()},
+	})
+	if summary = strings.TrimSpace(summary); err != nil || summary == "" {
+		if err != nil {
+			toolErr("compact failed: " + err.Error())
+		} else {
+			toolErr("compact produced no summary")
+		}
+		return true
+	}
+	*msgs = []Message{
+		(*msgs)[0],
+		{Role: "user", Content: "[Earlier conversation compacted to save context]\n\n" + summary},
+	}
+	after := estimateTokens(*msgs)
+	rec.Event("compact", map[string]any{"before_tokens": before, "after_tokens": after})
+	rec.Transcript(*msgs)
+	kv("compact", fmt.Sprintf("~%s → ~%s tokens", kfmt(before), kfmt(after)))
 	return true
 }
 
@@ -1083,6 +1132,9 @@ func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client,
 
 	kv("user", who)
 	kv("jail", jail.Root)
+	if name, _, ok := loadProjectInstructions(jail); ok {
+		kv("project", name+faint("  (instructions loaded)"))
+	}
 	endpointNote := ""
 	if len(client.Endpoints()) > 1 {
 		endpointNote = faint("  (+%d more — /endpoint)", len(client.Endpoints())-1)
