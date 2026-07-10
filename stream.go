@@ -143,11 +143,7 @@ func (p *proseWriter) closeMarker() {
 	p.pendingNewline = true
 }
 
-func (p *proseWriter) out(s string) {
-	screenMu.Lock()
-	fmt.Print(s)
-	screenMu.Unlock()
-}
+func (p *proseWriter) out(s string) { fmt.Print(s) }
 
 func (p *proseWriter) feed(s string) {
 	if p.raw {

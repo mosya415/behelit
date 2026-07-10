@@ -1,0 +1,25 @@
+КАК ЗАПУСТИТЬ НА MAC
+====================
+
+1) Открой Terminal (Терминал) и перейди в эту папку:
+      cd путь/к/папке/macos
+
+2) Разреши запуск (снять карантин macOS) и сделать исполняемым:
+      xattr -d com.apple.quarantine ./lca
+      chmod +x ./lca
+
+3) Запусти:
+      ./lca
+
+Если увидишь "bad CPU type" или он не запускается — у тебя Intel-мак,
+тогда используй файл lca-intel вместо lca:
+      xattr -d com.apple.quarantine ./lca-intel
+      chmod +x ./lca-intel
+      ./lca-intel
+
+Проверить свой чип:  uname -m
+   arm64  -> используй ./lca
+   x86_64 -> используй ./lca-intel
+
+Перед запуском задай эндпоинт своей модели, напр.:
+   LCA_BASE_URL=http://адрес:порт/v1 LCA_MODEL=имя-модели ./lca

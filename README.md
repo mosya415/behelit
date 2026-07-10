@@ -198,13 +198,10 @@ text.
 While typing, a status line under the input shows the current model, working
 mode (`approve:…`, plus `loop`/`unsafe` when on), and directory.
 
-While the model is streaming, an input line stays pinned to the terminal's
-bottom row (a DECSTBM scroll region keeps the answer scrolling above it), so you
-can read the answer forming AND type the next message without waiting. Press
-Enter and it queues: the current turn finishes, then your message runs (in loop
-mode this also breaks the loop to handle you promptly). Anything typed but not
-submitted carries over to pre-fill the next prompt. Linux-only; elsewhere the
-session just falls back to prompting after each turn.
+While the model is streaming, **Ctrl-C aborts the turn** — a scoped SIGINT
+handler cancels the request's context and control returns to the prompt (the
+partial reply is kept so the transcript stays clean). It's the escape hatch for
+a runaway generation or a `/loop` that won't stop.
 
 ## Design (the four non-trivial parts)
 
@@ -318,10 +315,6 @@ its output live behind a dim `│` gutter, its stdin is the null device (so it
 can't hang waiting for input), it is bounded by `LCA_CMD_TIMEOUT`, and Ctrl-C
 interrupts just that command — not the agent.
 
-While the model is streaming, **Ctrl-C aborts the turn**: the request's context
-is cancelled and control returns to the prompt (the partial reply is kept so the
-transcript stays clean). This is the escape hatch for a runaway generation or a
-`/loop` that won't stop.
 
 ### Approval modes — `approval.go`
 

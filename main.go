@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"sort"
@@ -112,33 +113,25 @@ func main() {
 	}
 	for {
 		fmt.Print("\n")
-		var line string
-		if q, ok := takeQueuedLine(); ok {
-			// The user typed this during the previous turn's streaming.
-			line = q
-			echoQueued(line)
-		} else {
-			prefill := takePartial()
-			if editPrefill != "" {
-				prefill, editPrefill = editPrefill, ""
+		prefill := ""
+		if editPrefill != "" {
+			prefill, editPrefill = editPrefill, ""
+		}
+		line, err := ed.ReadLine(" "+cFaint+"›"+cReset+" ", prefill)
+		if err == errLineCancel {
+			continue
+		}
+		if err != nil { // EOF (Ctrl-D / stream end)
+			return
+		}
+		// Backslash line-continuation: a line ending in \ keeps reading, so a
+		// long prompt can be typed across several lines.
+		for strings.HasSuffix(line, "\\") {
+			cont, err := ed.ReadLine("   "+cFaint+"…"+cReset+" ", "")
+			if err != nil {
+				break
 			}
-			l, err := ed.ReadLine(" "+cFaint+"›"+cReset+" ", prefill)
-			if err == errLineCancel {
-				continue
-			}
-			if err != nil { // EOF (Ctrl-D / stream end)
-				return
-			}
-			line = l
-			// Backslash line-continuation: a line ending in \ keeps reading, so a
-			// long prompt can be typed across several lines.
-			for strings.HasSuffix(line, "\\") {
-				cont, err := ed.ReadLine("   "+cFaint+"…"+cReset+" ", "")
-				if err != nil {
-					break
-				}
-				line = line[:len(line)-1] + "\n" + cont
-			}
+			line = line[:len(line)-1] + "\n" + cont
 		}
 		line = strings.TrimSpace(line)
 		switch line {
@@ -999,27 +992,11 @@ func fmtDurShort(d time.Duration) string {
 	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
-// echoQueued shows a message the user typed during streaming as a submitted
-// band, so it's clear which queued input is now running.
-func echoQueued(line string) {
-	w := termWidth()
-	bar := cFaint + strings.Repeat("─", w) + cReset
-	band := cBandBg + padTo(" › "+strings.ReplaceAll(line, "\n", "⏎ "), w, 0) + cReset
-	fmt.Println(bar)
-	fmt.Println(band)
-	fmt.Println(bar)
-}
-
 func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink, loop, interactive bool, lastReason *string) {
 	*lastReason = ""    // reasoning captured this turn, for /think last
 	continuing := false // the previous step was cut off by length; continue it
 	nudges := 0         // times we asked the model to redo a stray diff as a tool call
 	for step := 0; step < maxSteps; step++ {
-		// The user typed a new message during the previous step's streaming —
-		// hand control back to the REPL to run it instead of pressing on.
-		if interactive && hasQueuedLine() {
-			return
-		}
 		pw := newProseWriter(raw, showThink)
 
 		send, trimmed := trimForContext(*msgs, ctxTokens)
@@ -1027,20 +1004,29 @@ func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Me
 			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
 			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
 		}
-		// A cancelable context lets Ctrl-C (caught by the footer, which owns stdin
-		// while streaming) abort a runaway generation or loop mid-flight.
+		// A cancelable context + a scoped SIGINT handler let Ctrl-C abort a runaway
+		// generation or loop mid-flight (the terminal is in cooked mode between
+		// prompts, so Ctrl-C arrives as a signal). No terminal redraws involved.
 		ctx, cancel := context.WithCancel(context.Background())
 		var interrupted atomic.Bool
-		var f *footer
+		var sigch chan os.Signal
 		if interactive {
-			f = startFooter(" "+cFaint+"›"+cReset+" ", takePartial(), func() {
-				interrupted.Store(true)
-				cancel()
-			})
+			sigch = make(chan os.Signal, 1)
+			signal.Notify(sigch, os.Interrupt)
+			go func() {
+				select {
+				case <-sigch:
+					interrupted.Store(true)
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
 		}
 		reply, finish, usage, err := client.CompleteStream(ctx, send, pw.feed, pw.feedReasoning, continuing)
-		f.stop()
-		cancel()
+		if sigch != nil {
+			signal.Stop(sigch)
+		}
+		cancel() // ends the watcher goroutine
 		pw.end()
 		printPerf(usage)
 		if usage.PromptTokens > 0 {
