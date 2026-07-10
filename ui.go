@@ -178,13 +178,13 @@ func clampWidth(n int) int {
 	}
 }
 
-// clearScreen wipes the screen and scrollback and homes the cursor, so an
-// interactive session starts from the top — while staying on the normal screen,
-// so its output stays in the scrollback and can be scrolled back through. No-op
-// unless stdout is a real terminal, so piped output is never polluted.
+// clearScreen homes the cursor and clears the VISIBLE screen so a session starts
+// at the top — but deliberately does NOT emit \033[3J (erase-scrollback), so the
+// terminal's scrollback is preserved and you can scroll up past the banner into
+// earlier output / your shell history. No-op unless stdout is a real terminal.
 func clearScreen() {
 	if osTermWidth() > 0 {
-		fmt.Print("\033[3J\033[H\033[2J")
+		fmt.Print("\033[H\033[2J")
 	}
 }
 
