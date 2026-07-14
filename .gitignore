@@ -1,5 +1,10 @@
-# built binary
+# compiled binaries — distributed via GitHub Releases, not committed
 /lca
+/dist/
+/macos/
+/linux/
+/windows/
+*.exe
 
-# local agent state (audit log + transcripts live under $LCA_DIR, default ~/.lca)
-/.lca/
+# local session data (audit log + transcripts), if LCA_DIR points here
+.lca/
