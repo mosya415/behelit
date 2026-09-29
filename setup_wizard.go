@@ -487,15 +487,30 @@ func (r *Repl) setupModels(p *setupPlan) error {
 			}
 		}
 	}
+	// why each model arrives ticked. Without it the screen opens with three or
+	// four ticks the operator did not make and cannot account for.
+	why := map[string]string{}
+	mark := func(m, role string) {
+		if m == "" {
+			return
+		}
+		pre[m] = true
+		if why[m] == "" {
+			why[m] = role
+		} else if !strings.Contains(why[m], role) {
+			why[m] += "+" + role
+		}
+	}
 	if len(pre) == 0 {
-		// No team yet: the default IS lca init's, from the same functions.
+		// No team yet: the default IS lca init's, from the same functions. Two per
+		// role, because a role's models: is a chain — the second is its fallback.
 		for _, m := range pickModels(names, leadPref, 2) {
-			pre[m] = true
+			mark(m, "lead")
 		}
 		for _, m := range pickModels(names, coderPref, 2) {
-			pre[m] = true
+			mark(m, "coder")
 		}
-		pre[pickCheap(names)] = true
+		mark(pickCheap(names), "cheap")
 	}
 
 	for {
@@ -503,6 +518,9 @@ func (r *Repl) setupModels(p *setupPlan) error {
 		for _, m := range p.served {
 			c := modelChoice(m, pre[m.ID])
 			c.seq = seq[m.ID]
+			if r := why[m.ID]; r != "" {
+				c.note += " · ticked as the default " + r
+			}
 			cs = append(cs, c)
 		}
 		idx, err := pick(r.in, cs, pickOpts{multi: true, title: "setup",
@@ -586,7 +604,7 @@ func (r *Repl) setupTeam(p *setupPlan) error {
 	defaults := map[string]string{
 		"lead":  firstOf(pickModels(p.picked, leadPref, 1)),
 		"coder": firstOf(pickModels(p.picked, coderPref, 1)),
-		"cheap": pickCheap(p.picked),
+		"cheap": pickCheap(p.picked), // "" when none is small: the none row is then the default
 	}
 	for _, role := range []string{"lead", "coder", "reviewer", "cheap"} {
 		def := defaults[role]

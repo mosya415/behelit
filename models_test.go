@@ -698,3 +698,56 @@ func TestUnsourcedValuesAreAbsentNotGuessed(t *testing.T) {
 		}
 	}
 }
+
+// isSmall decides which model is offered as the cheap summariser and which are
+// candidates for lead and coder. It matched raw substrings, so "MiniMax-M3" — a
+// 428B flagship — was "small" because the vendor's name contains "mini": it was
+// proposed for compaction and dropped from the roles that needed it.
+func TestIsSmallMatchesTokensNotSubstrings(t *testing.T) {
+	big := []string{"MiniMax-M3", "kimi-k3", "glm5.3", "qwen3.6", "hy3", "deepseek-v4.1", "qwen3.6-235b-a22b"}
+	small := []string{"deepseek-v4.1-flash", "qwen3-30b-a3b-instruct", "glm-4.5-air", "gpt-4o-mini",
+		"qwen3.6-27b", "some-8b-instruct", "model-lite", "nano-2"}
+	for _, m := range big {
+		if isSmall(m) {
+			t.Errorf("%s must not be treated as a small model", m)
+		}
+	}
+	for _, m := range small {
+		if !isSmall(m) {
+			t.Errorf("%s is a small model", m)
+		}
+	}
+}
+
+// With no small model served, there is no cheap role: an arbitrary "last name the
+// gateway listed" made a flagship the summariser, and a role with an empty
+// models: list does not load at all.
+func TestPickCheapIsEmptyWithoutASmallModel(t *testing.T) {
+	fleet := []string{"hy3", "kimi-k3", "MiniMax-M3", "qwen3.6", "glm5.3"}
+	if got := pickCheap(fleet); got != "" {
+		t.Fatalf("pickCheap(%v) = %q, want none", fleet, got)
+	}
+	if cheapBlock("") != "" {
+		t.Fatal("no cheap model must write no cheap role")
+	}
+	withFlash := append(fleet, "deepseek-v4.1-flash")
+	if got := pickCheap(withFlash); got != "deepseek-v4.1-flash" {
+		t.Fatalf("pickCheap picked %q", got)
+	}
+	if !strings.Contains(cheapBlock("deepseek-v4.1-flash"), "models: [deepseek-v4.1-flash]") {
+		t.Fatalf("cheap role block: %q", cheapBlock("deepseek-v4.1-flash"))
+	}
+}
+
+// The default team over the operator's own fleet: the flagship must be a
+// candidate for the roles that do the work, not the summariser.
+func TestDefaultTeamOverTheServedFleet(t *testing.T) {
+	names := []string{"hy3", "kimi-k3", "MiniMax-M3", "deepseek-v4.1-flash", "qwen3.6", "glm5.3"}
+	lead, coder := pickModels(names, leadPref, 2), pickModels(names, coderPref, 2)
+	if !contains(append(lead, coder...), "MiniMax-M3") {
+		t.Errorf("MiniMax-M3 is a flagship; lead=%v coder=%v", lead, coder)
+	}
+	if got := pickCheap(names); got != "deepseek-v4.1-flash" {
+		t.Errorf("the flash build is the cheap one, got %q", got)
+	}
+}

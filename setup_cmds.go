@@ -175,14 +175,8 @@ roles:
       relevant code first, make the smallest correct change, and run the check
       command yourself until it passes. Don't refactor unrelated code.
 
-  cheap:
-    description: Summaries and compaction.
-    models: [%s]
-    effort: off
-    context: 32000
-    tools: []
-`, filepath.Base(cfg.Root), strings.TrimRight(gw.Endpoint(), "/"), remoteBlock, defaultsMember, strings.Join(allow, ", "),
-		strings.Join(lead, ", "), strings.Join(coder, ", "), checkLine(check), cheap)
+%s`, filepath.Base(cfg.Root), strings.TrimRight(gw.Endpoint(), "/"), remoteBlock, defaultsMember, strings.Join(allow, ", "),
+		strings.Join(lead, ", "), strings.Join(coder, ", "), checkLine(check), cheapBlock(cheap))
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		errLine("%v", err)
@@ -200,11 +194,17 @@ roles:
 	if len(members.list) > 1 {
 		hint("pin a role with \"member: <name>\" under it")
 	}
-	table([]string{"role", "models", "check"}, [][]string{
+	rows := [][]string{
 		{"lead", strings.Join(lead, faint(" → ")), faint("—")},
 		{"coder", strings.Join(coder, faint(" → ")), faint("%s", firstNonEmpty(check, "— add check_cmd"))},
-		{"cheap", cheap, faint("—")},
-	})
+	}
+	if cheap != "" {
+		rows = append(rows, []string{"cheap", cheap, faint("—")})
+	}
+	table([]string{"role", "models", "check"}, rows)
+	if cheap == "" {
+		hint("no small model is served, so no cheap role was written — compaction runs on the lead's model")
+	}
 	row("sandbox", faint("%s", strings.Join(allow, " ")))
 	if *remote != "" {
 		row("remote", *remote+faint(" · files and commands go there over ssh"))
@@ -226,17 +226,46 @@ func checkLine(check string) string {
 var (
 	leadPref  = []string{"kimi", "glm-5", "deepseek-v4-pro", "deepseek", "glm", "qwen3.7-max", "qwen3-max", "minimax", "hy3", "qwen"}
 	coderPref = []string{"coder", "deepseek-v4", "glm-5", "kimi", "minimax", "deepseek", "qwen", "glm", "hy3"}
-	smallHint = []string{"flash", "mini", "air", "lite", "small", "turbo", "a3b", "30b", "14b", "8b", "7b"}
+	smallHint = []string{"flash", "mini", "air", "lite", "small", "turbo", "nano", "tiny"}
 )
 
 func isSmall(m string) bool {
-	l := strings.ToLower(m)
-	for _, h := range smallHint {
-		if strings.Contains(l, h) {
+	// Per TOKEN, never as a raw substring: "mini" inside MiniMax made a 428B
+	// flagship look like the cheap model, which then lost it as a candidate for
+	// lead and coder. A parameter count is its own rule rather than a list of
+	// spellings, so 27b and 32b are recognised without being enumerated.
+	biggest := 0
+	for _, t := range strings.FieldsFunc(strings.ToLower(m), func(r rune) bool {
+		return r != '.' && (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	}) {
+		if contains(smallHint, t) {
 			return true
 		}
+		if n := paramCountB(t); n > biggest {
+			biggest = n
+		}
 	}
-	return false
+	// The LARGEST size token decides, because a mixture-of-experts id carries two:
+	// qwen3.6-235b-a22b is a 235B model that activates 22B, and reading the active
+	// count alone would file a flagship as small.
+	return biggest > 0 && biggest <= 32
+}
+
+// paramCountB reads a size token: "8b", "30b", "a3b" (active parameters) → the
+// number of billions, 0 when the token is not a size.
+func paramCountB(t string) int {
+	t = strings.TrimPrefix(t, "a")
+	if !strings.HasSuffix(t, "b") || len(t) < 2 {
+		return 0
+	}
+	n := 0
+	for _, r := range t[:len(t)-1] {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
 }
 
 // pickModels chooses up to n distinct big models by preference.
@@ -267,13 +296,33 @@ func pickModels(names, pref []string, n int) []string {
 	return out
 }
 
+// pickCheap is the small model compaction should run on, or "" when the gateway
+// serves none. It used to fall back to the last name the gateway listed, which is
+// arbitrary: it made a flagship the summariser on a fleet of six big models.
+// cheapBlock is the compaction role, or nothing when the gateway serves no small
+// model: a role with an empty models: list does not load, and inventing a
+// flagship as the summariser is worse than leaving compaction on the lead.
+func cheapBlock(model string) string {
+	if model == "" {
+		return ""
+	}
+	return fmt.Sprintf(`
+  cheap:
+    description: Summaries and compaction.
+    models: [%s]
+    effort: off
+    context: 32000
+    tools: []
+`, model)
+}
+
 func pickCheap(names []string) string {
 	for _, m := range names {
 		if isSmall(m) {
 			return m
 		}
 	}
-	return names[len(names)-1]
+	return ""
 }
 
 // detectToolchain guesses the project's test command and the commands its
