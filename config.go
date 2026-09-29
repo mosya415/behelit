@@ -39,6 +39,8 @@ type Config struct {
 	Agent        string   // primary agent to start with (LCA_AGENT)
 	SubagentMax  int      // max subagent nesting depth (LCA_SUBAGENT_DEPTH)
 	Tier         string   // active model tier (-tier / LCA_TIER); remaps every role that names one
+	APIKeyEnv    string   // the NAME of the variable APIKey was read from (config.json api_key_env)
+	Approve      string   // approval posture: off | run | edit | web | all (config.json approve)
 
 	TransportOverride string // force a tool transport for the whole run (eval -transport)
 }
@@ -50,40 +52,52 @@ func env(key, def string) string {
 	return def
 }
 
+// loadConfig resolves the configuration in layers: the literals, then the
+// locators (which decide where the files are), then the files, then env. It
+// keeps its signature — every caller that had it still has it.
 func loadConfig() Config {
-	cwd, err := os.Getwd()
+	cfg, _, _ := loadConfigWithSources()
+	return cfg
+}
+
+// loadConfigWithSources is loadConfig plus what /config needs to explain itself:
+// the decoded file config, and which layer each setting's effective value came
+// from. A value with no provenance is a value nobody can argue with.
+func loadConfigWithSources() (Config, *FileConfig, map[string]settingSource) {
+	cfg := defaultConfig()
+	srcs := map[string]settingSource{}
+	applyLocatorEnv(&cfg, srcs)
+	fc, err := loadFileConfig(cfg)
 	if err != nil {
-		cwd = "."
+		// The file is malformed. Refusing to start is loadFileConfig's own policy
+		// and setupOrchestrator reports it properly; here we carry on with the
+		// defaults so the message comes from there and not from a half-built
+		// config.
+		fc = &FileConfig{Providers: map[string]ProviderConfig{}, Agents: map[string]AgentConfig{}}
 	}
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = cwd
-	}
-	cfg := Config{
-		Root:         env("LCA_ROOT", cwd),
-		Dir:          env("LCA_DIR", filepath.Join(home, ".lca")),
-		BaseURL:      strings.TrimRight(env("LCA_BASE_URL", "http://localhost:8000/v1"), "/"),
-		Model:        env("LCA_MODEL", "local"),
-		APIKey:       env("LCA_API_KEY", "sk-noauth"),
-		Temperature:  -1, // unset: send no temperature unless a profile, role or LCA_TEMPERATURE says so
-		MaxSteps:     atoiDefault(os.Getenv("LCA_MAX_STEPS"), 50),
-		CtxTokens:    atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 0), // 0 = auto: derive from the model's window
-		MaxTokens:    atoiDefault(os.Getenv("LCA_MAX_TOKENS"), 0),
-		CmdTimeout:   atoiDefault(os.Getenv("LCA_CMD_TIMEOUT"), 120),
-		Raw:          os.Getenv("LCA_RAW") != "",
-		Discover:     os.Getenv("LCA_DISCOVER") != "",
-		Reservation:  os.Getenv("LCA_RESERVATION"),
-		DiscoverUser: os.Getenv("LCA_USER"),
-		Scheme:       env("LCA_SCHEME", "http"),
-		ShowThinking: os.Getenv("LCA_SHOW_THINKING") != "", // default: reasoning collapsed into the live status line
-		Loop:         os.Getenv("LCA_LOOP") != "",
-		Unsafe:       os.Getenv("LCA_UNSAFE") != "",
-		KeepSessions: atoiDefault(os.Getenv("LCA_KEEP_SESSIONS"), 200),
-		Tools:        strings.ToLower(os.Getenv("LCA_TOOLS")),
-		Thinking:     os.Getenv("LCA_THINKING"),
-		Agent:        env("LCA_AGENT", "build"),
-		SubagentMax:  atoiDefault(os.Getenv("LCA_SUBAGENT_DEPTH"), 1),
-		Tier:         os.Getenv("LCA_TIER"),
+	applyFileConfig(&cfg, fc, srcs)
+	applyEnvConfig(&cfg, srcs)
+	cfg.Endpoints = endpointList(cfg)
+	return cfg, fc, srcs
+}
+
+// defaultConfig is the literals and nothing else — no env, no files. Every
+// number a default supplies has to be visible in one place, or "where did 50
+// steps come from?" has no answer.
+func defaultConfig() Config {
+	return Config{
+		BaseURL:      "http://localhost:8000/v1",
+		Model:        "local",
+		APIKey:       "sk-noauth",
+		Temperature:  -1, // unset: send no temperature unless a profile, role or setting says so
+		MaxSteps:     50,
+		CtxTokens:    0, // 0 = auto: derive from the model's window
+		MaxTokens:    0,
+		CmdTimeout:   120,
+		Scheme:       "http",
+		KeepSessions: 200,
+		Agent:        "build",
+		SubagentMax:  1,
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",
@@ -92,22 +106,139 @@ func loadConfig() Config {
 			"ssh", "scp", "rsync", "bsk",
 		},
 	}
-	if v := os.Getenv("LCA_TEMPERATURE"); v != "" {
-		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-			cfg.Temperature = f
+}
+
+// applyLocatorEnv resolves where lca looks for everything. It must run FIRST and
+// takes no part in the file layers: a file that relocated the directory it was
+// found in would be a paradox.
+func applyLocatorEnv(c *Config, srcs map[string]settingSource) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		home = cwd
+	}
+	c.Root, c.Dir = cwd, filepath.Join(home, ".lca")
+	mark(srcs, "root", SrcDefault, "cwd")
+	mark(srcs, "dir", SrcDefault, "$HOME/.lca")
+	if v, ok := os.LookupEnv("LCA_ROOT"); ok && v != "" {
+		c.Root = v
+		mark(srcs, "root", SrcEnv, "LCA_ROOT")
+	}
+	if v, ok := os.LookupEnv("LCA_DIR"); ok && v != "" {
+		c.Dir = v
+		mark(srcs, "dir", SrcEnv, "LCA_DIR")
+	}
+}
+
+// applyFileConfig merges the config files' scalars, recording which file set
+// each one. fc.From already says which file that was, because "a config file"
+// is not an answer an operator can act on.
+func applyFileConfig(c *Config, fc *FileConfig, srcs map[string]settingSource) {
+	if fc == nil {
+		return
+	}
+	for _, s := range settings {
+		if s.JSON == "" || s.Kind == kLocator {
+			continue
+		}
+		raw, ok := fc.Raw[s.JSON]
+		if !ok {
+			continue
+		}
+		if err := applySetting(c, s.Key, raw); err != nil {
+			warnLine("%s: %v", prettyPath(fc.From[s.JSON], c.Root), err)
+			continue
+		}
+		mark(srcs, s.Key, fileSourceOf(*c, fc.From[s.JSON]), fc.From[s.JSON])
+	}
+	// api_key_env resolves HERE, where the file that named the variable is known,
+	// so /config can say "api_key_env → .lca/config.json" rather than inventing a
+	// source for a value it took from the environment.
+	if fc.APIKeyEnv != "" {
+		if v := os.Getenv(fc.APIKeyEnv); v != "" {
+			c.APIKey, c.APIKeyEnv = v, fc.APIKeyEnv
+			mark(srcs, "api_key", fileSourceOf(*c, fc.From["api_key_env"]), "api_key_env → "+fc.From["api_key_env"])
 		}
 	}
-	if v := os.Getenv("LCA_ALLOW"); v != "" {
-		cfg.Allowed = splitFields(v)
+	if fc.SubagentDepth > 0 {
+		c.SubagentMax = fc.SubagentDepth
 	}
+}
 
-	// Known endpoints: the current BaseURL first, then any from LCA_ENDPOINTS
-	// (comma-separated), deduped and trailing-slash-trimmed.
-	cfg.Endpoints = []string{cfg.BaseURL}
-	for _, e := range splitFields(os.Getenv("LCA_ENDPOINTS")) {
-		cfg.Endpoints = appendUnique(cfg.Endpoints, strings.TrimRight(e, "/"))
+// fileSourceOf names which of the three file layers a path belongs to, so
+// /config's explanation of a shadowed value points at the right file.
+func fileSourceOf(c Config, path string) Source {
+	switch {
+	case path == "":
+		return SrcUserFile
+	case path == os.Getenv("LCA_CONFIG"):
+		return SrcExtraFile
+	case strings.HasPrefix(path, filepath.Join(c.Root, ".lca")):
+		return SrcProjectFile
 	}
-	return cfg
+	return SrcUserFile
+}
+
+// applyEnvConfig is the override layer. It uses os.LookupEnv and not env(): a
+// file value must be beaten only when the variable is ACTUALLY present and
+// non-empty, which is the whole of "env is an override".
+//
+// Env stays above the files deliberately. Demoting it means it stops being
+// REQUIRED, not that it loses: flipping the order would silently break every
+// existing `export LCA_BASE_URL` the moment a .lca/config.json appeared, and
+// would make a checked-in project file un-overridable in CI. The honesty is paid
+// for in /config, which prints the shadowed file value with its path, and in
+// /set, which warns at the moment it matters.
+func applyEnvConfig(c *Config, srcs map[string]settingSource) {
+	for _, s := range settings {
+		if s.Env == "" || s.Kind == kLocator {
+			continue
+		}
+		v, ok := os.LookupEnv(s.Env)
+		if !ok || v == "" {
+			continue
+		}
+		if s.Kind == kBool {
+			// LCA_SHOW_THINKING and LCA_LOOP have always been "set = on", and a
+			// shell that exports them as 1 or true must keep meaning the same.
+			if _, named := parseBool(v); !named {
+				v = "on"
+			}
+		}
+		if err := applySetting(c, s.Key, v); err != nil {
+			warnLine("%s: %v", s.Env, err)
+			continue
+		}
+		mark(srcs, s.Key, SrcEnv, s.Env)
+	}
+	// Settings with no row of their own: debugging switches and Slurm discovery,
+	// which nothing persists because they describe one run.
+	c.Raw = os.Getenv("LCA_RAW") != ""
+	c.Discover = os.Getenv("LCA_DISCOVER") != ""
+	c.Reservation = os.Getenv("LCA_RESERVATION")
+	c.DiscoverUser = os.Getenv("LCA_USER")
+	c.Scheme = env("LCA_SCHEME", c.Scheme)
+	c.Unsafe = os.Getenv("LCA_UNSAFE") != ""
+	c.KeepSessions = atoiDefault(os.Getenv("LCA_KEEP_SESSIONS"), c.KeepSessions)
+}
+
+// endpointList is the known endpoints: the current BaseURL first, then the rest,
+// deduped and trailing-slash-trimmed.
+func endpointList(c Config) []string {
+	out := []string{c.BaseURL}
+	for _, e := range c.Endpoints {
+		out = appendUnique(out, strings.TrimRight(e, "/"))
+	}
+	return out
+}
+
+func mark(srcs map[string]settingSource, key string, src Source, path string) {
+	if srcs != nil {
+		srcs[key] = settingSource{Src: src, Path: path}
+	}
 }
 
 func appendUnique(xs []string, v string) []string {

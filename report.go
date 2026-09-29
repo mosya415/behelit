@@ -986,7 +986,15 @@ func (r *report) wall() time.Duration {
 
 // ── the command ─────────────────────────────────────────────────────────────
 
+// runReport is the shell form, and its stdout is the path and nothing else, so
+// `lca report | xargs open` keeps working. The in-session form wants the opposite
+// — a named, relative path with the program's own glyph — so the one line that
+// differs is a callback and the rest is shared. See cmdReport.
 func runReport(cfg Config, args []string) int {
+	return reportRun(cfg, args, func(dst string) { fmt.Println(dst) })
+}
+
+func reportRun(cfg Config, args []string, wrote func(string)) int {
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	out := fs.String("out", "", "write the HTML here (default: next to the trace)")
 	openIt := fs.Bool("open", false, "open the finished report with the desktop's own opener")
@@ -1022,9 +1030,9 @@ func runReport(cfg Config, args []string) int {
 		fmt.Fprintln(os.Stderr, "report:", err)
 		return 1
 	}
-	// stdout carries the path and nothing else, so `lca report | xargs open`
-	// works; everything the reader might want to know goes to stderr.
-	fmt.Println(dst)
+	// Everything the reader might want to know goes to stderr; only the caller's
+	// own line names the file.
+	wrote(dst)
 	for _, s := range rep.Sources {
 		if s.Err != "" {
 			fmt.Fprintln(os.Stderr, warn("skipped %s: %s", shortDir(s.Path), s.Err))

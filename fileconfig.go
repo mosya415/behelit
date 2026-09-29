@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -32,11 +33,22 @@ import (
 type FileConfig struct {
 	Model         string                    `json:"model"`
 	Thinking      string                    `json:"thinking"`
+	APIKeyEnv     string                    `json:"api_key_env"` // the NAME of the variable holding the key
 	SubagentDepth int                       `json:"subagent_depth"`
 	Providers     map[string]ProviderConfig `json:"providers"`
 	Agents        map[string]AgentConfig    `json:"agents"`
 	Permission    PermissionConfig          `json:"permission"`
 	Sources       []string                  `json:"-"`
+
+	// The scalars are carried as the TEXT that was in the file, keyed by JSON
+	// name, and validated once by applySetting (settings.go) — the same code /set
+	// and the env layer go through, so a file cannot smuggle in a value a command
+	// would have refused. A typed struct would need every setting spelled twice,
+	// and absent would be indistinguishable from zero.
+	Raw map[string]string `json:"-"`
+	// Which file last set each key, so /config can name the file instead of
+	// saying "a config file". Filled as loadFileConfig merges.
+	From map[string]string `json:"-"`
 }
 
 type ProviderConfig struct {
@@ -195,6 +207,7 @@ func loadFileConfig(cfg Config) (*FileConfig, error) {
 	if p := os.Getenv("LCA_CONFIG"); p != "" {
 		paths = append(paths, p)
 	}
+	out.Raw, out.From = map[string]string{}, map[string]string{}
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -204,12 +217,34 @@ func loadFileConfig(cfg Config) (*FileConfig, error) {
 		if err := json.Unmarshal(data, &fc); err != nil {
 			return nil, fmt.Errorf("%s: %w", p, err)
 		}
+		// Decoded twice on purpose: once into the struct for the blocks, once into
+		// raw keys to learn which scalars were PRESENT. Absent and zero must not be
+		// confused — "max_tokens": 0 is an operator saying "let the server decide",
+		// and a missing key is them saying nothing.
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(data, &keys); err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		for k, raw := range keys {
+			s := findSetting(k)
+			if s == nil || s.JSON != k {
+				continue // a block (providers, agents, permission) or a key we do not own
+			}
+			txt, err := scalarText(raw)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %s: %w", p, k, err)
+			}
+			out.Raw[k], out.From[k] = txt, p
+		}
 		out.Sources = append(out.Sources, p)
 		if fc.Model != "" {
 			out.Model = fc.Model
 		}
 		if fc.Thinking != "" {
 			out.Thinking = fc.Thinking
+		}
+		if fc.APIKeyEnv != "" {
+			out.APIKeyEnv = fc.APIKeyEnv
 		}
 		if fc.SubagentDepth > 0 {
 			out.SubagentDepth = fc.SubagentDepth
@@ -223,4 +258,39 @@ func loadFileConfig(cfg Config) (*FileConfig, error) {
 		out.Permission = append(out.Permission, fc.Permission...)
 	}
 	return out, nil
+}
+
+// scalarText renders one config.json value as the text applySetting takes: a
+// string as itself, a number and a bool in their own spelling, and a list as the
+// comma form the env variables already use. Anything else is a file the operator
+// meant differently, and saying so beats guessing.
+func scalarText(raw json.RawMessage) (string, error) {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", err
+	}
+	switch t := v.(type) {
+	case string:
+		return t, nil
+	case bool:
+		if t {
+			return "on", nil
+		}
+		return "off", nil
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64), nil
+	case []any:
+		var parts []string
+		for _, e := range t {
+			s, ok := e.(string)
+			if !ok {
+				return "", fmt.Errorf("a list of names, got %v", e)
+			}
+			parts = append(parts, s)
+		}
+		return strings.Join(parts, ","), nil
+	case nil:
+		return "", nil
+	}
+	return "", fmt.Errorf("expected a name, a number, a flag or a list")
 }

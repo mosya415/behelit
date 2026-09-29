@@ -54,6 +54,9 @@ type fakeServer struct {
 	requests []fakeRequest
 	respond  func(req fakeRequest, n int) fakeReply
 	models   []string // served by GET /models (nil → any model name accepted as listed)
+	// windows lets /models report max_model_len per id. Window provenance —
+	// "262k (server)" versus "200k (card)" — cannot be tested at all without it.
+	windows map[string]int
 }
 
 func newFakeServer(t *testing.T, respond func(req fakeRequest, n int) fakeReply) *fakeServer {
@@ -62,7 +65,11 @@ func newFakeServer(t *testing.T, respond func(req fakeRequest, n int) fakeReply)
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			var data []map[string]any
 			for _, m := range fs.models {
-				data = append(data, map[string]any{"id": m, "object": "model"})
+				row := map[string]any{"id": m, "object": "model"}
+				if n := fs.windows[m]; n > 0 {
+					row["max_model_len"] = n
+				}
+				data = append(data, row)
 			}
 			json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 			return

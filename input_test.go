@@ -92,3 +92,78 @@ func TestApprovalIgnoresTypeAhead(t *testing.T) {
 		t.Fatalf("the buffered input was eaten: %q", got)
 	}
 }
+
+// The wizard's fields used to be the REPL's own editor, so the gateway url and —
+// on the plaintext path — the api key landed in the ↑ history of the prompt that
+// opens right afterwards, one keystroke from being sent to the model as a message.
+// The fences and the status line belong to the REPL prompt too, not under a
+// one-field question inside a 76-column section.
+//
+// render, submit and remember are exercised directly: ReadLine's drawing lives on
+// the raw path, and makeRaw needs a real terminal, which `go test` has not got.
+func TestLineEditorFieldModeForgetsAndStaysBare(t *testing.T) {
+	field := NewLineEditor(newStringInput(""))
+	field.bare, field.noHistory, field.secret = true, true, true
+	field.status = func() string { return "THE STATUS LINE" }
+	const secret = "sk-a-real-looking-key"
+
+	field.remember(secret)
+	if len(field.history) != 0 {
+		t.Errorf("a forgetful field must not be remembered: %v", field.history)
+	}
+	out := captureStdout(t, func() { field.render("  › api key ", []rune(secret), len(secret)) })
+	if strings.Contains(out, secret) {
+		t.Errorf("a secret field echoed the key while it was typed:\n%q", out)
+	}
+	if !strings.Contains(out, "•") {
+		t.Errorf("a secret field must show its width:\n%q", out)
+	}
+	if strings.Contains(out, "THE STATUS LINE") {
+		t.Errorf("a bare field must not draw the REPL status line:\n%q", out)
+	}
+	out = captureStdout(t, func() { field.submit("  › api key ", []rune(secret)) })
+	if strings.Contains(out, secret) {
+		t.Errorf("a secret field echoed the key on submit:\n%q", out)
+	}
+	if strings.Contains(out, "───") {
+		t.Errorf("a bare field must not draw a full-width fence:\n%q", out)
+	}
+	if got := field.suggest("/mo"); got != nil {
+		t.Errorf("a bare field completed a command: %v", got)
+	}
+
+	// The ordinary prompt is unchanged: it remembers, it completes commands, and it
+	// draws its band and hairline.
+	plain := NewLineEditor(newStringInput(""))
+	plain.remember("hello")
+	plain.remember("hello") // the same line twice is one entry, as before
+	if len(plain.history) != 1 || plain.history[0] != "hello" {
+		t.Errorf("the REPL prompt must still keep its history: %v", plain.history)
+	}
+	if got := plain.suggest("/mo"); len(got) == 0 {
+		t.Error("the REPL prompt must still complete commands")
+	}
+	out = captureStdout(t, func() { plain.submit(" › ", []rune("hello")) })
+	if !strings.Contains(out, "hello") || !strings.Contains(out, "───") {
+		t.Errorf("the REPL prompt must still draw its band and hairline:\n%q", out)
+	}
+}
+
+// askSecret is the only reader the api-key field may use.
+func TestAskSecretDoesNotEcho(t *testing.T) {
+	in := scriptedTTY("sk-do-not-show-me\n")
+	var got string
+	out := captureStdout(t, func() {
+		var err error
+		got, err = askSecret(in, "api key ")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got != "sk-do-not-show-me" {
+		t.Fatalf("askSecret read %q", got)
+	}
+	if strings.Contains(out, "sk-do-not-show-me") {
+		t.Errorf("askSecret echoed the key:\n%q", out)
+	}
+}

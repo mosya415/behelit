@@ -605,7 +605,7 @@ func TestEvalEndToEnd(t *testing.T) {
 	stdout := os.Stdout
 	devnull, _ := os.Open(os.DevNull)
 	os.Stdout = devnull
-	code := runEval(cfg, []string{"-out", out, filepath.Join(tasks)})
+	code := runEval(context.Background(), cfg, []string{"-out", out, filepath.Join(tasks)})
 	os.Stdout = stdout
 	if code != 1 {
 		t.Fatalf("one task passes and one fails → exit 1, got %d", code)
@@ -856,7 +856,7 @@ func TestEvalTransportComparison(t *testing.T) {
 	stdout := os.Stdout
 	devnull, _ := os.Open(os.DevNull)
 	os.Stdout = devnull
-	code := runEval(cfg, []string{"-transport", "native,text", "-out", out, tasks})
+	code := runEval(context.Background(), cfg, []string{"-transport", "native,text", "-out", out, tasks})
 	os.Stdout = stdout
 	data, _ := os.ReadFile(filepath.Join(out, "results.jsonl"))
 	if code != 0 {
@@ -924,17 +924,17 @@ func TestDoctorFindsBrokenToolParser(t *testing.T) {
 	cfg := Config{Root: root, Dir: t.TempDir(), BaseURL: fs.URL, Allowed: []string{"ls"}}
 	gw := NewClient(cfg)
 	rc, _ := loadRoles(cfg)
-	if r := probeModel(cfg, gw, rc, "lead", "lead-a"); r.status != "ok" {
+	if r := probeModel(context.Background(), cfg, gw, rc, "lead", "lead-a"); r.status != "ok" {
 		t.Fatalf("lead-a: %+v", r)
 	}
-	r := probeModel(cfg, gw, rc, "coder", "coder-a")
+	r := probeModel(context.Background(), cfg, gw, rc, "coder", "coder-a")
 	if r.status != "fail" || !strings.Contains(r.fix, "tool-call-parser") {
 		t.Fatalf("coder-a should be diagnosed as a missing tool parser: %+v", r)
 	}
 	stdout := os.Stdout
 	devnull, _ := os.Open(os.DevNull)
 	os.Stdout = devnull
-	code := runDoctor(cfg, nil)
+	code := runDoctor(context.Background(), cfg, nil)
 	os.Stdout = stdout
 	if code != 1 {
 		t.Fatalf("doctor should fail on a broken model, exit %d", code)
@@ -1329,7 +1329,7 @@ func TestReviewSameFamilyWarns(t *testing.T) {
 	if strings.Contains(strings.Join(rc2.Warnings, "\n"), "same family") {
 		t.Fatalf("a cross-family reviewer must not warn: %v", rc2.Warnings)
 	}
-	out := captureStdout(t, func() { runDoctor(sameCfg, []string{"-no-probe"}) })
+	out := captureStdout(t, func() { runDoctor(context.Background(), sameCfg, []string{"-no-probe"}) })
 	if !strings.Contains(out, "same family") {
 		t.Fatalf("doctor must print the load warnings:\n%s", out)
 	}
@@ -2156,7 +2156,7 @@ func TestDoctorShowsTier(t *testing.T) {
 	t.Setenv("LCA_ROLES", "")
 	t.Setenv("LCA_TIER", "cheap")
 	cfg := Config{Root: root, Dir: t.TempDir(), BaseURL: fs.URL, Allowed: []string{"ls"}, Tier: os.Getenv("LCA_TIER")}
-	out := captureStdout(t, func() { runDoctor(cfg, []string{"-no-probe"}) })
+	out := captureStdout(t, func() { runDoctor(context.Background(), cfg, []string{"-no-probe"}) })
 	plain := stripANSI(out)
 	if !strings.Contains(plain, "cheap (active for every role that declares one)") {
 		t.Fatalf("doctor must say which tier is active:\n%s", plain)
@@ -2172,7 +2172,7 @@ func TestDoctorShowsTier(t *testing.T) {
 		t.Setenv("LCA_TIER", "")
 		flagged := cfg
 		flagged.Tier = ""
-		out := captureStdout(t, func() { runDoctor(flagged, []string{"-no-probe", "-tier", "cheap"}) })
+		out := captureStdout(t, func() { runDoctor(context.Background(), flagged, []string{"-no-probe", "-tier", "cheap"}) })
 		if !strings.Contains(stripANSI(out), "cheap (active for every role that declares one)") {
 			t.Fatalf("lca doctor -tier cheap:\n%s", stripANSI(out))
 		}
@@ -2244,7 +2244,9 @@ func TestEvalTierComparison(t *testing.T) {
 		Temperature: 0.2, MaxSteps: 10, SubagentMax: 1, KeepSessions: 10}
 
 	code := 0
-	printed := captureStdout(t, func() { code = runEval(cfg, []string{"-tier", "cheap,premium", "-out", out, tasks}) })
+	printed := captureStdout(t, func() {
+		code = runEval(context.Background(), cfg, []string{"-tier", "cheap,premium", "-out", out, tasks})
+	})
 	if code != 1 {
 		t.Fatalf("the cheap tier fails the task, so the matrix is not green: exit %d", code)
 	}
@@ -2275,7 +2277,7 @@ func TestEvalTierComparison(t *testing.T) {
 		before := len(fs.reqs())
 		code := 0
 		msg := captureStdout(t, func() {
-			code = runEval(cfg, []string{"-tier", "nosuch", "-out", filepath.Join(t.TempDir(), "o"), tasks})
+			code = runEval(context.Background(), cfg, []string{"-tier", "nosuch", "-out", filepath.Join(t.TempDir(), "o"), tasks})
 		})
 		if code != 2 {
 			t.Fatalf("exit %d (%s)", code, msg)
@@ -2672,5 +2674,338 @@ func TestStatusWordCoversReviewVerdicts(t *testing.T) {
 		if got := statusWord(word); !strings.Contains(got, glyph) {
 			t.Fatalf("%s must not read as %q", word, stripANSI(got))
 		}
+	}
+}
+
+// ── the shell subcommands, reached from inside the session ──────────────────
+
+// The slash twins must call the same entry points the subcommands do, and must
+// not leave the terminal in turn mode on the way out.
+func TestSlashDoctorReportEvalParity(t *testing.T) {
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		if strings.Contains(req.Body, `"role":"tool"`) {
+			return fakeReply{content: "fixed"}
+		}
+		return fakeReply{calls: []ToolCall{call("w", "write", map[string]any{"path": "answer.txt", "content": "42\n"})}}
+	})
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, testRoles, true)
+	in := newStringInput("a typed line\n")
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local, in: in}
+
+	slash := captureStdout(t, func() {
+		if r.cmdDoctor("-no-probe") {
+			t.Error("/doctor must not ask for a model turn")
+		}
+	})
+	direct := captureStdout(t, func() { runDoctor(context.Background(), h.orch.cfg, []string{"-no-probe"}) })
+	for _, title := range []string{"GATEWAY", "ROLES", "WORKSPACE"} {
+		if !strings.Contains(stripANSI(slash), title) || !strings.Contains(stripANSI(direct), title) {
+			t.Errorf("/doctor and lca doctor disagree about the %s section", title)
+		}
+	}
+
+	h.orch.rec.Event("user", map[string]any{"text": "hi"})
+	rep := captureStdout(t, func() {
+		if r.cmdReport("") {
+			t.Error("/report must not ask for a model turn")
+		}
+	})
+	// In-session, /report names its file the way every other in-session write does:
+	// "● wrote <path>", relative to the root, with -open mentioned. The shell form
+	// still prints the bare absolute path and nothing else, which is what
+	// `lca report | xargs open` needs — that is asserted separately below.
+	var html string
+	for _, line := range strings.Split(stripANSI(rep), "\n") {
+		if f := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "● wrote ")); strings.HasSuffix(f, ".html") {
+			html = f
+		}
+	}
+	if html == "" || !strings.Contains(stripANSI(rep), "wrote ") {
+		t.Fatalf("/report must name the file it wrote:\n%s", stripANSI(rep))
+	}
+	if !strings.Contains(stripANSI(rep), "-open") {
+		t.Errorf("/report must mention -open:\n%s", stripANSI(rep))
+	}
+	// prettyPath shortens to "~/…" outside the root, which is the program's
+	// convention everywhere; put it back to look at the file.
+	if home, _ := os.UserHomeDir(); strings.HasPrefix(html, "~/") && home != "" {
+		html = filepath.Join(home, html[2:])
+	} else if !filepath.IsAbs(html) {
+		html = filepath.Join(h.orch.jl.Root, html)
+	}
+	if _, err := os.Stat(html); err != nil {
+		t.Fatalf("/report named a file that is not there: %v", err)
+	}
+	// The shell form's stdout is the path alone.
+	shell := captureStdout(t, func() { runReport(h.orch.cfg, []string{h.orch.tracer.Path}) })
+	if got := strings.TrimSpace(stripANSI(shell)); !strings.HasSuffix(got, ".html") || strings.Contains(got, "wrote") {
+		t.Errorf("lca report must print the bare path: %q", got)
+	}
+
+	tasks := filepath.Join(t.TempDir(), "tasks")
+	os.MkdirAll(filepath.Join(tasks, "answer", "fixture"), 0o755)
+	os.WriteFile(filepath.Join(tasks, "answer", "fixture", "README"), []byte("puzzle\n"), 0o644)
+	os.WriteFile(filepath.Join(tasks, "answer", "task.yaml"),
+		[]byte("prompt: |\n  Write the answer to answer.txt\ncheck_cmd: cat answer.txt\nrole: coder\nrepo: fixture\n"), 0o644)
+	ev := captureStdout(t, func() {
+		if r.cmdEval("-out " + filepath.Join(t.TempDir(), "out") + " " + tasks) {
+			t.Error("/eval must not ask for a model turn")
+		}
+	})
+	if !strings.Contains(stripANSI(ev), "1/1") {
+		t.Errorf("/eval did not run the fixture task:\n%s", stripANSI(ev))
+	}
+
+	// The terminal is not in turn mode: what was typed is still readable.
+	if got, err := in.ReadString('\n'); err != nil || got != "a typed line\n" {
+		t.Fatalf("after three in-session commands the input reads %q, %v", got, err)
+	}
+}
+
+// Cancellation is at loop boundaries and the screen says so: a probe already in
+// flight finishes, the next one does not start. Called directly, because
+// watchInterrupt is a no-op when s.TTY is false.
+func TestLongCommandStopsOnCancelledContext(t *testing.T) {
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		return fakeReply{calls: []ToolCall{call("p", "ping", map[string]any{"value": "ok"})}}
+	})
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, testRoles, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	before := len(fs.reqs())
+	out := captureStdout(t, func() { runDoctor(ctx, h.orch.cfg, []string{"-all"}) })
+	if n := len(fs.reqs()) - before; n > 1 {
+		t.Errorf("a cancelled doctor made %d model calls, want at most 1", n)
+	}
+	if !strings.Contains(stripANSI(out), "interrupted") {
+		t.Errorf("the interruption must be on screen:\n%s", stripANSI(out))
+	}
+
+	tasks := filepath.Join(t.TempDir(), "tasks")
+	os.MkdirAll(filepath.Join(tasks, "answer", "fixture"), 0o755)
+	os.WriteFile(filepath.Join(tasks, "answer", "fixture", "README"), []byte("puzzle\n"), 0o644)
+	os.WriteFile(filepath.Join(tasks, "answer", "task.yaml"),
+		[]byte("prompt: |\n  Write it\ncheck_cmd: cat answer.txt\nrole: coder\nrepo: fixture\n"), 0o644)
+	before = len(fs.reqs())
+	out = captureStdout(t, func() { runEval(ctx, h.orch.cfg, []string{"-out", filepath.Join(t.TempDir(), "o"), tasks}) })
+	if n := len(fs.reqs()) - before; n > 0 {
+		t.Errorf("a cancelled eval ran %d requests' worth of task", n)
+	}
+	if !strings.Contains(stripANSI(out), "interrupted") {
+		t.Errorf("eval must still write its summary and say it was interrupted:\n%s", stripANSI(out))
+	}
+}
+
+// Inside a session, "the report" means the conversation you are in — not the
+// newest file on disk.
+func TestReportDefaultsToThisSessionsTrace(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, testRoles, false)
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local, in: newStringInput("")}
+	h.orch.rec.Event("user", map[string]any{"text": "hi"})
+
+	// A newer, unrelated trace where `lca report` with no argument would find it.
+	traces := filepath.Join(h.orch.cfg.stateDir(), "traces")
+	os.MkdirAll(traces, 0o700)
+	other := filepath.Join(traces, "99999999-999999-1.jsonl")
+	os.WriteFile(other, []byte(`{"type":"turn","agent":"someone-else"}`+"\n"), 0o600)
+
+	out := captureStdout(t, func() { r.cmdReport("") })
+	if !strings.Contains(stripANSI(out), strings.TrimSuffix(filepath.Base(h.orch.tracer.Path), ".jsonl")) {
+		t.Errorf("/report rendered something other than this session's trace (%s):\n%s",
+			h.orch.tracer.Path, stripANSI(out))
+	}
+}
+
+// ── the pickers ─────────────────────────────────────────────────────────────
+
+// The picker only ever supplies a STRING to the branch that already existed, so
+// the typed and the picked forms cannot drift.
+func TestModelPickerAssignsAndRolePickerSaves(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	fs.windows = map[string]int{"lead-b": 123456}
+	h := newRoleHarness(t, fs, testRoles, false)
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local,
+		in: scriptedTTY("\x1b[B\n"), cfgSrc: map[string]settingSource{}}
+
+	captureStdout(t, func() { r.cmdModel("") })
+	if got := h.sess.client.Model(); got != fs.models[1] {
+		t.Fatalf("the picker switched to %q, want the second served model %q", got, fs.models[1])
+	}
+	if got := h.sess.client.CtxLen(); got != 123456 {
+		t.Errorf("relearnCtxLen did not take the window from /v1/models: %d", got)
+	}
+
+	// /role coder model with no value: a multi-select, the chain in ROW order.
+	r.in = scriptedTTY("\x0e" + " " + "\x1b[B" + " " + "\n")
+	captureStdout(t, func() { r.cmdRole("coder model") })
+	coder := h.orch.agents["coder"]
+	if strings.Join(coder.Models, ",") != fs.models[0]+","+fs.models[1] {
+		t.Fatalf("the picked chain is %v, want the first two served ids in row order", coder.Models)
+	}
+	captureStdout(t, func() { r.cmdAgent("coder") })
+	if h.sess.client.Model() != coder.Models[0] {
+		t.Errorf("the session did not follow the coder's new chain: %s", h.sess.client.Model())
+	}
+	captureStdout(t, func() { r.cmdRole("save") })
+	rc, err := loadRoles(Config{Root: h.root, Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("the saved roles.yaml does not load: %v", err)
+	}
+	for _, a := range rc.Roles {
+		if a.Name == "coder" && strings.Join(a.Models, ",") != strings.Join(coder.Models, ",") {
+			t.Fatalf("the picked chain did not round-trip: %v", a.Models)
+		}
+	}
+}
+
+// Off a terminal the old output is the whole answer — scripted `lca <<EOF`
+// sessions drive the REPL today, and an error would break them.
+func TestModelPickerFallsBackWithoutTTY(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, testRoles, false)
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local, in: newStringInput("")}
+	before := h.sess.client.Model()
+
+	out := stripANSI(captureStdout(t, func() { r.cmdModel("") }))
+	for _, want := range []string{"current", "profile", "context"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("/model lost its %s row off a terminal:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "↑↓ move") || strings.Contains(out, "enter confirms") {
+		t.Errorf("/model drew a picker with no terminal:\n%s", out)
+	}
+	if h.sess.client.Model() != before {
+		t.Errorf("/model changed the model with no terminal")
+	}
+
+	out = stripANSI(captureStdout(t, func() { r.cmdRole("coder model") }))
+	if !strings.Contains(out, "usage: /role coder") {
+		t.Errorf("/role coder model must print today's usage line off a terminal:\n%s", out)
+	}
+}
+
+func TestRegistryListsTheNewCommands(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, testRoles, false)
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local, in: newStringInput("")}
+
+	want := []string{"/setup", "/config", "/set", "/save", "/doctor", "/report", "/eval", "/tier"}
+	seen := map[string]int{}
+	for _, c := range replRegistry() {
+		seen[c.name]++
+		if !containsStr(cmdGroups, c.group) {
+			t.Errorf("%s is in group %q, which cmdGroups does not list", c.name, c.group)
+		}
+	}
+	for _, n := range want {
+		if seen[n] != 1 {
+			t.Errorf("%s appears %d times in the registry", n, seen[n])
+		}
+		if findCmd(n) == nil {
+			t.Errorf("%s does not resolve through findCmd", n)
+		}
+	}
+	// /tier is hidden until the team declares tiers, and listed once it does.
+	inMenu := func() bool {
+		for _, c := range r.menu() {
+			if c.name == "/tier" {
+				return true
+			}
+		}
+		return false
+	}
+	if inMenu() {
+		t.Error("/tier is listed by a team with no tiers")
+	}
+	h.orch.roles.Tiers = map[string][]string{"cheap": {"cheap-a"}}
+	h.orch.roles.TierOrder = []string{"cheap"}
+	if !inMenu() {
+		t.Error("/tier is hidden by a team that declares tiers")
+	}
+	help := stripANSI(captureStdout(t, func() { r.cmdHelp("all") }))
+	for _, n := range want {
+		if !strings.Contains(help, n) {
+			t.Errorf("/help all never mentions %s", n)
+		}
+	}
+}
+
+// Ctrl-C during /doctor's tool-call probes is an interrupt, not a broken gateway.
+// Every target is launched before anything is awaited, so the "interrupted" notice
+// in the launch loop was unreachable for a human Ctrl-C, and the cancelled probes
+// were rendered as red failures that set the "problems found" verdict.
+func TestDoctorReportsAnInterruptedProbeAsInterrupted(t *testing.T) {
+	gate := make(chan struct{})
+	defer close(gate) // the handler goroutines are parked on it
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		<-gate // hold every completion open until the test lets go
+		return fakeReply{calls: []ToolCall{call("p", "ping", map[string]any{"value": "ok"})}}
+	})
+	fs.models = allModels()
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, ".lca"), 0o755)
+	os.WriteFile(filepath.Join(root, ".lca", "roles.yaml"), []byte(testRoles), 0o644)
+	t.Setenv("LCA_ROLES", "")
+	cfg := Config{Root: root, Dir: t.TempDir(), BaseURL: fs.URL, Endpoints: []string{fs.URL}, Allowed: []string{"ls"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond) // the probes are in flight by now
+		cancel()
+	}()
+	out := stripANSI(captureStdout(t, func() { runDoctor(ctx, cfg, nil) }))
+	if !strings.Contains(out, "interrupted") {
+		t.Errorf("an interrupted probe run must say so:\n%s", out)
+	}
+	if strings.Contains(out, "context canceled") {
+		t.Errorf("a cancelled probe must not be reported as a transport failure:\n%s", out)
+	}
+	if strings.Contains(out, "problems found") {
+		t.Errorf("Ctrl-C must not flip doctor's verdict:\n%s", out)
+	}
+}
+
+// /role <name> model on a TIERED role: a.Models is the tier's expanded chain, so a
+// bare Enter used to freeze a copy of it and drop `tier:` with no mention. The first
+// row is now a real no-op, and anything else says what it costs.
+func TestRolePickerKeepsATierOnABareEnter(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, tierRoles, false)
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local,
+		in: scriptedTTY("\n"), cfgSrc: map[string]settingSource{}}
+	lead := h.orch.agents["lead"]
+	if lead.Tier == "" {
+		t.Fatal("this fixture must have a tiered lead")
+	}
+	before := strings.Join(lead.Models, ",")
+	out := stripANSI(captureStdout(t, func() { r.cmdRole("lead model") }))
+	if lead.Tier == "" {
+		t.Errorf("Enter dropped the tier:\n%s", out)
+	}
+	if strings.Join(lead.Models, ",") != before {
+		t.Errorf("Enter rewrote the chain: %v", lead.Models)
+	}
+	if !strings.Contains(out, "keeps tier") {
+		t.Errorf("the no-op must say what it did:\n%s", out)
+	}
+
+	// Choosing a model instead replaces the tier — and says so.
+	r.in = scriptedTTY("\x0e" + "\x1b[B" + " " + "\n") // ^n, ↓ onto the first model, space, Enter
+	out = stripANSI(captureStdout(t, func() { r.cmdRole("lead model") }))
+	if lead.Tier != "" {
+		t.Errorf("a hand-picked chain must replace the tier: %q", lead.Tier)
+	}
+	if !strings.Contains(out, "no longer follow tier") {
+		t.Errorf("losing the tier must be said out loud:\n%s", out)
 	}
 }

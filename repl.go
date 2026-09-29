@@ -29,7 +29,39 @@ type Repl struct {
 	in    *Input
 	notes []string
 
+	// Where each effective setting came from, and what this session changed and
+	// has not written. /config reads the first, /save the second, and /exit says
+	// one line about it — see repl_config.go.
+	cfgSrc  map[string]settingSource
+	unsaved map[string]string
+	// applying is set while /set drives one of the typed commands (/model,
+	// /endpoint, /approve, /tier) on its way to writing the file, so noteChange
+	// knows not to advise a /save for something about to be persisted two lines
+	// later. See applyLive.
+	applying bool
+
 	prefill string // /edit: the next prompt starts with this text
+}
+
+// editor is the line editor, made on demand: /setup and the pickers ask for a
+// line before Loop has built one (first-run setup runs before the prompt opens).
+func (r *Repl) editor() *LineEditor {
+	if r.ed == nil {
+		r.ed = NewLineEditor(r.in)
+	}
+	return r.ed
+}
+
+// fieldEditor is a one-field prompt inside a section: the wizard's, and nothing
+// else's. It is NOT r.ed, which Loop wires with the "/" menu, @file completion
+// and the status line — under a wizard field that meant an 80-column fence
+// straddling a 76-column rule, the REPL status line drawn under "gateway url",
+// and every value typed coming back at the next prompt under ↑. A fresh one per
+// field, because a field that remembers is the bug.
+func (r *Repl) fieldEditor() *LineEditor {
+	ed := NewLineEditor(r.in)
+	ed.bare, ed.noHistory = true, true
+	return ed
 }
 
 type replCmd struct {
@@ -54,6 +86,10 @@ func replRegistry() []replCmd {
 		{name: "/compact", desc: "summarize the conversation to free context", group: "session", run: (*Repl).cmdCompact},
 		{name: "/reset", desc: "start over (clears the conversation and change log)", group: "session", run: (*Repl).cmdReset},
 		{name: "/exit", aliases: []string{"/quit"}, desc: "quit", group: "session"},
+		{name: "/setup", args: "[models]", desc: "pick the models and give them roles", group: "session", run: (*Repl).cmdSetup},
+		{name: "/config", args: "[<key>]", desc: "every effective setting and where it comes from", group: "session", run: (*Repl).cmdConfig},
+		{name: "/set", args: "[-user] <key> <value>", desc: "change a setting and keep it in the config file", group: "session", run: (*Repl).cmdSet},
+		{name: "/save", args: "[-user] [<key> …]", desc: "keep this session's settings in the config file", group: "session", run: (*Repl).cmdSave},
 
 		{name: "/agent", args: "[<name>]", desc: "show or switch the primary agent / role", group: "agents", run: (*Repl).cmdAgent},
 		{name: "/agents", desc: "the team: roles and agents", group: "agents", run: (*Repl).cmdAgents},
@@ -74,6 +110,13 @@ func replRegistry() []replCmd {
 		{name: "/undo", desc: "revert the last change", group: "review", run: (*Repl).cmdUndo},
 		{name: "/context", desc: "context size, cache, biggest outputs", group: "review", run: (*Repl).cmdContext},
 		{name: "/stats", desc: "this session: turns, tokens, cache, tool-call failures", group: "review", run: (*Repl).cmdStats},
+		// Short arg strings on purpose: /help pads its name column to the WIDEST
+		// entry, so one 50-character synopsis pushed all twenty-five descriptions
+		// past column 56 and wrapped every one of them at 80. Each command's own
+		// usage line carries the flags.
+		{name: "/doctor", args: "[flags]", desc: "check gateway, roles, tool calls, sandbox, members", group: "review", run: (*Repl).cmdDoctor},
+		{name: "/report", args: "[<id>] [-open]", desc: "render this session's trace as one HTML file", group: "review", run: (*Repl).cmdReport},
+		{name: "/eval", args: "<dir> [flags]", desc: "run evaluation tasks", group: "review", run: (*Repl).cmdEval},
 
 		{name: "/approve", args: "[on|off|run|edit]", desc: "what runs without asking", group: "modes", run: (*Repl).cmdApprove},
 		{name: "/think", args: "[on|off|last]", desc: "show the model's reasoning", group: "modes", run: (*Repl).cmdThink},
@@ -81,6 +124,7 @@ func replRegistry() []replCmd {
 		{name: "/unsafe", args: "[on|off]", desc: "lift the sandbox (any path, any command)", group: "modes", run: (*Repl).cmdUnsafe},
 
 		{name: "/model", args: "[<name>]", desc: "show or switch the model", group: "model", run: (*Repl).cmdModel},
+		{name: "/tier", args: "[<name>]", desc: "show or switch the active model tier", group: "model", show: hasTiers, run: (*Repl).cmdTier},
 		{name: "/providers", desc: "hosted API presets and keys", group: "model", show: notTeam, run: (*Repl).cmdProviders},
 		{name: "/endpoint", aliases: []string{"/ep"}, args: "[<n>|url]", desc: "list or switch endpoints", group: "model", run: (*Repl).cmdEndpoint},
 		{name: "/discover", aliases: []string{"/disc"}, desc: "find models on the Slurm cluster", group: "model", show: notTeam, run: (*Repl).cmdDiscover},
@@ -169,6 +213,7 @@ func (r *Repl) Loop() {
 			name, arg, _ := strings.Cut(line, " ")
 			if c := findCmd(name); c != nil {
 				if c.run == nil { // /exit
+					r.exitNotice()
 					return
 				}
 				if c.run(r, strings.TrimSpace(arg)) {
@@ -352,7 +397,7 @@ func (r *Repl) Banner() {
 	fmt.Println()
 	if !r.teamMode() && o.gatewayModels < 0 {
 		fmt.Println(" " + faint("Type a task to start. /help for commands · @file attaches a file · Ctrl-C interrupts"))
-		fmt.Println(" " + faint("Orchestrating a team through a gateway? lca init creates .lca/roles.yaml"))
+		fmt.Println(" " + faint("/setup picks the models and gives them roles — or lca init from the shell"))
 		return
 	}
 	fmt.Println(" " + faint("Type a task to start. /help for commands · @file attaches a file · Ctrl-C interrupts"))
@@ -393,12 +438,23 @@ func (r *Repl) cmdHelp(arg string) bool {
 			width = max(width, visibleWidth(r[0]))
 		}
 	}
+	// The column is capped: it is padded to the widest synopsis, and one long one
+	// used to wrap every description on the screen. Anything over the cap keeps its
+	// args on a faint continuation line of its own instead of taxing the other
+	// twenty-four commands.
+	width = min(width, 30)
 	for _, g := range cmdGroups {
 		if len(groups[g]) == 0 {
 			continue
 		}
 		fmt.Printf("  %s%s%s\n", cDim, g, cReset)
 		for _, l := range groups[g] {
+			if visibleWidth(l.syn) > width {
+				name, args, _ := strings.Cut(stripANSI(l.syn), " ")
+				fmt.Printf("    %s  %s\n", padTo(name, width, 0), l.desc)
+				fmt.Printf("    %s  %s\n", padTo("", width, 0), faint("%s", args))
+				continue
+			}
 			fmt.Printf("    %s  %s\n", padTo(l.syn, width, 0), l.desc)
 		}
 	}
@@ -789,6 +845,11 @@ func (r *Repl) cmdApprove(arg string) bool {
 	}
 	r.orch.rec.Event("approve_mode", map[string]any{"trusted": ap.TrustedClasses()})
 	okLine("%s", approvalPhrase(ap))
+	// "on" is the command's spelling; "all" is the setting's, and the file has to
+	// hold a value /set would accept.
+	r.cfg.Approve = map[string]string{"on": "all", "write": "edit"}[arg]
+	r.cfg.Approve = firstNonEmpty(r.cfg.Approve, arg)
+	r.noteChange("approve", "/approve")
 	return false
 }
 
@@ -828,6 +889,8 @@ func (r *Repl) cmdThink(arg string) bool {
 	} else {
 		okLine("reasoning collapses to a one-line status")
 	}
+	r.cfg.ShowThinking = v
+	r.noteChange("show_thinking", "/think")
 	return false
 }
 
@@ -844,6 +907,8 @@ func (r *Repl) cmdLoop(arg string) bool {
 	} else {
 		okLine("loop off")
 	}
+	r.cfg.Loop = v
+	r.noteChange("loop", "/loop")
 	return false
 }
 
@@ -936,7 +1001,28 @@ func (r *Repl) cmdModel(arg string) bool {
 				}
 			}
 		}
-		return false
+		// The report survives and the menu comes AFTER it: it is the most useful
+		// screen in the program, and replacing it with a picker would lose the
+		// window, sampling and replay provenance above. Off a terminal the report
+		// and its hint are the whole answer, byte for byte.
+		if !r.in.IsTTY() {
+			return false
+		}
+		served, err := local.ListModels()
+		if err != nil || len(served) == 0 {
+			return false
+		}
+		var cs []choice
+		for _, m := range served {
+			cs = append(cs, modelChoice(m, m.ID == s.client.Model()))
+		}
+		i, perr := pickOne(r.in, cs, pickOpts{title: "model", detail: faint("%d served at %s · enter keeps the current one", len(cs), hostOf(local.Endpoint()))})
+		if perr != nil || i < 0 || cs[i].id == s.client.Model() {
+			return false
+		}
+		// Straight into the branch that already exists: no second implementation,
+		// so the typed and the picked forms cannot drift.
+		return r.cmdModel(cs[i].id)
 	}
 
 	prev := s.client.Model()
@@ -961,6 +1047,8 @@ func (r *Repl) cmdModel(arg string) bool {
 	s.RefreshSystem()
 	r.orch.rec.Event("model_change", map[string]any{"from": prev, "to": arg})
 	okLine("model %s %s", faint("%s →", prev), arg)
+	r.cfg.Model = arg
+	r.noteChange("model", "/model")
 	return false
 }
 
@@ -996,7 +1084,26 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 		}
 		table(nil, rows)
 		hint("/endpoint <n|url> switches")
-		return false
+		// A one-row picker under a one-row table cannot change anything, so it is
+		// two screens of chrome asking a question with one answer.
+		if len(eps) < 2 {
+			hint("/set endpoints <url>,<url> adds more · /set endpoint <url> moves this one")
+			return false
+		}
+		if !r.in.IsTTY() {
+			return false
+		}
+		var cs []choice
+		for i, e := range eps {
+			// A down endpoint is selectable on purpose: switching to a gateway that
+			// is starting is a thing people do.
+			cs = append(cs, choice{id: e, label: e, detail: probes[i].glyph() + " " + probes[i].detail(e == client.Endpoint(), client.Model()), on: e == client.Endpoint()})
+		}
+		i, perr := pickOne(r.in, cs, pickOpts{title: "endpoint", detail: faint("enter keeps the current one")})
+		if perr != nil || i < 0 || cs[i].id == client.Endpoint() {
+			return false
+		}
+		return r.cmdEndpoint(cs[i].id)
 	}
 	target := arg
 	if n, err := strconv.Atoi(arg); err == nil {
@@ -1014,6 +1121,8 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 	s.RefreshSystem()
 	r.orch.rec.Event("endpoint_change", map[string]any{"from": prev, "to": client.Endpoint()})
 	okLine("endpoint %s", client.Endpoint())
+	r.cfg.BaseURL = client.Endpoint()
+	r.noteChange("endpoint", "/endpoint")
 	if m := client.EndpointModel(client.Endpoint()); m != "" && m != client.Model() {
 		client.SetModel(m)
 		row("model", m)

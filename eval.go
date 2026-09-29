@@ -86,7 +86,9 @@ type EvalResult struct {
 	Error             string   `json:"error,omitempty"`
 }
 
-func runEval(cfg Config, args []string) int {
+// runEval takes a ctx for the same reason doctor does: a matrix of tasks is
+// minutes of gateway time, and Ctrl-C must stop the next task from starting.
+func runEval(ctx context.Context, cfg Config, args []string) int {
 	fset := flag.NewFlagSet("eval", flag.ContinueOnError)
 	out := fset.String("out", "", "output directory (default $LCA_DIR/eval/<timestamp>)")
 	role := fset.String("role", "", "role for every task (overrides the task's)")
@@ -124,7 +126,10 @@ func runEval(cfg Config, args []string) int {
 		}
 	}
 	if len(tasks) == 0 {
-		fmt.Fprintln(os.Stderr, "eval: no tasks found")
+		// Styled like every other refusal in the program: a naked lowercase line in the
+		// middle of a session reads as output from something else.
+		errLine("eval: no tasks found")
+		hint("a task is a directory holding task.md (or task.yaml) with a prompt and a check — README has the format")
 		return 2
 	}
 	if *out == "" {
@@ -199,10 +204,16 @@ func runEval(cfg Config, args []string) int {
 	}
 	section("eval", faint("%s", what))
 	passed, total := 0, 0
+	interrupted := false
+	planned := len(tiers) * len(modes) * len(tasks)
 	var all []EvalResult
 	for _, tier := range tiers {
 		for _, mode := range modes {
 			for _, t := range tasks {
+				if ctx.Err() != nil {
+					interrupted = true
+					break
+				}
 				if *role != "" {
 					t.Role = *role
 				}
@@ -273,7 +284,10 @@ func runEval(cfg Config, args []string) int {
 		printVariantComparison("tiers", "tier", tiers, all, func(r EvalResult) string { return r.Tier })
 	}
 	fmt.Println()
-	if passed == total {
+	if interrupted {
+		warnLine("interrupted after %d of %d — a task already running finished, the next did not start", total, planned)
+	}
+	if passed == total && !interrupted {
 		okLine("%d/%d passed", passed, total)
 	} else {
 		errLine("%d/%d passed", passed, total)

@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -56,16 +54,31 @@ func (r *Repl) cmdRole(arg string) bool {
 	if len(fields) == 1 {
 		return r.showRole(a)
 	}
-	if len(fields) < 3 && fields[1] != "use" {
+	if len(fields) < 2 || (len(fields) < 3 && fields[1] != "use" && !r.canOfferRoleValue(fields[1])) {
 		errLine("usage: /role %s <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value>", name)
 		return false
 	}
 	key, value := fields[1], strings.TrimSpace(strings.Join(fields[2:], " "))
 	value = strings.Trim(value, "\"'")
+	if value == "" {
+		// No value given: offer the same choices by hand rather than making the
+		// operator type ids. Off a terminal this falls through to the usage line
+		// the command has always printed.
+		v, ok := r.offerRoleValue(a, key)
+		if !ok {
+			errLine("usage: /role %s <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value>", name)
+			return false
+		}
+		value = v
+	}
 	switch key {
 	case "use":
 		return r.cmdAgent(name)
 	case "model", "models":
+		if t, ok := strings.CutPrefix(value, keepTierID); ok {
+			okLine("%s keeps tier %s", name, t)
+			return false
+		}
 		var models []string
 		for _, m := range strings.FieldsFunc(value, func(c rune) bool { return c == ',' || c == ' ' }) {
 			if m = strings.TrimSpace(m); m != "" {
@@ -169,8 +182,8 @@ func (r *Repl) cmdRole(arg string) bool {
 			errLine("%s has no model of its own — /role %s model <name[,fallback]> first", value, value)
 			return false
 		}
-		if sameFamily(a, rev) {
-			warnLine("%s and %s are the same family — a same-family second opinion shares the blind spots", a.Models[0], rev.Models[0])
+		if w := sameFamilyWarning(firstOf(a.Models), firstOf(rev.Models)); w != "" {
+			warnLine("%s", w)
 		}
 		a.Review = value
 	case "tools":
@@ -216,7 +229,7 @@ func (r *Repl) showRoles() bool {
 		}
 	}
 	if len(roles) == 0 {
-		fmt.Println("  " + faint("no roles yet — lca init writes a team, or /role new <name> model <model>"))
+		fmt.Println("  " + faint("no roles yet — /setup builds one, or /role new <name> model <model>"))
 		return false
 	}
 	section("roles")
@@ -283,32 +296,108 @@ func (r *Repl) showRole(a *Agent) bool {
 	return false
 }
 
-// saveRoles writes the current team back to .lca/roles.yaml.
+// saveRoles writes the current team back to .lca/roles.yaml, through the shared
+// writeRoles so /setup and /role save keep one .bak policy and one lock.
 func (r *Repl) saveRoles() bool {
 	o := r.orch
 	if o.roles == nil || len(o.roles.Roles) == 0 {
 		errLine("there is no team to save")
 		return false
 	}
-	path := filepath.Join(o.jl.Root, ".lca", "roles.yaml")
-	if len(o.roles.Sources) > 0 {
-		path = o.roles.Sources[0]
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	path, err := writeRoles(o.jl.Root, o.roles, o.rec)
+	if err != nil {
 		errLine("%v", err)
 		return false
 	}
-	if old, err := os.ReadFile(path); err == nil { // keep the previous version next to it
-		if err := os.WriteFile(path+".bak", old, 0o644); err != nil {
-			warnLine("could not keep a backup: %v", err)
-		}
-	}
-	if err := os.WriteFile(path, []byte(o.roles.YAML()), 0o644); err != nil {
-		errLine("%v", err)
-		return false
-	}
-	o.rec.Event("roles_saved", map[string]any{"path": path})
 	okLine("wrote %s", prettyPath(path, o.jl.Root))
+	return false
+}
+
+// keepTierID marks the picker row that means "change nothing": the id travels
+// back through the same string the typed form takes, so the no-op needs no second
+// return value and no state on the Repl.
+const keepTierID = "@keep-tier:"
+
+// offerRoleValue is the picker behind a bare "/role <name> model" or
+// "/role <name> tier": it produces a STRING for the branch that already exists,
+// so no selection logic is duplicated and the typed form stays authoritative.
+func (r *Repl) offerRoleValue(a *Agent, key string) (string, bool) {
+	if !r.canOfferRoleValue(key) || !r.in.IsTTY() {
+		return "", false
+	}
+	switch key {
+	case "model", "models":
+		served, err := r.local.ListModels()
+		if err != nil || len(served) == 0 {
+			errLine("the gateway lists no models to pick from")
+			return "", false
+		}
+		// seq is the chain's own order. Without it the rows come back in the gateway's
+		// /v1/models order, so merely opening the menu and pressing Enter rewrote the
+		// chain — and for the reviewer, whose first model was chosen precisely for not
+		// being the coder's family, it promoted the coder's family to the front.
+		seq := map[string]int{}
+		for i, m := range a.Models {
+			seq[m] = i + 1
+		}
+		var cs []choice
+		// A tiered role's a.Models is the tier's EXPANDED chain, so a bare Enter used
+		// to freeze a copy of it and drop `tier:` without a word. This row makes Enter
+		// a real no-op, and anything else says what it costs.
+		if a.Tier != "" {
+			cs = append(cs, choice{id: keepTierID + a.Tier, label: "keep tier " + a.Tier,
+				detail: strings.Join(r.orch.roles.Tiers[a.Tier], faint(" → ")), on: true, seq: 1})
+		}
+		for _, m := range served {
+			c := modelChoice(m, a.Tier == "" && seq[m.ID] > 0)
+			if a.Tier == "" {
+				c.seq = seq[m.ID]
+			}
+			cs = append(cs, c)
+		}
+		idx, err := pick(r.in, cs, pickOpts{multi: true, title: "role " + a.Name,
+			detail: faint("its model chain — first is preferred, the rest are fallbacks")})
+		if err != nil || len(idx) == 0 {
+			return "", false
+		}
+		var picked []string
+		for _, i := range idx {
+			if strings.HasPrefix(cs[i].id, keepTierID) {
+				return cs[i].id, true // handed straight back, so Enter changes nothing
+			}
+			picked = append(picked, cs[i].id)
+		}
+		if len(picked) == 0 {
+			return "", false
+		}
+		if a.Tier != "" {
+			warnLine("%s will no longer follow tier %s — a chain of its own replaces it", a.Name, a.Tier)
+		}
+		return strings.Join(picked, ","), true
+	case "tier":
+		o := r.orch
+		if o.roles == nil || len(o.roles.TierOrder) == 0 {
+			errLine("this team has no tiers: block in roles.yaml")
+			return "", false
+		}
+		var cs []choice
+		for _, t := range o.roles.TierOrder {
+			cs = append(cs, choice{id: t, label: t, detail: strings.Join(o.roles.Tiers[t], faint(" → ")), on: t == a.Tier})
+		}
+		i, err := pickOne(r.in, cs, pickOpts{title: "role " + a.Name, detail: faint("which tier's chain it runs")})
+		if err != nil || i < 0 {
+			return "", false
+		}
+		return cs[i].id, true
+	}
+	return "", false
+}
+
+func (r *Repl) canOfferRoleValue(key string) bool {
+	switch key {
+	case "model", "models", "tier":
+		return true
+	}
 	return false
 }
 

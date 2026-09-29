@@ -57,6 +57,17 @@ func NewJail(root string, allowed []string, unsafe bool) (*Jail, error) {
 	return &Jail{Root: real, Allowed: allowed, Unsafe: unsafe, allowed: set}, nil
 }
 
+// SetAllowed swaps the command allowlist in place. In place, and not a fresh
+// NewJail, because every Session holds this *Jail pointer — a replacement would
+// leave every running session policing the old list.
+func (j *Jail) SetAllowed(cmds []string) {
+	set := make(map[string]bool, len(cmds))
+	for _, c := range cmds {
+		set[c] = true
+	}
+	j.Allowed, j.allowed = cmds, set
+}
+
 // Resolve turns a tool-supplied path into an absolute path guaranteed to be
 // inside the jail. It resolves symlinks on the deepest existing ancestor (the
 // target itself may not exist yet, e.g. a new file being written).

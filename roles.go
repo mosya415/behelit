@@ -533,6 +533,17 @@ func (rc *RolesConfig) applyTier(a *Agent) {
 	a.Models = append([]string(nil), rc.Tiers[name]...)
 }
 
+// role is the named role, or nil. /setup's review screen reads the team it is
+// about to write through this, so the screen and the file cannot disagree.
+func (rc *RolesConfig) role(name string) *Agent {
+	for _, a := range rc.Roles {
+		if a.Name == name {
+			return a
+		}
+	}
+	return nil
+}
+
 // tierList names the declared tiers in declaration order.
 func (rc *RolesConfig) tierList() string {
 	if len(rc.TierOrder) == 0 {
@@ -740,7 +751,7 @@ func (rc *RolesConfig) remoteIsItsOwnSpelling() bool {
 // together in a session can be kept.
 func (rc *RolesConfig) YAML() string {
 	var b strings.Builder
-	b.WriteString("# Team for lca. Written by /role save; edit freely.\n\n")
+	b.WriteString("# Team for lca. Written from a session (/setup or /role save); edit freely.\n\n")
 	if rc.Entry != "" {
 		fmt.Fprintf(&b, "entry: %s\n", rc.Entry)
 	}

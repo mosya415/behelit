@@ -7,7 +7,9 @@ import (
 )
 
 // errorHint turns a failure into the next thing to try — the difference
-// between an error message and a usable one.
+// between an error message and a usable one. Every route names the in-session
+// command beside the environment variable: an error that can only be acted on by
+// leaving the program is the same complaint in a different place.
 func errorHint(err error) string {
 	if err == nil {
 		return ""
@@ -17,26 +19,26 @@ func errorHint(err error) string {
 	if errors.As(err, &ae) {
 		switch {
 		case ae.Status == 401 || ae.Status == 403:
-			return "the endpoint rejected the credentials — check the API key (LCA_API_KEY or the provider's key variable)"
+			return "the endpoint rejected the credentials — /set api_key_env <VAR> names the variable holding the key (or export LCA_API_KEY)"
 		case ae.Status == 404 && strings.Contains(msg, "model"):
-			return "that model isn't served here — lca doctor lists what the gateway serves; fix the name in roles.yaml"
+			return "that model isn't served here — /model lists what the gateway serves (lca doctor from the shell); fix the name in roles.yaml"
 		case ae.Status == 404:
-			return "wrong URL? LCA_BASE_URL must include the API base path, e.g. http://node:18080/v1"
+			return "wrong URL? the endpoint must include the API base path — /set endpoint http://node:18080/v1 (or LCA_BASE_URL)"
 		case isContextOverflow(err):
 			return "the conversation no longer fits — /compact summarizes it, /reset starts over"
 		case ae.Status == 400 && (strings.Contains(msg, "tool") || strings.Contains(msg, "auto")):
-			return "the engine refused tool calling — enable its tool-call parser, or set transport: text for this model (lca doctor checks)"
+			return "the engine refused tool calling — enable its tool-call parser, or set transport: text for this model (/doctor checks it)"
 		}
 		return ""
 	}
 	var ne net.Error
 	switch {
 	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "no such host"):
-		return "nothing answers at LCA_BASE_URL — is the gateway up? lca doctor checks the setup"
+		return "nothing answers at that endpoint — is the gateway up? /setup asks for it again, /doctor checks the setup"
 	case errors.As(err, &ne) && ne.Timeout():
-		return "the endpoint timed out — a cold model may still be starting; try again, or lca doctor"
+		return "the endpoint timed out — a cold model may still be starting; try again, or /doctor"
 	case strings.Contains(msg, "no api key"):
-		return "export the provider's key, or use a gateway via LCA_BASE_URL"
+		return "/set api_key_env <VAR> names the variable holding the key, or /setup points lca at a gateway instead"
 	case strings.Contains(msg, "stayed overloaded") || strings.Contains(msg, "came up within"):
 		return "the gateway is saturated or the model can't start — check it with bsk / the ops console, or raise LCA_GW_MAX_WAIT"
 	}

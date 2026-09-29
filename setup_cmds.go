@@ -84,7 +84,8 @@ func runInit(cfg Config, args []string) int {
 	models, err := gw.ListModels()
 	if err != nil {
 		errLine("can't list models at %s: %v", gw.Endpoint(), err)
-		hint("point LCA_BASE_URL at the gateway, e.g. export LCA_BASE_URL=http://node:18080/v1")
+		hint("in a session: lca, then /setup asks for the gateway and shows what it serves")
+		hint("non-interactive: export LCA_BASE_URL=http://node:18080/v1, or put base_url in .lca/config.json")
 		return 1
 	}
 	var names []string
@@ -315,7 +316,11 @@ type probeResult struct {
 	warns       []string
 }
 
-func runDoctor(cfg Config, args []string) int {
+// runDoctor takes a ctx because `lca doctor -all` probes every model in every
+// chain at a three-minute timeout each: Ctrl-C has to stop it for real, not stop
+// WAITING for it. Cancellation is at loop boundaries, and the screen says so —
+// a probe already in flight finishes, the next one does not start.
+func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	noProbe := fs.Bool("no-probe", false, "don't call the models (only list and configuration checks)")
 	all := fs.Bool("all", false, "probe every model in every chain, not just the first of each role")
@@ -359,7 +364,7 @@ func runDoctor(cfg Config, args []string) int {
 		fail("%v", rerr)
 	case len(roles.Roles) == 0:
 		warnLine("no roles.yaml — single-agent mode")
-		hint("lca init writes one from the gateway's models")
+		hint("in a session: /setup picks the models and gives them roles · from the shell: lca init")
 	default:
 		row("files", faint("%s", strings.Join(func() []string {
 			var ps []string
@@ -513,16 +518,37 @@ func runDoctor(cfg Config, args []string) int {
 		results := make([]probeResult, len(targets))
 		var wg sync.WaitGroup
 		fmt.Println("  " + faint("asking each probed model for one tool call…"))
+		started := 0
 		for i, t := range targets {
+			if ctx.Err() != nil {
+				warnLine("interrupted after %d of %d — a probe already in flight finishes, the next does not start", started, len(targets))
+				break
+			}
+			started++
 			wg.Add(1)
 			go func(i int, t target) {
 				defer wg.Done()
-				results[i] = probeModel(cfg, gw, roles, t.role, t.model)
+				results[i] = probeModel(ctx, cfg, gw, roles, t.role, t.model)
 			}(i, t)
 		}
 		wg.Wait()
+		// After the wait, not only in the launch loop: every target is launched before
+		// anything is awaited, so a human Ctrl-C always arrives with started ==
+		// len(targets) and the notice above was unreachable. The cancelled probes then
+		// rendered as red failures and flipped the verdict to "problems found", with no
+		// mention of the interrupt — /eval got this right and doctor did not.
+		if ctx.Err() != nil && started == len(targets) {
+			warnLine("interrupted — the probes below did not finish; nothing here is a verdict on the gateway")
+		}
 		for _, r := range results {
+			if r.status == "" {
+				continue // never started: the run was interrupted before it
+			}
 			label := r.model + faint(" (%s)", r.role)
+			if ctx.Err() != nil && r.status != "ok" && strings.Contains(r.detail, "context canceled") {
+				warnLine("%s  %s", label, faint("interrupted"))
+				continue
+			}
 			switch r.status {
 			case "ok":
 				okLine("%s  %s", label, faint("%s", r.detail))
@@ -563,7 +589,7 @@ func runDoctor(cfg Config, args []string) int {
 		}
 		if remotes > 0 {
 			section("members", faint("%s", plural(remotes, "other machine", "other machines")))
-			reach := probeMembers(context.Background(), orch, names)
+			reach := probeMembers(ctx, orch, names)
 			for _, n := range names {
 				m := orch.member(n)
 				if m.IsLocal() {
@@ -718,7 +744,7 @@ func runDoctor(cfg Config, args []string) int {
 
 // probeModel asks one model for one tool call through the gateway, with the
 // same request shape the agent uses, and reports what came back.
-func probeModel(cfg Config, gw *Client, roles *RolesConfig, role, model string) probeResult {
+func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig, role, model string) probeResult {
 	res := probeResult{model: model, role: role}
 	c := *gw
 	c.model = model
@@ -738,7 +764,7 @@ func probeModel(cfg Config, gw *Client, roles *RolesConfig, role, model string) 
 			effort = r.Thinking
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	req := ChatRequest{Thinking: effort, MaxTokens: 2048,
 		Headers: map[string]string{"x-session-id": "lca-doctor-" + model, "x-root-session-id": "lca-doctor"}}

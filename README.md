@@ -18,7 +18,9 @@ trail come from the process (uid/gid) for free.
 
 ## Contents
 
-- [Quick start](#quick-start) — env vars, commands, endpoints, Slurm discovery
+- [Quick start](#quick-start) — `lca` → `/setup`
+- [Configuration in the session](#configuration-in-the-session--setup-config-set-save) — `/config`, `/set`, `/save`, the `config.json` keys, the API-key rule
+- [Non-interactive: CI, scripts and containers](#non-interactive-ci-scripts-and-containers) · [Environment variables](#environment-an-override-one-run-at-a-time)
 - [Models & providers](#models--providers--providersgo-modelsgo-chatgo) — presets, per-family profiles, the JSON config
 - [The team — `roles.yaml`](#the-team--rolesyaml-rolesgo-delegatego-verifygo) — roles, [delegation and the verifier](#delegation-and-the-verifier--delegaterole-task-check_cmd), [cross-family review](#cross-family-review), [`fork:`](#fork-true--inherit-the-reads-not-the-transcript), [tiers](#tiers-develop-on-premium-operate-on-cheap), `/role`
 - [Through the gateway](#through-the-gateway--gwpolicygo-chatgo) — the cacheable prefix, [failure policy](#gateway-failure-policy), transports, per-model settings
@@ -35,17 +37,41 @@ trail come from the process (uid/gid) for free.
 
 ```sh
 go build -o lca .
+./lca            # a session opens; type /setup
+```
 
-# a team of open models through the gateway (berserk-gw)
-export LCA_BASE_URL=http://node:18080/v1
-./lca init          # writes .lca/roles.yaml from the gateway's models and your stack
+`/setup` asks for the gateway url, probes it immediately and shows what it
+serves — each model with its context window **and where that number came from**
+(`262k (server)` is the running deployment's own `max_model_len`; `200k (card)`
+is the vendor's model card; `window ?` is nobody published one). If the gateway
+answers `401`, it asks for the credential and probes again before going on, so a
+keyed gateway is set up from the session like any other. You pick the models with
+the arrow keys (type to narrow a long list), give them roles — lead, coder,
+reviewer, cheap — and it writes `.lca/roles.yaml` and `.lca/config.json` and
+loads them into the session you are already sitting in. **No restart and no
+environment variable.** Then `/doctor`, then a task.
+
+Your picks are what gets written. If you accept the optional `tiers:`, it asks
+separately whether `lead` and `coder` should *follow* one — a role with a `tier:`
+has its own chain replaced by that tier's, and answering `n` (the default) keeps
+the models you chose and leaves the tiers in the file for `/tier` to use.
+
+Nothing is written until the last screen, and Ctrl-C at any point leaves the
+tree exactly as it was. In a directory with nothing configured, `lca` offers
+`/setup` on its own (one line, Enter accepts, `n` goes straight to the prompt).
+
+Everything else is reachable from the same session — `/config` shows every
+setting and where it came from, `/set` changes one and keeps it, `/model`,
+`/tier`, `/endpoint`, `/role`, `/doctor`, `/report`, `/eval`, `/run`. `/help`
+lists them all.
+
+The shell subcommands are unchanged and are what CI uses:
+
+```sh
+LCA_BASE_URL=http://node:18080/v1 ./lca init   # write .lca/roles.yaml non-interactively
 ./lca doctor        # checks gateway, roles, real tool calls, sandbox, members, workflows
-./lca               # interactive session — type a task; /help lists the commands
 ./lca run           # list this project's workflows; lca run <name> executes one
-
-# or a single model: a local endpoint or a hosted API
-LCA_BASE_URL=http://localhost:8000/v1 LCA_MODEL=my-model ./lca
-DEEPSEEK_API_KEY=… ./lca -model deepseek/deepseek-v4-pro
+DEEPSEEK_API_KEY=… ./lca -model deepseek/deepseek-v4-pro   # a single hosted model
 ```
 
 `lca init` writes a **minimal working team** — `entry`, `transport`, `apply`,
@@ -84,7 +110,103 @@ status** is the machine-readable result:
 Without `-y`, side effects still need approval; with no terminal attached
 they are refused rather than run unattended.
 
-### Configuration (env)
+### Configuration in the session — `/setup`, `/config`, `/set`, `/save`
+
+Configuration lives in the program. You never need an environment variable to
+get started; env is an override for environments with no terminal.
+
+| Command | What it does |
+| --- | --- |
+| `/setup` | the wizard: gateway, models, roles, tiers, check command — writes both files and reloads them live |
+| `/setup models` | keep the endpoint and credentials, re-pick the models |
+| `/config` | every effective setting, its value, and **which layer and which file** it came from |
+| `/config <key>` | one setting: what it means, what it accepts, where it is set, which JSON key holds it |
+| `/set <key> <value>` | change it live and write it to `.lca/config.json` |
+| `/set -user <key> <value>` | write it to `~/.lca/config.json` instead |
+| `/save [<key> …]` | keep what this session changed with `/model`, `/endpoint`, `/tier`, `/approve`, `/think`, `/loop` |
+
+With a team loaded, `/set model` and `/save model` **refuse**: a top-level `model`
+key outranks every role's chain at every future start, so the banner and
+`/agents` would disagree for ever. They point at `/role <name> model <id>` plus
+`/role save` instead, and `-force` does it anyway. `/set -user` warns when the
+project file sets the same key and is read after the one it just wrote.
+
+`/set` writes immediately — using `/set` *is* the request to write. The mood
+toggles (`/model`, `/endpoint`, `/tier`, `/approve`, `/think`, `/loop`) do not:
+they print one faint line naming `/save`, `/config` marks them `session ·
+unsaved`, and `/exit` says one line if any are still unwritten. Nothing blocks
+to ask, and nothing is silently lost.
+
+**`config.json` keys** (`.lca/config.json` per project, `~/.lca/config.json` for
+every project):
+
+| Key | Setting | Accepts |
+| --- | --- | --- |
+| `base_url` | `endpoint` | a url including the API base path; a missing `/v1` is appended and announced |
+| `endpoints` | `endpoints` | a list of urls for `/endpoint` switching |
+| `api_key_env` | `api_key_env` | the **NAME** of the variable holding the key |
+| `api_key` | `api_key` | the token itself — see below |
+| `model` | `model` | a served id, or `provider/model` |
+| `tier` | `tier` | a key of `roles.yaml`'s `tiers:` |
+| `thinking` | `effort` | `off on low medium high xhigh max` — the level **sent** |
+| `tools` | `transport` | `native text auto` |
+| `temperature` | `temperature` | `0…2`, or `unset` to send none |
+| `ctx_tokens` | `context` | transcript budget (`0` = from the model's window) |
+| `max_tokens` · `max_steps` · `cmd_timeout` · `subagent_depth` | `max_tokens` `steps` `cmd_timeout` `subagent_depth` | whole numbers |
+| `agent` | `agent` | a primary agent or role name |
+| `approve` | `approve` | `off run edit web all` |
+| `show_thinking` · `loop` | `show_thinking` `loop` | `on` / `off` |
+| `allow` | `allow` | the sandbox allowlist (`roles.yaml`'s `sandbox.allow` overrides it) |
+| `providers` · `agents` · `permission` | — | the blocks below; the writer preserves them, and `permission` key **order** (which is precedence) survives byte for byte |
+
+**An API key is never written in plain text without saying so.** `/set api_key
+<literal>` refuses and points at `/set api_key_env LCA_API_KEY`, which records
+the variable's *name* — `.lca` is inside your repository, and one `git add -A`
+publishes a secret. `/set api_key <value> -plaintext` does it anyway, at mode
+`0600`, and prints exactly what that exposes — naming `config.json.bak` as well,
+because the backup beside it carries the previous key at the same mode. `/config`
+always masks the key: `sk-…9f2 (43 chars)`, `set · from $LCA_API_KEY`, `unset ·
+$LCA_API_KEY names it, but it is not set in this shell` when the variable was
+never exported, and `none · the gateway needs none` for the `sk-noauth`
+placeholder. The literal never appears in any command's output — not in
+`/config`, not in `/config api_key`, not in the hint that names a file value the
+environment shadows — and the audit log records `<redacted>`.
+
+`root` and `dir` are **locators**, not settings: a file that relocated the
+directory it was found in would be a paradox, so they come from the environment
+and the working directory only and `/config` shows them read-only. `unsafe` is
+likewise not a setting — `/unsafe` lifts the sandbox for one session, and a file
+that did it for every future run in a directory is a foot-gun.
+
+**Precedence**, last wins: the defaults → `roles.yaml` (for `transport`, the
+entry role's chain, its `effort` and its `tier` — `/config` names the team file
+for each of them) → `~/.lca/config.json` → `<root>/.lca/config.json` →
+`$LCA_CONFIG` → **an `LCA_*` variable that is actually set** → a flag →
+something you changed in the session. Env stays above the files on purpose:
+demoting it means it stops being *required*, not that it loses — flipping the
+order would break every existing `export LCA_BASE_URL` the moment a
+`.lca/config.json` appeared, and make a checked-in project file un-overridable
+in CI. `/config` pays for that honestly: it prints the shadowed file value with
+its path, and `/set` warns, naming the variable, at the moment it matters.
+
+### Non-interactive: CI, scripts and containers
+
+Environment variables are the override for environments with no terminal — you
+never need them to get started. Everything below is unchanged:
+
+```sh
+LCA_BASE_URL=http://node:18080/v1 ./lca init   # write the team from the gateway's models
+./lca doctor                                   # check it end to end
+./lca -y "add a nil check to Parse in x.go"    # one task, one exit status
+./lca run nightly -var target=pkg/auth         # a deterministic workflow
+./lca eval tasks/                              # the evaluation matrix
+```
+
+With no terminal on stdin, `/setup` refuses in one line naming `lca init`, the
+config file and `lca doctor`, rather than blocking on a question nobody is there
+to answer; the pickers fall back to the text output they always printed.
+
+### Environment (an override, one run at a time)
 
 | Var            | Default                        | Meaning                                   |
 | -------------- | ------------------------------ | ----------------------------------------- |

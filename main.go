@@ -11,20 +11,20 @@ import (
 )
 
 func main() {
-	cfg := loadConfig()
+	cfg, _, cfgSrc := loadConfigWithSources()
 	if cfg.CmdTimeout > 0 {
 		cmdTimeout = time.Duration(cfg.CmdTimeout) * time.Second
 	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "eval":
-			os.Exit(runEval(cfg, os.Args[2:]))
+			os.Exit(runEval(context.Background(), cfg, os.Args[2:]))
 		case "run":
 			os.Exit(runWorkflow(cfg, os.Args[2:]))
 		case "init":
 			os.Exit(runInit(cfg, os.Args[2:]))
 		case "doctor":
-			os.Exit(runDoctor(cfg, os.Args[2:]))
+			os.Exit(runDoctor(context.Background(), cfg, os.Args[2:]))
 		case "report":
 			os.Exit(runReport(cfg, os.Args[2:]))
 		case "help", "--help":
@@ -47,11 +47,21 @@ func main() {
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
 
 	cfg.Unsafe = cfg.Unsafe || *unsafe
-	cfg.Tier = firstNonEmpty(*tierFlag, cfg.Tier)
+	if *tierFlag != "" {
+		cfg.Tier = *tierFlag
+		mark(cfgSrc, "tier", SrcFlag, "-tier")
+	}
+	if *modelFlag != "" {
+		mark(cfgSrc, "model", SrcFlag, "-model")
+	}
 	in := NewInput(os.Stdin)
 	ap := NewApprover(in)
+	// The persisted posture first, then the flag on top: -y is what the operator
+	// asked for on THIS run, and a config file must not be able to take it back.
+	applyApproveTo(ap, cfg.Approve)
 	if *yes || *yesLong {
 		ap.TrustAll()
+		mark(cfgSrc, "approve", SrcFlag, "-y")
 	}
 	orch, err := setupOrchestrator(cfg, ap, os.Getenv("LCA_TRACE"))
 	if err != nil {
@@ -104,7 +114,10 @@ func main() {
 		os.Exit(oneShot(orch, sess, prompt, *checkFlag, append(notes, orch.warnings...)))
 	}
 
-	r := &Repl{cfg: cfg, orch: orch, sess: sess, local: local, in: in, notes: notes}
+	// roles.yaml owns the entry role's chain, its effort and the transport, and
+	// /config has to be able to say so — see markRoleSources.
+	markRoleSources(cfgSrc, orch.jl.Root, orch.roles, sess.agent)
+	r := &Repl{cfg: cfg, orch: orch, sess: sess, local: local, in: in, notes: notes, cfgSrc: cfgSrc}
 	if os.Getenv("LCA_NO_CLEAR") == "" {
 		clearScreen()
 	}
@@ -112,6 +125,10 @@ func main() {
 	if *resume {
 		r.cmdResume("")
 	}
+	// Nothing configured here and a terminal to ask on: offer the wizard once,
+	// before the prompt opens. It is an offer, not a gate — Enter accepts, n
+	// falls straight through to the prompt.
+	r.offerSetup()
 	r.Loop()
 }
 
@@ -157,30 +174,9 @@ func fatal(err error) {
 // setupOrchestrator builds everything a run needs from cfg: jail (with the
 // roles.yaml sandbox allowlist), file config, roles (validated against the
 // gateway's /v1/models), recorder and trace. tracePath "" = the default
-// $LCA_DIR/traces/<session>.jsonl.
+// $LCA_DIR/traces/<session>.jsonl. It keeps its signature and its callers; the
+// half a live reload can repeat is buildOrchestrator below.
 func setupOrchestrator(cfg Config, ap *Approver, tracePath string) (*Orchestrator, error) {
-	roles, err := loadRoles(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("roles: %w", err)
-	}
-	if len(roles.Roles) == 0 {
-		roles = nil
-	}
-	allowed := cfg.Allowed
-	if roles != nil && len(roles.Allow) > 0 {
-		allowed = roles.Allow
-	}
-	jail, err := NewJail(cfg.Root, allowed, cfg.Unsafe)
-	if err != nil {
-		return nil, fmt.Errorf("jail init failed: %w", err)
-	}
-	if roles != nil && roles.Shell {
-		jail.Shell = true
-	}
-	fc, err := loadFileConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("config: %w", err)
-	}
 	rec, err := NewRecorder(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("recorder init failed: %w", err)
@@ -192,6 +188,38 @@ func setupOrchestrator(cfg Config, ap *Approver, tracePath string) (*Orchestrato
 	if err != nil {
 		rec.Close()
 		return nil, fmt.Errorf("trace: %w", err)
+	}
+	o, err := buildOrchestrator(cfg, ap, rec, tracer)
+	if err != nil {
+		tracer.Close()
+		rec.Close()
+		return nil, err
+	}
+	return o, nil
+}
+
+// buildOrchestrator is everything setupOrchestrator does except creating the
+// recorder and the tracer, so a reload can reuse them. One session must write
+// ONE audit log and ONE trace: rotating them mid-session would make /report
+// render half a conversation.
+func buildOrchestrator(cfg Config, ap *Approver, rec *Recorder, tracer *Tracer) (*Orchestrator, error) {
+	roles, err := loadRoles(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("roles: %w", err)
+	}
+	if len(roles.Roles) == 0 {
+		roles = nil
+	}
+	jail, err := NewJail(cfg.Root, allowlistOf(cfg, roles), cfg.Unsafe)
+	if err != nil {
+		return nil, fmt.Errorf("jail init failed: %w", err)
+	}
+	if roles != nil && roles.Shell {
+		jail.Shell = true
+	}
+	fc, err := loadFileConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	local := NewClient(cfg)
 	var warns []string
@@ -234,8 +262,10 @@ func usage() {
 		"   -unsafe                      lift the sandbox (any path, any command)",
 		"",
 		" " + f("SETUP"),
-		"   LCA_BASE_URL                 the gateway or endpoint, e.g. http://node:18080/v1",
-		"   .lca/roles.yaml              the team: roles, model chains, tools (lca init writes one)",
+		"   lca                          interactive session; /setup picks the models and gives them roles",
+		"   .lca/config.json             the endpoint and the settings (/set writes it, /config explains it)",
+		"   .lca/roles.yaml              the team (/setup or lca init writes one)",
+		"   LCA_BASE_URL                 an override for one run — you never need it to get started",
 		"   DEEPSEEK_API_KEY, …          keys for hosted presets, when not using a gateway",
 		"",
 		" " + f("All settings: README.md. In a session, /help lists the commands."),

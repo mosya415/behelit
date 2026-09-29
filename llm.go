@@ -300,7 +300,11 @@ func (c *Client) ProbeModels(baseURL string) ([]ModelInfo, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("endpoint returned %d", resp.StatusCode)
+		// Typed, not fmt.Errorf: /setup's credentials step, errorHint and doctor all
+		// decide on the STATUS, and a status they have to scrape out of a sentence is
+		// a status they get wrong — a 401 read as "the gateway may still be starting"
+		// left the wizard with no route to ask for a key at all.
+		return nil, &APIError{Status: resp.StatusCode, Body: string(raw), Endpoint: baseURL}
 	}
 	var out modelsResponse
 	if err := json.Unmarshal(raw, &out); err != nil {

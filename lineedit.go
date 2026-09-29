@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"unicode/utf8"
 )
@@ -46,9 +45,42 @@ type LineEditor struct {
 	models  func() []string       // known model names, for /model completion
 	files   func(string) []string // jail files matching a fragment, for @-completion
 	status  func() string         // one-line status shown under the input (model · mode · dir)
+
+	// The three switches a one-field prompt inside a section needs. The wizard's
+	// fields are not the REPL's prompt: a full-width fence straddles a 76-column
+	// section, the status line has no business under "gateway url", a "/" menu is
+	// noise there, and nothing typed at a wizard field — least of all an api key —
+	// belongs in the ↑ history of the prompt that opens afterwards.
+	noHistory bool // never append to history
+	bare      bool // no fences, no status line, no completion menu
+	secret    bool // render • per rune (implies noHistory, set together)
 }
 
 func NewLineEditor(in *Input) *LineEditor { return &LineEditor{in: in} }
+
+// remember puts a submitted line in the ↑ history — unless this editor is a
+// forgetful field. A wizard field is one: the gateway url coming back at the next
+// prompt is untidy, and the api key coming back there is the secret one ↑ and one
+// Enter from being sent to the model as a message.
+func (e *LineEditor) remember(line string) {
+	s := strings.TrimSpace(line)
+	if s == "" || e.noHistory {
+		return
+	}
+	if len(e.history) == 0 || e.history[len(e.history)-1] != s {
+		e.history = append(e.history, s)
+	}
+}
+
+// display is the buffer as drawn. A secret field shows its own width and nothing
+// else: the raw path renders on every keystroke, so without this the key is on
+// screen in clear while it is typed.
+func (e *LineEditor) display(buf []rune) string {
+	if e.secret {
+		return strings.Repeat("•", len(buf))
+	}
+	return displayRunes(buf)
+}
 
 // stage decides what to do with text that arrived at once (a paste, or what was
 // typed while the agent was working): a short single line is put in the input as
@@ -87,6 +119,9 @@ type suggestion struct{ name, desc, complete string }
 // suggest returns menu items for the current buffer: model names after
 // "/model ", otherwise matching command names.
 func (e *LineEditor) suggest(buf string) []suggestion {
+	if e.bare {
+		return nil // a wizard field is not the REPL prompt: no "/" menu, no @files
+	}
 	if arg, ok := strings.CutPrefix(buf, "/model "); ok {
 		if e.models == nil {
 			return nil
@@ -126,9 +161,16 @@ func (e *LineEditor) out(s string) { fmt.Print(s) }
 // ReadLine prints prompt and returns the entered line. Returns errLineCancel on
 // Ctrl-C (caller should just continue) and io.EOF on Ctrl-D / stream end.
 func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
-	restore, err := makeRaw(int(os.Stdin.Fd()))
+	// The editor's own Input, not os.Stdin: a scripted Input (tests, `lca <<EOF`)
+	// has no terminal to switch, and raw-moding a descriptor it does not read
+	// from would change the operator's terminal for nothing.
+	fd := e.in.fd()
+	if fd < 0 {
+		return e.cooked(prompt, initial)
+	}
+	restore, err := makeRaw(fd)
 	if err != nil {
-		return e.cooked(prompt)
+		return e.cooked(prompt, initial)
 	}
 	defer restore()
 	e.out("\033[?2004h") // ask the terminal to bracket pastes
@@ -145,7 +187,9 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 	}
 
 	// top fence of the input area
-	e.out(cFaint + strings.Repeat("─", termWidth()) + cReset + "\r\n")
+	if !e.bare {
+		e.out(cFaint + strings.Repeat("─", termWidth()) + cReset + "\r\n")
+	}
 	e.render(prompt, buf, pos)
 	for {
 		b, err := e.in.ReadByte()
@@ -156,9 +200,7 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 		case '\r', '\n':
 			e.submit(prompt, buf)
 			line := e.take(buf)
-			if s := strings.TrimSpace(line); s != "" && (len(e.history) == 0 || e.history[len(e.history)-1] != s) {
-				e.history = append(e.history, s)
-			}
+			e.remember(line)
 			return line, nil
 		case 3: // Ctrl-C
 			e.out("\r\033[J" + prompt + string(buf) + "^C\r\n")
@@ -198,33 +240,45 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 	}
 }
 
-func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
-	b1, err := e.in.ReadByte()
+// readEscape reads what follows an ESC and names the key: "A".."D" for the
+// arrows in both the CSI and the application-cursor spelling, "H"/"F", "3~"
+// Delete, "5~"/"6~" PgUp/PgDn, "200~" paste start, "esc" for a second ESC, and
+// "" for a sequence we do not know. Shared with the picker (pick.go), so the
+// editor and the menu cannot disagree about what ↑ is.
+func readEscape(in *Input) string {
+	b1, err := in.ReadByte()
 	if err != nil {
-		return buf, pos, hist
+		return ""
 	}
-	if b1 == 'O' { // application cursor keys: ESC O A/B/C/D
-		if b2, err := e.in.ReadByte(); err == nil {
-			return e.applyKey(string(b2), buf, pos, hist)
+	switch {
+	case b1 == 'O': // application cursor keys: ESC O A/B/C/D
+		b2, err := in.ReadByte()
+		if err != nil {
+			return ""
 		}
-		return buf, pos, hist
-	}
-	if b1 != '[' {
-		return buf, pos, hist
+		return string(b2)
+	case b1 == 27: // ESC ESC — the picker's "get me out of here"
+		return "esc"
+	case b1 != '[':
+		return ""
 	}
 	// read the rest of the CSI sequence up to its final byte
 	var seq []byte
 	for {
-		c, err := e.in.ReadByte()
+		c, err := in.ReadByte()
 		if err != nil {
-			return buf, pos, hist
+			return ""
 		}
 		seq = append(seq, c)
 		if c >= 0x40 && c <= 0x7e {
 			break
 		}
 	}
-	switch string(seq) {
+	return string(seq)
+}
+
+func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
+	switch k := readEscape(e.in); k {
 	case "200~": // bracketed paste: inline if short, else staged as one message
 		buf, pos = e.stage(e.readPaste(), buf, pos)
 		return buf, pos, hist
@@ -234,7 +288,7 @@ func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
 		}
 		return buf, pos, hist
 	default:
-		return e.applyKey(string(seq), buf, pos, hist)
+		return e.applyKey(k, buf, pos, hist)
 	}
 }
 
@@ -316,7 +370,11 @@ func displayRunes(buf []rune) string {
 
 // readRune assembles a full UTF-8 rune from its first byte (Cyrillic etc. are
 // multi-byte), reading continuation bytes as needed.
-func (e *LineEditor) readRune(first byte) rune {
+func (e *LineEditor) readRune(first byte) rune { return readRuneIn(e.in, first) }
+
+// readRuneIn is the same assembly for any Input — the picker's filter takes
+// Cyrillic too, and one decoder means one set of edge cases.
+func readRuneIn(in *Input, first byte) rune {
 	if first < 0x80 {
 		return rune(first)
 	}
@@ -334,7 +392,7 @@ func (e *LineEditor) readRune(first byte) rune {
 	bytes := make([]byte, 1, 4)
 	bytes[0] = first
 	for i := 0; i < n; i++ {
-		c, err := e.in.ReadByte()
+		c, err := in.ReadByte()
 		if err != nil {
 			break
 		}
@@ -362,6 +420,13 @@ func (e *LineEditor) take(buf []rune) string {
 // text as a full-width gray-green band, closed by a hairline below (the top fence
 // was drawn when the prompt opened). An empty line just advances.
 func (e *LineEditor) submit(prompt string, buf []rune) {
+	// A bare field leaves the answer as a plain line inside its section: the band
+	// and its hairline are the REPL prompt's chrome, drawn at the terminal's full
+	// width, and they straddled the 76-column rule of the section above them.
+	if e.bare {
+		e.out("\r\033[J" + prompt + e.display(buf) + "\r\n")
+		return
+	}
 	if e.staged != "" {
 		w := termWidth()
 		band := cBandBg + padTo(stripANSI(prompt)+pasteSummary(e.staged)+"  "+displayRunes(buf), w, 0) + cReset
@@ -384,9 +449,9 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 	menu := e.suggest(string(buf))
 	e.out("\r\033[J") // clear from line start down (input + any old menu / status)
 	if e.staged != "" {
-		e.out(prompt + cBold + "[" + pasteSummary(e.staged) + "]" + cReset + " " + displayRunes(buf))
+		e.out(prompt + cBold + "[" + pasteSummary(e.staged) + "]" + cReset + " " + e.display(buf))
 	} else {
-		e.out(prompt + displayRunes(buf))
+		e.out(prompt + e.display(buf))
 	}
 	below := 0
 	for _, m := range menu {
@@ -398,7 +463,7 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 		below++
 	}
 	// With no command menu open, show the persistent status line under the input.
-	if below == 0 && e.status != nil {
+	if below == 0 && !e.bare && e.status != nil {
 		if s := e.status(); s != "" {
 			e.out("\r\n  " + cFaint + s + cReset)
 			below++
@@ -412,19 +477,30 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 	if e.staged != "" {
 		lead = visibleWidth("[" + pasteSummary(e.staged) + "] ")
 	}
-	if col := visibleWidth(prompt) + lead + visibleWidth(displayRunes(buf[:pos])); col > 0 {
+	if col := visibleWidth(prompt) + lead + visibleWidth(e.display(buf[:pos])); col > 0 {
 		e.out(fmt.Sprintf("\033[%dC", col))
 	}
 }
 
-// cooked is the fallback line read for non-terminal stdin.
-func (e *LineEditor) cooked(prompt string) (string, error) {
-	e.out(prompt)
+// cooked is the fallback line read for non-terminal stdin. It shows the prefill
+// and returns it on an empty line, because a prompt that offers a default and
+// then discards it when you press Enter is worse than no default — and raw mode
+// is exactly where you cannot see that happen.
+func (e *LineEditor) cooked(prompt, initial string) (string, error) {
+	if initial != "" {
+		e.out(prompt + "[" + initial + "] ")
+	} else {
+		e.out(prompt)
+	}
 	line, err := e.in.ReadString('\n')
-	if err != nil {
+	if err != nil && strings.TrimSpace(line) == "" {
 		return "", err
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	line = strings.TrimRight(line, "\r\n")
+	if strings.TrimSpace(line) == "" {
+		return initial, nil
+	}
+	return line, nil
 }
 
 // complete completes the buffer against the current suggestions: fully if there

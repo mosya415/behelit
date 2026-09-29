@@ -24,7 +24,8 @@ import (
 // staged message you send with Enter.
 
 type Input struct {
-	f *os.File
+	f   *os.File
+	tty bool // a real terminal on both ends — see IsTTY
 
 	mu      sync.Mutex
 	pending []byte
@@ -32,11 +33,36 @@ type Input struct {
 	stopCapture func()
 }
 
-func NewInput(f *os.File) *Input { return &Input{f: f} }
+func NewInput(f *os.File) *Input {
+	in := &Input{f: f}
+	if st, err := f.Stat(); err == nil {
+		in.tty = st.Mode()&os.ModeCharDevice != 0 && osTermWidth() > 0
+	}
+	return in
+}
 
 // newStringInput is an Input with no terminal behind it: unattended runs (eval)
 // and tests, where reads just run out.
 func newStringInput(s string) *Input { return &Input{pending: []byte(s)} }
+
+// IsTTY reports that there is a real terminal on BOTH ends: stdin to read keys
+// from and stdout to draw on. osTermWidth() answers for stdout only (it ioctls
+// stdout) and makeRaw would answer for stdin only by changing it, so the cheap
+// stdlib test is used for stdin and both are required — a menu you cannot see
+// is worse than no menu. A pipe (CI, `lca … < file`) answers false, and the
+// caller then names the non-interactive path instead of blocking on a question
+// nobody is there to answer.
+func (in *Input) IsTTY() bool { return in.tty }
+
+// fd is the descriptor to put in raw mode, or -1 when there is no file behind
+// this Input. -1 is not an error: a scripted Input's bytes are already raw —
+// there is simply no terminal discipline to switch off.
+func (in *Input) fd() int {
+	if in.f == nil {
+		return -1
+	}
+	return int(in.f.Fd())
+}
 
 // ReadByte returns the next byte, blocking only when the buffer is empty.
 func (in *Input) ReadByte() (byte, error) {
