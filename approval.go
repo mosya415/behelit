@@ -126,6 +126,11 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 	fmt.Print("   allow?  " + cBold + "y" + cReset + cFaint + " yes · " + cReset + cBold + "n" + cReset + cFaint + " no · " + cReset +
 		cBold + "a" + cReset + cFaint + " yes to everything this session" + cReset + "  " + cFaint + "›" + cReset + " ")
 
+	// The terminal has to be the ordinary one for a question: under the turn mode
+	// the agent's input capture installs, a read returns nothing at once and the
+	// answer would not even be echoed.
+	defer a.in.PauseCapture()()
+
 	// Anything typed or pasted before the question appeared is not an answer to
 	// it: set it aside and give it back to the next prompt.
 	a.in.Drain()

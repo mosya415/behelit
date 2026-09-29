@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -30,6 +32,13 @@ type Input struct {
 	mu      sync.Mutex
 	pending []byte
 
+	// readMu keeps the non-blocking Drain out of a blocking read's way. Drain flips
+	// the descriptor to O_NONBLOCK for its duration, so a read blocked on the same
+	// descriptor came back EAGAIN — and an approval prompt read that fails answers
+	// its own question with "denied" without the operator touching the keyboard.
+	// The capture loop SKIPS a tick rather than waiting, so a prompt that is open
+	// for a minute cannot stall it.
+	readMu      sync.Mutex
 	stopCapture func()
 }
 
@@ -79,17 +88,36 @@ func (in *Input) ReadByte() (byte, error) {
 		return 0, io.EOF
 	}
 	var one [512]byte
-	n, err := in.f.Read(one[:])
-	if n > 0 {
-		in.mu.Lock()
-		in.pending = append(in.pending, one[1:n]...)
-		in.mu.Unlock()
-		return one[0], nil
+	for {
+		in.readMu.Lock()
+		n, err := in.f.Read(one[:])
+		in.readMu.Unlock()
+		if n > 0 {
+			in.mu.Lock()
+			in.pending = append(in.pending, one[1:n]...)
+			in.mu.Unlock()
+			return one[0], nil
+		}
+		// A terminal in the turn mode this file's capture uses (-icanon, VMIN=0)
+		// answers a read with zero bytes instead of waiting. Reading that as an end
+		// of input is what let an approval prompt answer its own question: it came
+		// back "" immediately and Confirm printed "denied" without a keystroke.
+		if n == 0 && err == nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		// EAGAIN is not an answer and not an end of input: something else had the
+		// descriptor non-blocking for a moment. Wait a tick and read again, so no
+		// caller ever reads a race as a decision.
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err == nil {
+			err = io.EOF
+		}
+		return 0, err
 	}
-	if err == nil {
-		err = io.EOF
-	}
-	return 0, err
 }
 
 // ReadString reads until delim (used by the cooked fallback and the approval
@@ -114,7 +142,13 @@ func (in *Input) Drain() {
 	if in.f == nil {
 		return
 	}
+	// Never while a blocking read is in progress: making the descriptor
+	// non-blocking under it turns the read into EAGAIN.
+	if !in.readMu.TryLock() {
+		return
+	}
 	data := readAvailable(in.f)
+	in.readMu.Unlock()
 	if len(data) == 0 {
 		return
 	}
@@ -178,6 +212,19 @@ func (in *Input) StartCapture() {
 			restore()
 		}
 	}
+}
+
+// PauseCapture gives the terminal back to an interactive prompt: the capture's
+// turn mode neither blocks on a read nor echoes, so a question asked under it
+// gets an empty answer and shows nothing of what is typed. The returned function
+// resumes capturing, so the keystrokes that arrive during the rest of the turn are
+// still collected. It is a no-op when nothing is capturing.
+func (in *Input) PauseCapture() func() {
+	if in.stopCapture == nil {
+		return func() {}
+	}
+	in.StopCapture()
+	return in.StartCapture
 }
 
 // StopCapture ends capturing and returns the terminal to its usual state.

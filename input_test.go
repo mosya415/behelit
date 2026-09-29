@@ -4,6 +4,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInputBufferOrder(t *testing.T) {
@@ -165,5 +166,49 @@ func TestAskSecretDoesNotEcho(t *testing.T) {
 	}
 	if strings.Contains(out, "sk-do-not-show-me") {
 		t.Errorf("askSecret echoed the key:\n%q", out)
+	}
+}
+
+// An approval prompt must read the operator's answer even while the turn's input
+// capture is running. Capture puts the terminal in turn mode (-icanon, no echo),
+// where a read returns zero bytes instead of waiting — and ReadByte reported that
+// as an end of input, so Approver.Confirm answered its own question with "denied"
+// three commands in a row without a keystroke.
+func TestPromptReadSurvivesTheCaptureLoop(t *testing.T) {
+	m, sl, err := openPTY()
+	if err != nil {
+		t.Skipf("no pty here: %v", err)
+	}
+	in := NewInput(sl)
+	in.StartCapture() // as the REPL does for the duration of a turn
+
+	// The operator answers a moment later, as a human would.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		m.Write([]byte("y\r"))
+	}()
+
+	ap := NewApprover(in)
+	type res struct{ ok, auto bool }
+	ch := make(chan res, 1)
+	go func() {
+		ok, auto := ap.Confirm("run", "git status", "")
+		ch <- res{ok, auto}
+	}()
+	var got res
+	select {
+	case got = <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Confirm never returned — the answer was not read")
+	}
+	in.StopCapture()
+	sl.Close()
+	m.Close()
+
+	if !got.ok {
+		t.Fatal("a typed y was read as a refusal: Confirm answered its own question")
+	}
+	if got.auto {
+		t.Fatal("this was a real question, not an auto-approval")
 	}
 }
