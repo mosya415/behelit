@@ -47,9 +47,21 @@ type Orchestrator struct {
 	reads  map[string]time.Time // abs path → mtime when the agent last saw it
 
 	roles     *RolesConfig // roles.yaml, nil when absent
-	remote    *Remote      // when set, the project lives on another machine
+	remote    *Remote      // the "remote" member: the old single-machine spelling
 	tracer    *Tracer
 	worktrees worktrees
+
+	// The fleet (members.go). members always holds "local"; the remote: member
+	// is synthesised from o.remote on demand instead of copied here, because
+	// o.remote is assigned after construction in more than one place.
+	members    map[string]*Member
+	memOrd     []string // declaration order
+	defMem     string   // defaults: member:
+	hasMembers bool     // a members: block was declared
+
+	memMu  sync.Mutex
+	locMem *Member // the local member, allocated once
+	legMem *Member // the synthesised "remote" member, keyed on o.remote
 
 	gatewayModels int // models the gateway lists: -1 not checked, 0 unreachable
 
@@ -104,13 +116,8 @@ func NewOrchestrator(cfg Config, fc *FileConfig, jl *Jail, ap *Approver, rec *Re
 		for _, r := range roles.Roles {
 			o.agents[r.Name] = r // a role replaces a same-named agent
 		}
-		o.remote = roles.Remote
 	}
-	if o.remote == nil {
-		if rem, err := parseRemote(nil); err == nil && rem != nil {
-			o.remote = rem // LCA_REMOTE without a roles.yaml
-		}
-	}
+	o.setFleet(roles)
 	o.skills = loadSkills(jl.Root, cfg.Dir)
 	o.commands, w = loadCommands(jl.Root, cfg.Dir, ps)
 	o.warnings = append(o.warnings, w...)
@@ -199,6 +206,8 @@ type Session struct {
 	extra  Ruleset // session-level restrictions (subagents)
 
 	checkLive    io.Writer // where a verifier check's output streams live (nil: nowhere)
+	member       string    // member NAME pinned to this session ("" = resolve from the role)
+	wtRem        *Remote   // a delegate worktree that lives on a member, not on this machine
 	jl           *Jail     // own working tree (delegate worktree); nil = the orchestrator's
 	isolated     bool      // works in a scratch worktree: edits/commands there are the point
 	rootOverride string    // root session id for detached helper sessions (compaction)
@@ -270,12 +279,18 @@ func (s *Session) Client() *Client { return s.client }
 func (s *Session) Agent() *Agent   { return s.agent }
 
 // remote is the machine this session's files and commands live on, or nil for
-// local work. A delegate's worktree is always local, so it stays nil there.
+// local work. The contract is unchanged to the letter: nil means "this
+// machine", and a delegate worktree ON this machine stays nil however its role
+// is pinned (s.jl is that worktree's jail). A worktree on a MEMBER carries its
+// own transport, because it is a different directory on that machine.
 func (s *Session) remote() *Remote {
+	if s.wtRem != nil {
+		return s.wtRem
+	}
 	if s.jl != nil {
 		return nil
 	}
-	return s.orch.remote
+	return s.memberOf().Rem
 }
 
 // applyModelOpts fills in what the model card says for the model in use, for
@@ -372,7 +387,51 @@ func (s *Session) jail() *Jail {
 	if s.jl != nil {
 		return s.jl
 	}
-	return s.orch.jl
+	return s.memberOf().jail(s.orch)
+}
+
+// runTool and runCheck are the only two paths from a tool, the verifier or a
+// workflow step to the machine a session works on. The member's sandbox decides
+// FIRST — Remote.run consults no policy of its own, and until members existed
+// the remote branch of run_command called it with no CheckCommand at all, so the
+// allowlist and the GPU policy were not enforced for the model's own commands on
+// a remote project. A member must not be another way around them: nothing else
+// calls Remote.run with a model's or an author's words.
+//
+// They are two methods, not one, because the two contracts differ and neither
+// may drift: the model's tool keeps runCommand's live output, Ctrl-C handling
+// and "error: …" refusals, while a verifier or a workflow step keeps execCheck's
+// ("sandbox: …", -1), which the runner already looks for.
+func (s *Session) runTool(ctx context.Context, cmd string, timeout time.Duration, live io.Writer) string {
+	if rem := s.remote(); rem != nil {
+		if err := s.checkCmd(cmd); err != nil {
+			return "error: " + err.Error()
+		}
+		out, exit := rem.run(ctx, cmd, timeout, nil, live)
+		return remoteCmdResult(out, exit, timeout)
+	}
+	return runCommand(ctx, s.jail(), cmd, timeout, live)
+}
+
+func (s *Session) runCheck(ctx context.Context, cmd string, timeout time.Duration, live io.Writer) (string, int) {
+	if rem := s.remote(); rem != nil {
+		if err := s.checkCmd(cmd); err != nil {
+			return "sandbox: " + err.Error(), -1
+		}
+		return rem.run(ctx, cmd, timeout, nil, live)
+	}
+	return execCheck(ctx, s.jail(), cmd, timeout, live)
+}
+
+// checkCmd asks this session's sandbox about a command it is about to run, with
+// the semantics of the machine that will run it: a member's leg crosses a shell
+// over there, and one-argv semantics would let a second command past the
+// allowlist. The verifier asks the same question before it spends an attempt.
+func (s *Session) checkCmd(cmd string) error {
+	if s.remote() != nil {
+		return s.jail().CheckRemote(cmd)
+	}
+	return s.jail().CheckCommand(cmd)
 }
 
 // SetAgent switches the primary agent. The system prompt is rebuilt (a

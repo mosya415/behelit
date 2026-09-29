@@ -24,12 +24,19 @@ import (
 //	remote:                     # work on another machine (outbound ssh only)
 //	  host: cab-node
 //	  dir: /home/u/llmbench
+//	members:                    # a fleet: one entry per machine (members.go)
+//	  build-box: {host: build01, dir: /srv/work/llmbench}
+//	  gpu-0:
+//	    host: gpu07
+//	    dir: /scratch/llmbench
+//	    allow: [ls, cat, python3, bsk]   # this member's sandbox
 //	models:                     # per-model settings (gateway names)
 //	  some-model: {transport: text}   # its native tool parser is broken/missing
 //	tiers:                      # named chains: develop on premium, operate on cheap
 //	  cheap:   [qwen3-30b-a3b]
 //	  premium: [kimi-k2.6, glm-5.2]
 //	defaults:
+//	  member: build-box         # the member roles use when they name none
 //	  context: 128000
 //	  steps: 50
 //	  verify_attempts: 2        # verifier failures fed back before giving up
@@ -49,6 +56,7 @@ import (
 //	    prompt: |
 //	      You lead the task…
 //	  coder:
+//	    member: build-box       # this role's sessions work on that machine
 //	    models: [qwen3-coder-480b, deepseek-v4-pro]  # or: tier: premium
 //	    review: reviewer        # a second opinion on a diff the verifier passed
 //	    fork: true              # start from the caller's reads, not a blank context
@@ -68,7 +76,11 @@ type RolesConfig struct {
 	Apply          string // verified | always | never
 	Allow          []string
 	Shell          bool                  // run commands through sh: pipes work, every segment is still checked
-	Remote         *Remote               // work on another machine over ssh
+	Remote         *Remote               // work on another machine over ssh (the "remote" member)
+	Members        map[string]*Member    // the fleet; always contains "local"
+	MemberOrder    []string              // declaration order, for /members, doctor and YAML()
+	DefaultMember  string                // defaults: member:
+	HasMembers     bool                  // a members: block was declared somewhere
 	ModelOpts      map[string]*ModelOpts // per-model settings from the model card
 	VerifyAttempts int
 	CheckTimeout   int
@@ -108,7 +120,13 @@ func (rc *RolesConfig) transportOf(model string) string {
 }
 
 func loadRoles(cfg Config) (*RolesConfig, error) {
-	rc := &RolesConfig{Apply: "verified", VerifyAttempts: 2, CheckTimeout: 600, ModelOpts: map[string]*ModelOpts{}}
+	rc := &RolesConfig{Apply: "verified", VerifyAttempts: 2, CheckTimeout: 600, ModelOpts: map[string]*ModelOpts{},
+		Members: map[string]*Member{localMemberName: {Name: localMemberName}}}
+	// Which spelling the other machine came from decides whether cross-machine
+	// delegation is available and what a round trip through YAML() writes back,
+	// and members: may sit in a different merged file than remote:.
+	remoteBlock, envRemote := false, strings.TrimSpace(os.Getenv("LCA_REMOTE")) != ""
+	lastPath := ""
 	paths := []string{filepath.Join(cfg.Dir, "roles.yaml"), filepath.Join(cfg.Root, ".lca", "roles.yaml")}
 	if p := os.Getenv("LCA_ROLES"); p != "" {
 		paths = append(paths, p)
@@ -127,6 +145,7 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			p = abs
 		}
 		rc.Sources = append(rc.Sources, p)
+		lastPath = p
 		doc := parseYAMLish(string(data))
 		if v := doc.str("entry"); v != "" {
 			rc.Entry = v
@@ -155,12 +174,31 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		if v := defs.str("review"); v != "" {
 			rc.Review = v
 		}
-		if rn := doc.child("remote"); rn != nil || os.Getenv("LCA_REMOTE") != "" {
+		if v := defs.str("member"); v != "" {
+			rc.DefaultMember = v
+		}
+		if rn := doc.child("remote"); rn != nil || envRemote {
+			if rn != nil {
+				remoteBlock = true
+			}
 			rem, err := parseRemote(rn)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", p, err)
 			}
 			rc.Remote = rem
+		}
+		if mn := doc.child("members"); mn != nil {
+			ms, order, err := parseMembers(mn)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", p, err)
+			}
+			rc.HasMembers = true
+			for _, n := range order {
+				if rc.Members[n] == nil || !contains(rc.MemberOrder, n) {
+					rc.MemberOrder = append(rc.MemberOrder, n)
+				}
+				rc.Members[n] = ms[n] // a later file replaces the member wholesale
+			}
 		}
 		if ms := doc.child("models"); ms != nil {
 			for _, m := range ms.Children {
@@ -303,6 +341,39 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			"-tier %s changed nothing: no role declares tier: — %s each name their own models:",
 			rc.Tier, strings.Join(pinned, ", ")))
 	}
+	// The fleet resolves only once every file has merged, for the same reason
+	// reviewers do: members: and remote: may live in different files, and the
+	// name collision between them can only be seen once both are known.
+	if rc.Remote != nil {
+		rc.Remote.Name = legacyMemberName
+		switch declared := rc.Members[legacyMemberName]; {
+		case declared != nil && declared.Rem != nil && remoteBlock:
+			return nil, fmt.Errorf(`%s: members.remote and the remote: block both define a member named "remote" — keep one (remote: is the old single-member spelling)`, lastPath)
+		case declared != nil && declared.Rem != nil:
+			// LCA_REMOTE wins over the file, the way it always has, but a fleet
+			// that names its machines must be told which one it just repointed.
+			rc.Warnings = append(rc.Warnings, fmt.Sprintf(
+				"LCA_REMOTE overrides members.remote (%s) and is the team's default member", rc.Remote.Label()))
+			declared.Rem = rc.Remote
+			rc.DefaultMember = legacyMemberName
+		default:
+			rc.Members[legacyMemberName] = &Member{Name: legacyMemberName, Rem: rc.Remote, fromRemote: true}
+			if !contains(rc.MemberOrder, legacyMemberName) {
+				rc.MemberOrder = append(rc.MemberOrder, legacyMemberName)
+			}
+			if envRemote || rc.DefaultMember == "" {
+				rc.DefaultMember = legacyMemberName
+			}
+		}
+	}
+	if rc.DefaultMember != "" && rc.Members[rc.DefaultMember] == nil {
+		return nil, fmt.Errorf("%s: defaults: member: %q is not a member (members: %s)", lastPath, rc.DefaultMember, strings.Join(rc.memberNames(), ", "))
+	}
+	for _, a := range rc.Roles {
+		if a.Member != "" && rc.Members[a.Member] == nil {
+			return nil, fmt.Errorf("%s: role %s: member: %q is not a member (members: %s)", lastPath, a.Name, a.Member, strings.Join(rc.memberNames(), ", "))
+		}
+	}
 	// Reviewers resolve only once every file has merged: a merged team's
 	// reviewer can come from another file, so this is not checked in applyRole.
 	defined := func(name string) *Agent {
@@ -335,6 +406,13 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			rc.Warnings = append(rc.Warnings, fmt.Sprintf(
 				"role %s: its reviewer %s runs %s, the same family as %s — a same-family second opinion shares the blind spots the review exists to find",
 				a.Name, rev.Name, rev.Models[0], a.Models[0]))
+		}
+		// The reviewer reads the worktree, so it runs where the worktree is,
+		// whatever its own member: says. A silent move is worse than a warning.
+		if am, rm := rc.memberOf(a), rc.memberOf(rev); am != rm {
+			rc.Warnings = append(rc.Warnings, fmt.Sprintf(
+				"role %s: its reviewer %s is pinned to member %s, but a review happens inside the worktree on %s — the reviewer will run there",
+				a.Name, rev.Name, rm, am))
 		}
 	}
 	for _, a := range rc.Roles {
@@ -380,6 +458,19 @@ func (rc *RolesConfig) reviewerOf(a *Agent, lookup func(string) *Agent) *Agent {
 		return nil
 	}
 	return rev
+}
+
+// memberOf is the member name a role's sessions resolve to at load time, in the
+// same order Orchestrator.memberFor uses at runtime, so what the loader warns
+// about is what will actually run.
+func (rc *RolesConfig) memberOf(a *Agent) string {
+	return firstNonEmpty(a.Member, rc.DefaultMember, localMemberName)
+}
+
+// memberNames lists the fleet for a load-time message, through the same helper
+// /members and doctor list it with.
+func (rc *RolesConfig) memberNames() []string {
+	return fleetNames(rc.MemberOrder, rc.Remote != nil)
 }
 
 // sameFamily reports whether two roles' first models come from one family per
@@ -460,9 +551,13 @@ func applyRole(a *Agent, n *yNode, baseDir string) error {
 		a.Tier, a.Models = v, nil
 	}
 	// No validation here: a reviewer's name resolves only once every file has
-	// merged (loadRoles does it).
+	// merged (loadRoles does it). A member: is the same — it may be declared in
+	// another merged file.
 	if v := n.str("review"); v != "" {
 		a.Review = v
+	}
+	if v := n.str("member"); v != "" {
+		a.Member = v
 	}
 	if f := n.child("fork"); f != nil {
 		switch strings.ToLower(strings.TrimSpace(f.Value)) {
@@ -602,6 +697,17 @@ func (o *Orchestrator) roleList(exclude string) []*Agent {
 	return out
 }
 
+// remoteIsItsOwnSpelling reports that the member named "remote" exists only
+// because of the remote: block or LCA_REMOTE. YAML() then writes it back in that
+// spelling and leaves it out of members:, because a file carrying both is one the
+// loader refuses. A DECLARED members.remote goes under members: instead, with its
+// own allow:/shell: — dropping it there is how /role save silently widened a
+// member's sandbox.
+func (rc *RolesConfig) remoteIsItsOwnSpelling() bool {
+	m := rc.Members[legacyMemberName]
+	return m == nil || m.fromRemote
+}
+
 // YAML renders the team as roles.yaml — what /role save writes, so a team put
 // together in a session can be kept.
 func (rc *RolesConfig) YAML() string {
@@ -616,15 +722,52 @@ func (rc *RolesConfig) YAML() string {
 	if rc.Apply != "" {
 		fmt.Fprintf(&b, "apply: %s\n", rc.Apply)
 	}
-	if rc.Remote != nil {
+	if rc.Remote != nil && rc.remoteIsItsOwnSpelling() {
 		fmt.Fprintf(&b, "\nremote:\n  host: %s\n  dir: %s\n", rc.Remote.Host, rc.Remote.Dir)
 		if len(rc.Remote.SSH) > 0 {
 			fmt.Fprintf(&b, "  ssh: [%s]\n", strings.Join(rc.Remote.SSH, ", "))
 		}
 	}
+	// The fleet. A member that came from a legacy remote: block is written back
+	// as remote: above, not moved into members:, so a round trip does not
+	// silently rewrite the operator's file into the new form.
+	var mem strings.Builder
+	for _, n := range rc.MemberOrder {
+		m := rc.Members[n]
+		switch {
+		case m == nil:
+			continue
+		case n == legacyMemberName && rc.remoteIsItsOwnSpelling():
+			continue // written as the remote: block above
+		case n == localMemberName && m.Allow == nil && m.Shell == nil:
+			continue // declaring local says nothing unless it scopes the sandbox
+		}
+		fmt.Fprintf(&mem, "  %s:\n", n)
+		if m.Rem != nil {
+			if m.Rem.Host != "" {
+				fmt.Fprintf(&mem, "    host: %s\n", m.Rem.Host)
+			}
+			fmt.Fprintf(&mem, "    dir: %s\n", m.Rem.Dir)
+			if len(m.Rem.SSH) > 0 {
+				fmt.Fprintf(&mem, "    ssh: [%s]\n", strings.Join(m.Rem.SSH, ", "))
+			}
+		}
+		if len(m.Allow) > 0 {
+			fmt.Fprintf(&mem, "    allow: [%s]\n", strings.Join(m.Allow, ", "))
+		}
+		if m.Shell != nil {
+			fmt.Fprintf(&mem, "    shell: %t\n", *m.Shell)
+		}
+	}
+	if mem.Len() > 0 {
+		b.WriteString("\nmembers:\n" + mem.String())
+	}
 	fmt.Fprintf(&b, "\ndefaults:\n  verify_attempts: %d\n  check_timeout: %d\n", rc.VerifyAttempts, rc.CheckTimeout)
 	if rc.Review != "" {
 		fmt.Fprintf(&b, "  review: %s\n", rc.Review)
+	}
+	if rc.DefaultMember != "" && !(rc.DefaultMember == legacyMemberName && rc.remoteIsItsOwnSpelling()) {
+		fmt.Fprintf(&b, "  member: %s\n", rc.DefaultMember)
 	}
 	if len(rc.Allow) > 0 || rc.Shell {
 		b.WriteString("\nsandbox:\n")
@@ -702,6 +845,9 @@ func (rc *RolesConfig) YAML() string {
 		}
 		if a.Review != "" {
 			fmt.Fprintf(&b, "    review: %s\n", a.Review)
+		}
+		if a.Member != "" {
+			fmt.Fprintf(&b, "    member: %s\n", a.Member)
 		}
 		if a.Fork {
 			b.WriteString("    fork: true\n")

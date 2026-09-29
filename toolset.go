@@ -55,6 +55,10 @@ type ToolCtx struct {
 	// a caller-side channel (a workflow step), deliberately not a tool argument:
 	// choosing who reviews is registration, not a model's decision.
 	Reviewer string
+	// Member overrides the role's member for this one call (a workflow step's
+	// member:), for the same reason Reviewer is a caller-side channel and not a
+	// tool argument: choosing a machine is registration, not a model's decision.
+	Member string
 	// ForkFrom is the session a `fork: true` delegation inherits context from
 	// when it is not the caller itself — a workflow's lead reads nothing, and the
 	// reads worth handing down were made by a prompt step's own child session.
@@ -256,9 +260,13 @@ func toolsFor(s *Session) []*ToolDef {
 				continue
 			}
 		case "delegate":
-			// delegation works in a local git worktree; on a remote project the
-			// subagents share the tree instead (task), or run lca on that machine.
-			if s.remote() != nil || s.depth >= s.orch.subagentDepth() || len(s.orch.roleList(s.agent.Name)) == 0 {
+			// A delegation needs a git worktree. On a members: fleet it gets one ON
+			// that member; on the old single-remote spelling the worktree would be
+			// local while the project is not, so the subagents share the tree
+			// instead (task), or lca runs on that machine. canDelegate is
+			// registration, never a network probe: the tool schema is part of the
+			// cached prefix and must not depend on whether a host answered.
+			if !s.orch.canDelegate(s.memberOf()) || s.depth >= s.orch.subagentDepth() || len(s.orch.roleList(s.agent.Name)) == 0 {
 				continue
 			}
 		}

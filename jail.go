@@ -15,7 +15,19 @@ type Jail struct {
 	Allowed []string // command allowlist, for display
 	Unsafe  bool     // OFF the jail: any path, any command (see /unsafe)
 	Shell   bool     // run commands through sh (pipes, redirects) — every segment still checked
+	Member  string   // the member this policy describes ("" = this machine), for refusals
 	allowed map[string]bool
+}
+
+// forMember names the machine a refusal is about. It is message-only: a
+// member's jail decides exactly as the team's does, and which machine it
+// describes changes nothing — but "not on the allowlist" with no machine named
+// is unactionable on a fleet where each member has its own list.
+func (j *Jail) forMember() string {
+	if j == nil || j.Member == "" {
+		return ""
+	}
+	return " for member " + j.Member
 }
 
 // realRoot canonicalises a project root the way the jail holds it: absolute
@@ -145,9 +157,33 @@ func (j *Jail) CheckCommand(cmdline string) error {
 		return fmt.Errorf("empty command")
 	}
 	if !j.AllowCommand(argv[0]) {
-		return fmt.Errorf("command %q is not on the allowlist", argv[0])
+		return fmt.Errorf("command %q is not on the allowlist%s", argv[0], j.forMember())
 	}
 	return checkArgv(nil, argv, 0)
+}
+
+// CheckRemote is CheckCommand for a line that will be run by a shell on ANOTHER
+// machine. The transport sends `cd <dir> && <line>` as one ssh argument, so the
+// far side's login shell — not this process — splits it: `;`, `&&`, `|`, `$(…)`
+// and backticks are operators over there whatever this team's sandbox.shell
+// says. Checked with the local executor's one-argv semantics, `echo hi; srun
+// -n8 …` cleared the allowlist on argv[0] alone and ran the rest on the member;
+// the check has to match the executor, or a member is a way around the sandbox.
+//
+// CheckCommand runs first so every refusal it already words keeps its wording
+// (the allowlist on argv[0] before the GPU policy). The shell pass then checks
+// each segment, which is what catches the smuggled command. The operators
+// themselves are NOT refused: a remote leg has always been run by a shell, and
+// taking pipes away from the teams that use them today would fix a hole by
+// breaking their work. What must not happen is an unlisted command running.
+func (j *Jail) CheckRemote(cmdline string) error {
+	if err := j.CheckCommand(cmdline); err != nil {
+		return err
+	}
+	if j.Unsafe || j.Shell {
+		return nil // CheckCommand already used the shell's semantics
+	}
+	return checkShellLine(j, cmdline, 0)
 }
 
 // checkShellLine checks every segment of a shell line (split on operators,
@@ -212,7 +248,7 @@ command:
 		return fmt.Errorf("%s launches GPU work directly — %s", name, gpuHint)
 	}
 	if j != nil && !j.AllowCommand(name) {
-		return fmt.Errorf("command %q is not on the allowlist", name)
+		return fmt.Errorf("command %q is not on the allowlist%s", name, j.forMember())
 	}
 	if shells[name] {
 		for k, arg := range rest {

@@ -90,6 +90,10 @@ type WorkflowStep struct {
 	When    []whenClause  // nil = always
 	Review  string        // delegate: "" (the role's own) | "on" | "off" | a role name
 	Fork    string        // delegate: "" (the role's own) | "true" | "false"
+	// Member is the machine this step runs on: the author's value, rewritten by
+	// bind to the resolved member name (as Role already is). Legal on all three
+	// kinds — a run step has no role but it does have a machine.
+	Member string
 
 	reviewer string // the role that reviews this step's diff, resolved by bind
 }
@@ -137,6 +141,7 @@ type StepState struct {
 	Index      int         `json:"index"`
 	Kind       string      `json:"kind"`
 	Role       string      `json:"role,omitempty"`
+	Member     string      `json:"member"`
 	Reviewer   string      `json:"reviewer,omitempty"`
 	Review     string      `json:"review,omitempty"`
 	Model      string      `json:"model,omitempty"`
@@ -170,6 +175,7 @@ type WorkflowState struct {
 	Lead     string            `json:"lead,omitempty"`    // the lead role the run bound to
 	Tier     string            `json:"tier,omitempty"`    // the active tier the run bound to
 	NSteps   int               `json:"n_steps,omitempty"` // how many steps the file had: Cursor alone cannot say whether work is left
+	Members  map[string]string `json:"members,omitempty"` // step name → the member it bound to, for the resume guard
 	Started  string            `json:"started"`
 	Updated  string            `json:"updated"`
 	Cursor   int               `json:"cursor"` // index of the NEXT step to execute
@@ -191,6 +197,7 @@ type StepRecord struct {
 	Kind        string      `json:"kind"`                   // run | prompt | delegate
 	TaskSession string      `json:"task_session,omitempty"` // delegate: the subagent session, joining this step to its TaskRecord
 	Role        string      `json:"role,omitempty"`
+	Member      string      `json:"member"` // where this step ran
 	Reviewer    string      `json:"reviewer,omitempty"`
 	Review      string      `json:"review,omitempty"`
 	Model       string      `json:"model,omitempty"`
@@ -220,7 +227,7 @@ var reWFBareRef = regexp.MustCompile(`^(vars|steps)\.([A-Za-z0-9_-]+)(?:\.([A-Za
 
 var wfTopKeys = []string{"name", "description", "role", "timeout", "vars", "steps"}
 
-var wfStepKeys = []string{"run", "prompt", "delegate", "role", "check", "retries", "timeout", "on_fail", "when", "review", "fork"}
+var wfStepKeys = []string{"run", "prompt", "delegate", "role", "check", "retries", "timeout", "on_fail", "when", "review", "fork", "member"}
 
 // wfFields are the placeholder fields each kind of step produces.
 var wfFields = map[string][]string{
@@ -357,6 +364,11 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 				default:
 					s.Review = strings.TrimSpace(k.Value)
 				}
+			case "member":
+				if strings.TrimSpace(k.Value) == "" {
+					return fail("step %s: member: is empty (want a member name, or local)", sn.Key)
+				}
+				s.Member = strings.TrimSpace(k.Value)
 			case "fork":
 				switch strings.ToLower(strings.TrimSpace(k.Value)) {
 				case "true", "yes", "on":
@@ -650,6 +662,29 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 	}
 	delegates := false
 	for _, s := range wf.Steps {
+		if s.Kind != stepRun {
+			s.Role = firstNonEmpty(s.Role, wf.Role, lead)
+			if ag := o.agents[s.Role]; ag == nil || !ag.IsRole {
+				return fail("step %s: no role %q in roles.yaml", s.Name, s.Role)
+			}
+		}
+		// The machine, before the sandbox: a member carries its own allowlist and
+		// shell mode, so the machine that will run the line is the one that has to
+		// decide about it. A step without member: keeps the role's (or the lead's,
+		// on a run step, which has no role but does have a machine).
+		if s.Member == "" {
+			owner := s.Role
+			if s.Kind == stepRun {
+				owner = lead
+			}
+			s.Member = o.memberFor(o.agents[owner]).MemberName()
+		}
+		mem := o.member(s.Member)
+		if mem == nil {
+			return fail("step %s: member: %q is not a member (members: %s)", s.Name, s.Member, strings.Join(o.memberNames(), ", "))
+		}
+		s.Member = mem.MemberName()
+		jl := o.policyOf(mem)
 		// Ask the sandbox now. A command it would refuse, or a shell line this
 		// team cannot run, must not surface at step 9 of a pipeline that has
 		// already spent an hour; only a command built from a step's output
@@ -662,19 +697,18 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 			if err != nil {
 				return fail("step %s: %v", s.Name, err)
 			}
-			if !o.jl.Shell && !o.jl.Unsafe {
+			// Only for a step that runs HERE: locally the line is one argv, so the
+			// operator would be passed to the command as an argument and the step
+			// could only ever fail. On a member the far side's shell really does act
+			// on it — refusing it there would be a message that is not true, and
+			// checkOn below checks every segment of it instead.
+			if mem.IsLocal() && !jl.Shell && !jl.Unsafe {
 				if op := shellOperatorOutsideQuotes(line); op != "" {
 					return fail("step %s: this team runs one argv per command (no sandbox.shell), so %q is passed to the command as an argument — use two steps, or set sandbox: {shell: true} in roles.yaml", s.Name, op)
 				}
 			}
-			if err := o.jl.CheckCommand(line); err != nil {
+			if err := checkOn(jl, mem, line); err != nil {
 				return fail("step %s: %v", s.Name, err)
-			}
-		}
-		if s.Kind != stepRun {
-			s.Role = firstNonEmpty(s.Role, wf.Role, lead)
-			if ag := o.agents[s.Role]; ag == nil || !ag.IsRole {
-				return fail("step %s: no role %q in roles.yaml", s.Name, s.Role)
 			}
 		}
 		if s.Timeout == 0 {
@@ -719,12 +753,47 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 			s.reviewer = s.Review
 		}
 	}
+	// Every member the steps name, probed once and BEFORE any question that needs
+	// an answer from it: an unreachable fleet must cost zero tokens and leave no
+	// run directory behind, and a delegate step's "is not a git repository" about a
+	// machine that never answered would send the operator to git init a directory
+	// on a box that is down.
+	probed := map[string]bool{}
+	for _, s := range wf.Steps {
+		if probed[s.Member] {
+			continue
+		}
+		probed[s.Member] = true
+		if err := o.member(s.Member).reach(context.Background()); err != nil {
+			return fail("%v", err)
+		}
+	}
 	if delegates {
-		if o.remote != nil {
+		// The old single-remote spelling keeps its blanket refusal: its worktree
+		// would be local while the project is not. A members: fleet gets a worktree
+		// ON the member instead, so the question becomes per member.
+		if o.legacyFleet() {
 			return fail("delegate steps need local git worktrees; this team is configured for %s — use run/prompt steps instead", o.remote.Where())
 		}
-		if _, err := gitCmd(o.jl.Root, nil, nil, "rev-parse", "--show-toplevel"); err != nil {
-			return fail("delegate steps need a git repository (%s is not one)", o.jl.Root)
+		for _, s := range wf.Steps {
+			if s.Kind != stepDelegate {
+				continue
+			}
+			mem := o.member(s.Member)
+			if mem.IsLocal() {
+				if _, err := gitCmd(o.jl.Root, nil, nil, "rev-parse", "--show-toplevel"); err != nil {
+					return fail("delegate steps need a git repository (%s is not one)", o.jl.Root)
+				}
+				continue
+			}
+			// The member answered the probe above, so this is about the directory.
+			// git's own complaint comes along: "not a git repository" and "no git
+			// installed" need different fixes and the operator should not have to
+			// guess which one this was.
+			if out, errs, exit := mem.Rem.plumb(context.Background(), "git rev-parse --show-toplevel", nil, 2*time.Minute); exit != 0 {
+				return fail("step %s: role %s runs on member %s, whose directory %s is not a git repository — a delegate step needs a worktree there (git init or clone it), or run the role on another member: %s",
+					s.Name, s.Role, mem.MemberName(), mem.Rem.Dir, strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 2, 200)))
+			}
 		}
 	}
 	wf.attempts = o.verifyAttempts()
@@ -771,7 +840,9 @@ func (wf *Workflow) plan() [][]string {
 		if s.reviewer != "" {
 			role += " → " + s.reviewer
 		}
-		rows = append(rows, []string{strconv.Itoa(i + 1), s.Name, s.Kind, role, attempts, to, when, orDash(truncate(firstLine(s.Check), 40))})
+		// The member column is always present: -dry-run is where an operator reads
+		// what will run where.
+		rows = append(rows, []string{strconv.Itoa(i + 1), s.Name, s.Kind, role, orDash(s.Member), attempts, to, when, orDash(truncate(firstLine(s.Check), 40))})
 	}
 	return rows
 }
@@ -1548,16 +1619,35 @@ func (r *wfRunner) runStep(ctx context.Context, s *WorkflowStep, announce func(s
 // RunVerifiedAll takes, so a remote project works too. A command the sandbox
 // refuses is a failed step whose Detail is the refusal, never a silent skip.
 func (r *wfRunner) shellStep(ctx context.Context, s *WorkflowStep, cmd string, timeout time.Duration) (string, int) {
-	if rem := r.lead.remote(); rem != nil {
+	mem := r.orch.member(s.Member)
+	if mem == nil {
+		// bind resolves and rewrites every step's member, so this cannot happen
+		// today — and it must not become a fallback if a new door ever reaches
+		// here: running on the lead's machine instead of the one the step names,
+		// with no message, is the single worst thing this feature could do.
+		why := fmt.Sprintf("member %s is not a member (members: %s)", s.Member, strings.Join(r.orch.memberNames(), ", "))
+		r.log.line(why)
+		return why, -1
+	}
+	jl := r.orch.policyOf(mem)
+	if rem := mem.Rem; rem != nil {
+		// The gate is inside Remote.run too, but a step's refusal has to reach
+		// run.log: nothing streamed, so this is the only place it can be written.
+		if err := mem.reach(ctx); err != nil {
+			r.log.line(err.Error())
+			return err.Error(), -1
+		}
 		// Remote.run consults no policy of its own, so the allowlist and the GPU
 		// rules are applied here — the same line must not be refused locally and
-		// waved through on a remote host.
-		if err := r.lead.jail().CheckCommand(cmd); err != nil {
+		// waved through on another machine. A member is not a hole in the sandbox:
+		// what is checked is the command we are about to send, with the semantics
+		// of the shell that will run it, never the ssh argv we build around it.
+		if err := jl.CheckRemote(cmd); err != nil {
 			return "sandbox: " + err.Error(), -1
 		}
 		return rem.run(ctx, cmd, timeout, nil, r.log)
 	}
-	return execCheck(ctx, r.lead.jail(), cmd, timeout, r.log)
+	return execCheck(ctx, jl, cmd, timeout, r.log)
 }
 
 // shellSteps is the action plus its check, retried as a unit. The step is ok
@@ -1639,6 +1729,13 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 	// the ones a prompt step made. The session outlives forgetChild; only its
 	// resumability by task_id goes away.
 	r.forkSrc = child
+	// The step's machine, before the task message: RefreshSystem keeps Msgs[0]
+	// that role's own system prompt for that member, which is the prefix the
+	// gateway caches.
+	if child.member != s.Member {
+		child.member = s.Member
+		child.RefreshSystem()
+	}
 	child.view = &workflowView{View: child.view, log: r.log, step: s.Name}
 	child.checkLive = r.log
 	child.Msgs = append(child.Msgs, Message{Role: "user", Content: text})
@@ -1707,7 +1804,7 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 		if s.Timeout > 0 {
 			actx, cancel = context.WithTimeout(ctx, s.Timeout)
 		}
-		tc := &ToolCtx{Ctx: actx, S: r.lead, Name: "delegate", Reviewer: s.reviewer, ForkFrom: r.forkSrc}
+		tc := &ToolCtx{Ctx: actx, S: r.lead, Name: "delegate", Reviewer: s.reviewer, ForkFrom: r.forkSrc, Member: s.Member}
 		args := Args{"role": s.Role, "task": task, "check_cmd": check, "review": s.reviewer != ""}
 		if s.Fork != "" {
 			args["fork"] = s.Fork == "true"
@@ -1779,8 +1876,9 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 // stop `; rm -rf ~` becoming a second segment, and without a shell tokenize
 // keeps it one argv word. A ${vars.k} goes in verbatim: it comes from the file
 // or the command line, the same trust as roles.yaml allow:, and a var like
-// "-count=1 ./..." must stay several words. The result still goes through
-// Jail.CheckCommand.
+// "-count=1 ./..." must stay several words. The result still goes through the
+// sandbox — Jail.CheckCommand here, Jail.CheckRemote for a step on a member,
+// whose own shell would act on an operator a var brought in.
 func (r *wfRunner) expand(text string, quote bool) (string, error) {
 	if text == "" {
 		return "", nil
@@ -1918,7 +2016,7 @@ func (r *wfRunner) record(s *WorkflowStep, o *stepOutcome, start time.Time, d ti
 			rel = ""
 		}
 	}
-	ss := &StepState{Name: s.Name, Index: s.Index, Kind: s.Kind, Role: s.Role, Reviewer: o.Reviewer, Review: o.Review, Model: o.Model, Session: o.Session,
+	ss := &StepState{Name: s.Name, Index: s.Index, Kind: s.Kind, Role: s.Role, Member: s.Member, Reviewer: o.Reviewer, Review: o.Review, Model: o.Model, Session: o.Session,
 		Status: o.Status, Exit: o.Exit, Checked: o.Checked, Attempts: o.Attempts, Out: o.Out,
 		Detail: truncate(o.Detail, 2000), Started: traceTS(start),
 		Finished: nowTS(), DurationMs: d.Milliseconds(), Usage: o.Usage}
@@ -1950,7 +2048,7 @@ func (r *wfRunner) storeDiff(s *WorkflowStep, diff string) (string, error) {
 
 func (r *wfRunner) traceStep(s *WorkflowStep, ss *StepState, o stepOutcome) {
 	rec := StepRecord{Type: "step", TS: nowTS(), RootSession: r.lead.rootUID(), Session: ss.Session,
-		Run: r.st.Run, Workflow: r.wf.Name, Step: ss.Name, Index: ss.Index, Kind: ss.Kind, TaskSession: o.TaskSession, Role: ss.Role,
+		Run: r.st.Run, Workflow: r.wf.Name, Step: ss.Name, Index: ss.Index, Kind: ss.Kind, TaskSession: o.TaskSession, Role: ss.Role, Member: ss.Member,
 		Reviewer: ss.Reviewer, Review: ss.Review,
 		Model: ss.Model, Status: ss.Status, Exit: ss.Exit, Check: o.Check, CheckExit: o.CheckExit,
 		Checked: ss.Checked, Attempts: ss.Attempts, DurationMs: ss.DurationMs, Usage: ss.Usage,
@@ -2196,6 +2294,15 @@ func runWorkflow(cfg Config, args []string) int {
 		errLine("%v", err)
 		return 2
 	}
+	if st != nil {
+		// Only bind knows which machine each step resolves to, so this guard cannot
+		// sit with the tier and lead ones above.
+		if err := checkResumeFleet(wf, st); err != nil {
+			errLine("%v", err)
+			hint("start a fresh run: lca run %s", wf.Name)
+			return 2
+		}
+	}
 	for _, w := range orch.warnings {
 		warnLine("%s", w)
 	}
@@ -2205,7 +2312,7 @@ func runWorkflow(cfg Config, args []string) int {
 		if wf.Desc != "" {
 			row("about", wf.Desc)
 		}
-		table([]string{"#", "step", "kind", "role", "tries", "timeout", "when", "check"}, wf.plan())
+		table([]string{"#", "step", "kind", "role", "member", "tries", "timeout", "when", "check"}, wf.plan())
 		hint("nothing ran: -dry-run validates and prints the plan")
 		return 0
 	}
@@ -2280,6 +2387,35 @@ func checkResume(wf *Workflow, st *WorkflowState, cliVars map[string]string, roo
 	return nil
 }
 
+// checkResumeFleet refuses a resume whose steps would now run on another machine
+// than the run recorded. roles.yaml can change between two invocations — a
+// defaults: member:, a role's member: — and bind resolves every step against the
+// file as it is today, so steps 1..n would have run on one machine and the rest
+// on another, with paths, build artefacts and git state from two trees under one
+// green result. That is the tier guard's failure in another dress, and the
+// recorded member is there to be read back.
+//
+// It runs AFTER bind, which is what resolves s.Member; the members: map covers
+// every step (a run from before it existed has only the steps that ran, and those
+// are still compared).
+func checkResumeFleet(wf *Workflow, st *WorkflowState) error {
+	was := map[string]string{}
+	for _, ss := range st.Steps {
+		was[ss.Name] = ss.Member
+	}
+	for n, m := range st.Members {
+		was[n] = m
+	}
+	for _, s := range wf.Steps {
+		prev := was[s.Name]
+		if prev == "" || prev == s.Member {
+			continue
+		}
+		return fmt.Errorf("this run bound step %s to member %s and %s is configured now — a run split across two machines reports one result over two trees", s.Name, prev, s.Member)
+	}
+	return nil
+}
+
 // attachRun records that this process is now working on the run, and un-pauses
 // it: a resume is what clears a pause.
 func attachRun(o *Orchestrator, dir string, st *WorkflowState) {
@@ -2302,7 +2438,13 @@ func newRunState(cfg Config, o *Orchestrator, wf *Workflow, lead string, vars ma
 	}
 	st := &WorkflowState{Version: wfStateVersion, Run: id, Workflow: wf.Name, Path: wf.Path, Sum: wf.Sum,
 		Root: o.jl.Root, Lead: lead, Tier: o.activeTier(), NSteps: len(wf.Steps), Sessions: []string{o.rec.id}, Traces: []string{o.tracer.Path},
-		Vars: vars, Started: nowTS(), Status: "running"}
+		Vars: vars, Started: nowTS(), Status: "running", Members: map[string]string{}}
+	// bind has already resolved every step's machine: recording all of them, not
+	// only the ones that run, is what lets a resume refuse a fleet that moved
+	// under a step that had not started yet.
+	for _, s := range wf.Steps {
+		st.Members[s.Name] = s.Member
+	}
 	return filepath.Join(runsDir(cfg), id), st
 }
 

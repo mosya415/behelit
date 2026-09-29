@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -162,4 +163,98 @@ func (r *Repl) cmdRun(arg string) bool {
 		Message{Role: "assistant", Content: "Understood.", Agent: r.sess.agent.Name})
 	r.sess.saveTranscript()
 	return false
+}
+
+// probeMembers checks every member's reachability through the cached gate, in
+// parallel and bounded, so /members and doctor cost one short ssh per machine
+// and not one per row of output. A local member is always reachable.
+func probeMembers(ctx context.Context, o *Orchestrator, names []string) map[string]error {
+	out := make(map[string]error, len(names))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, min(max(len(names), 1), 8))
+	for _, n := range names {
+		m := o.member(n)
+		if m.IsLocal() {
+			continue
+		}
+		wg.Add(1)
+		go func(name string, m *Member) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err := m.reach(ctx)
+			mu.Lock()
+			out[name] = err
+			mu.Unlock()
+		}(n, m)
+	}
+	wg.Wait()
+	return out
+}
+
+// memberSandbox describes what a member may run, for a table cell.
+func memberSandbox(o *Orchestrator, m *Member) string {
+	j := o.policyOf(m)
+	if j == nil {
+		return "—"
+	}
+	switch {
+	case j.Unsafe:
+		return "unsafe"
+	case m != nil && m.Allow != nil:
+		return fmt.Sprintf("%d own%s", len(m.Allow), map[bool]string{true: " · sh", false: ""}[j.Shell])
+	}
+	return fmt.Sprintf("%d team%s", len(j.Allowed), map[bool]string{true: " · sh", false: ""}[j.Shell])
+}
+
+func (r *Repl) cmdMembers(string) bool {
+	o := r.orch
+	names := o.memberNames()
+	section("members", faint("%s", plural(len(names), "machine", "machines")))
+	reach := probeMembers(context.Background(), o, names)
+	byMember := map[string][]string{}
+	if o.roles != nil {
+		for _, a := range o.roles.Roles {
+			n := o.memberFor(a).MemberName()
+			byMember[n] = append(byMember[n], a.Name)
+		}
+	}
+	here := r.sess.memberName()
+	var rows [][]string
+	var fixes []string
+	for _, n := range names {
+		m := o.member(n)
+		label := n
+		if n == here {
+			label = cBold + n + cReset
+		}
+		status := cGreen + "ok" + cReset
+		if err := reach[n]; err != nil {
+			// A machine ssh reaches whose project directory is not there is not
+			// "unreachable": the cell names what is actually wrong, and the line
+			// below it says what to do.
+			status = cRed + map[bool]string{true: "no project dir", false: "unreachable"}[memberDirMissing(err)] + cReset
+			fixes = append(fixes, err.Error())
+		}
+		rows = append(rows, []string{label, faint("%s", m.Where()+dirSuffix(m)), memberSandbox(o, m),
+			faint("%s", orDash(strings.Join(byMember[n], ", "))), status})
+	}
+	table([]string{"member", "where", "sandbox", "roles", "status"}, rows)
+	for _, f := range fixes {
+		errLine("%s", f)
+	}
+	hint("pin a role with member: <name> in roles.yaml · a step's member: overrides it")
+	if o.legacyFleet() {
+		hint("member remote comes from the old remote: block — delegate is off there; move it into members: for cross-machine worktrees")
+	}
+	return false
+}
+
+// dirSuffix shows which directory a member's project is in, next to the host.
+func dirSuffix(m *Member) string {
+	if m.IsLocal() {
+		return ""
+	}
+	return ":" + m.Rem.Dir
 }

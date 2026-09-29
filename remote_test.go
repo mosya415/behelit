@@ -201,3 +201,33 @@ func TestRemoteConfigFromEnv(t *testing.T) {
 	}
 	_ = json.Marshal
 }
+
+// ssh: has two live spellings, and getting them confused is what made following
+// this file's own documentation exec "-o": a list whose first element starts
+// with "-" is extra FLAGS on top of the default transport, anything else is the
+// whole transport argv (which is the only network-free test harness there is).
+func TestSSHFlagsOrWholeTransport(t *testing.T) {
+	for _, c := range []struct {
+		ssh  []string
+		want string
+	}{
+		{nil, "ssh -o BatchMode=yes -o ConnectTimeout=10 h script"},
+		{[]string{"-o", "X"}, "ssh -o BatchMode=yes -o ConnectTimeout=10 -o X h script"},
+		{[]string{"-p", "2222"}, "ssh -o BatchMode=yes -o ConnectTimeout=10 -p 2222 h script"},
+		{[]string{"sh", "-c"}, "sh -c h script"},
+	} {
+		r := &Remote{Host: "h", Dir: "/p", SSH: c.ssh}
+		if got := strings.Join(r.argv("script"), " "); got != c.want {
+			t.Errorf("ssh: %v → %q, want %q", c.ssh, got, c.want)
+		}
+	}
+	// Extra flags must not be appended to the caller's slice in place: two
+	// members sharing one backing array would accumulate each other's flags.
+	shared := make([]string, 1, 4)
+	shared[0] = "-o"
+	r := &Remote{Host: "h", Dir: "/p", SSH: shared}
+	first := strings.Join(r.argv("s"), " ")
+	if second := strings.Join(r.argv("s"), " "); first != second {
+		t.Fatalf("sshCmd is not idempotent: %q then %q", first, second)
+	}
+}

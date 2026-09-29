@@ -65,6 +65,7 @@ type Agent struct {
 	Review   string // roles.yaml `review:` — the role that reviews this role's diffs
 	Fork     bool   // roles.yaml `fork:` — delegations to this role start from the caller's reads
 	Tier     string // roles.yaml `tier:` — the chain this role names instead of models:
+	Member   string // roles.yaml `member:` — the machine this role's sessions work on
 }
 
 func (a *Agent) isPrimary() bool  { return a.Mode == "primary" || a.Mode == "all" || a.Mode == "" }

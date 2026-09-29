@@ -59,7 +59,9 @@ func replRegistry() []replCmd {
 		{name: "/agents", desc: "the team: roles and agents", group: "agents", run: (*Repl).cmdAgents},
 		{name: "/role", aliases: []string{"/roles"}, args: "[<name> <setting> <value>]", desc: "show or change roles by hand (model, effort, tools, check)", group: "agents", run: (*Repl).cmdRole},
 		{name: "/delegate", args: "<role> <task>", desc: "hand one task to a role now (worktree + verifier)", group: "agents",
-			show: func(r *Repl) bool { return r.teamMode() && r.orch.remote == nil }, run: (*Repl).cmdDelegate},
+			show: func(r *Repl) bool { return r.teamMode() && r.orch.canDelegate(r.sess.memberOf()) }, run: (*Repl).cmdDelegate},
+		{name: "/members", desc: "the machines the team works on, and whether they answer", group: "agents",
+			show: func(r *Repl) bool { return len(r.orch.memberNames()) > 1 }, run: (*Repl).cmdMembers},
 		{name: "/run", args: "<name> [k=v …]", desc: "run a workflow (deterministic steps)", group: "agents", run: (*Repl).cmdRun},
 		{name: "/tasks", args: "[<id>]", desc: "subagent runs and their results", group: "agents", run: (*Repl).cmdTasks},
 		{name: "/todo", aliases: []string{"/todos"}, desc: "the agent's todo list", group: "agents", run: (*Repl).cmdTodo},
@@ -227,7 +229,7 @@ func (r *Repl) statusLine() string {
 		parts = append(parts, fmt.Sprintf("%d running in background", n))
 	}
 	if rem := s.remote(); rem != nil {
-		parts = append(parts, rem.Host+":"+path.Base(rem.Dir))
+		parts = append(parts, s.memberName()+" · "+rem.Host+":"+path.Base(rem.Dir))
 	} else {
 		parts = append(parts, shortDir(s.jail().Root))
 	}
@@ -278,8 +280,8 @@ func (r *Repl) Banner() {
 	if len(facts) > 0 {
 		proj += faint(" · %s", strings.Join(facts, " · "))
 	}
-	if rem := o.remote; rem != nil {
-		proj = cBold + path.Base(rem.Dir) + cReset + "  " + faint("%s on %s · over ssh", ellipsizeMiddle(rem.Dir, 40), rem.Host)
+	if rem := s.remote(); rem != nil {
+		proj = cBold + path.Base(rem.Dir) + cReset + "  " + faint("%s · %s on %s · over ssh", s.memberName(), ellipsizeMiddle(rem.Dir, 40), rem.Host)
 	}
 	row("project", proj)
 
@@ -506,6 +508,9 @@ func (r *Repl) cmdAgents(string) bool {
 			what += " · tier " + t
 		}
 		section("team", faint("%s", what))
+		// The member column appears only on a fleet, so a single-machine team's
+		// output is byte-identical to what it has always been.
+		fleet := len(o.memberNames()) > 1
 		var rows [][]string
 		for _, a := range o.roles.Roles {
 			name := a.Name
@@ -520,9 +525,17 @@ func (r *Repl) cmdAgents(string) bool {
 			if a.Context > 0 {
 				ctx = kfmt(a.Context)
 			}
-			rows = append(rows, []string{name, orDash(a.Tier), strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))})
+			cols := []string{name, orDash(a.Tier), strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))}
+			if fleet {
+				cols = append(cols, o.memberFor(a).MemberName())
+			}
+			rows = append(rows, cols)
 		}
-		table([]string{"role", "tier", "models", "effort", "context", "tools", "check"}, rows)
+		head := []string{"role", "tier", "models", "effort", "context", "tools", "check"}
+		if fleet {
+			head = append(head, "member")
+		}
+		table(head, rows)
 	}
 	section("agents")
 	var rows [][]string
@@ -835,7 +848,10 @@ func (r *Repl) cmdLoop(arg string) bool {
 }
 
 func (r *Repl) cmdUnsafe(arg string) bool {
-	jail := r.sess.jail()
+	// The team's jail, not this session's view of it: a member that scopes its
+	// own allowlist gets a COPY of o.jl rebuilt per call, so lifting the sandbox
+	// on the copy would lift it for nobody. The operator means the whole fleet.
+	jail := r.orch.jl
 	v, ok := toggle(arg, jail.Unsafe)
 	if !ok {
 		errLine("usage: /unsafe [on|off]")

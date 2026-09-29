@@ -467,7 +467,7 @@ func runEvalTask(cfg Config, t *EvalTask, dir string, keep, verbose bool) (res E
 		v.Status = "timeout"
 	}
 	cancel()
-	sess.traceTask(t.Prompt, v, t.CheckCmd, 0, 0, false, nil, vstart)
+	sess.traceTask(t.Prompt, v, t.CheckCmd, 0, 0, false, nil, vstart, "")
 	sess.saveTranscript()
 	orch.tracer.Close()
 

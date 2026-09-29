@@ -303,14 +303,10 @@ func runCommandTool(tc *ToolCtx, a Args) string {
 	if t := a.Int("timeout"); t > 0 {
 		timeout = time.Duration(min(t, 1800)) * time.Second
 	}
-	var res string
-	if rem := tc.S.remote(); rem != nil {
-		out, exit := rem.run(tc.Ctx, cmd, timeout, nil, tc.S.view.Live())
-		res = remoteCmdResult(out, exit, timeout)
-	} else {
-		res = runCommand(tc.Ctx, tc.S.jail(), cmd, timeout, tc.S.view.Live())
-	}
-	tc.S.event("run_command", map[string]any{"cmd": cmd, "approved": true, "result": summarize(res)})
+	// One chokepoint for both machines: the member's sandbox decides before
+	// anything leaves this one (Session.runTool).
+	res := tc.S.runTool(tc.Ctx, cmd, timeout, tc.S.view.Live())
+	tc.S.event("run_command", map[string]any{"cmd": cmd, "member": tc.S.memberName(), "approved": true, "result": summarize(res)})
 	return res
 }
 
@@ -407,19 +403,19 @@ func runRemoteEdit(tc *ToolCtx, rem *Remote, a Args, path, oldS, newS string) st
 	}
 	updated, strategy, err := fuzzyReplace(content, oldS, newS, a.Bool("replace_all"))
 	if err != nil {
-		tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "error": err.Error()})
+		tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "error": err.Error()})
 		return "error: " + path + ": " + err.Error()
 	}
 	msg, ok := tc.Ask("edit", path, "EDIT "+path, unifiedPreview(oldS, newS))
 	if !ok {
-		tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "approved": false})
+		tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": false})
 		return msg
 	}
 	if errs := rem.write(tc.Ctx, rel, updated); errs != "" {
 		return errs
 	}
 	tc.S.noteRead(tc.Ctx, path)
-	tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "approved": true, "strategy": strategy})
+	tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": true, "strategy": strategy})
 	res := fmt.Sprintf("edited %s on %s (1 replacement)", path, rem.Where())
 	if strategy != "exact" {
 		res += " — matched via " + strategy + " fallback; re-read before further edits nearby"
@@ -442,14 +438,14 @@ func runRemoteWrite(tc *ToolCtx, rem *Remote, path, content string) string {
 	preview := fmt.Sprintf("   %s %s on %s (%d bytes)", action, path, rem.Where(), len(content))
 	msg, ok := tc.Ask("edit", path, strings.ToUpper(action)+" "+path, preview)
 	if !ok {
-		tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "approved": false})
+		tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": false})
 		return msg
 	}
 	if errs := rem.write(tc.Ctx, rel, content); errs != "" {
 		return errs
 	}
 	tc.S.noteRead(tc.Ctx, path)
-	tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "approved": true, "bytes": len(content)})
+	tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": true, "bytes": len(content)})
 	return fmt.Sprintf("wrote %s on %s (%d bytes)", path, rem.Where(), len(content))
 }
 
@@ -463,7 +459,11 @@ func remoteCmdResult(out string, exit int, timeout time.Duration) string {
 		}
 		return res
 	case exit < 0:
-		return res
+		// Never ran (member unreachable, ssh gone) or killed by the timeout:
+		// the "error:" prefix is what execCall reads to mark the call failed, so
+		// the trace and /stats do not report a clean call for work that did not
+		// happen on any machine.
+		return "error: " + strings.TrimSpace(res)
 	default:
 		return res + fmt.Sprintf("\n(exit status %d)", exit)
 	}

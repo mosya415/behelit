@@ -75,8 +75,17 @@ func (s *Session) RunVerifiedAll(ctx context.Context, checks []string, attempts 
 	// A check the sandbox would refuse is an error up front, not after a whole
 	// agent run spent attempts on it.
 	for _, check := range checks {
-		if err := s.jail().CheckCommand(check); err != nil {
+		if err := s.checkCmd(check); err != nil {
 			v.Status, v.Tail = "error", "check rejected by the sandbox: "+err.Error()
+			return v
+		}
+	}
+	// An unreachable member is an ERROR, not a failed check: feeding an ssh
+	// failure back to a model as "your change did not pass" asks it to fix
+	// something it cannot reach.
+	if len(checks) > 0 {
+		if err := s.memberOf().reach(ctx); err != nil {
+			v.Status, v.Tail = "error", err.Error()
 			return v
 		}
 	}
@@ -99,15 +108,20 @@ func (s *Session) RunVerifiedAll(ctx context.Context, checks []string, attempts 
 		exit := 0
 		for _, check = range checks {
 			cstart := time.Now()
-			if rem := s.remote(); rem != nil {
-				out, exit = rem.run(ctx, check, s.orch.checkTimeout(), nil, s.checkLive)
-			} else {
-				out, exit = execCheck(ctx, s.jail(), check, s.orch.checkTimeout(), s.checkLive)
-			}
+			out, exit = s.runCheck(ctx, check, s.orch.checkTimeout(), s.checkLive)
 			s.stats.VerifyRuns++
 			s.view.Check(check, exit, time.Since(cstart), attempt, attempts)
-			s.event("verify", map[string]any{"check": check, "exit": exit, "attempt": attempt})
+			s.event("verify", map[string]any{"check": check, "member": s.memberName(), "exit": exit, "attempt": attempt})
 			if exit != 0 {
+				// A check that "failed" because the machine went away mid-run is not
+				// a failing check: ssh's own error fed back as "your change did not
+				// pass" asks the model to fix a VPN, and burns every attempt doing
+				// it. The transport error already dropped the gate, so this asks
+				// once, and only after something has already failed.
+				if rerr := s.memberOf().reach(ctx); rerr != nil {
+					v.Status, v.Tail = "error", rerr.Error()
+					return v
+				}
 				break
 			}
 		}

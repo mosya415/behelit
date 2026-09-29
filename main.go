@@ -126,7 +126,7 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []st
 	}
 	start := time.Now()
 	v := sess.RunVerified(context.Background(), check, orch.verifyAttempts())
-	sess.traceTask(prompt, v, check, 0, 0, false, nil, start)
+	sess.traceTask(prompt, v, check, 0, 0, false, nil, start, "")
 	sess.saveTranscript()
 	fmt.Fprintf(os.Stderr, "\n%s  %s\n", statusWord(v.Status), faint("%s · %s", check, plural(v.Attempts, "attempt", "attempts")))
 	if v.Status != "passed" {

@@ -298,6 +298,13 @@ func (o *Orchestrator) newChild(parent *Session, ag *Agent, desc string) (*Sessi
 	if ev, ok := parent.view.(*evalView); ok {
 		child.view = ev // eval output stays compact
 	}
+	// The machine: the role's own member:, else the CALLER's. Not
+	// defaults.member — the task tool's contract is that a subagent shares the
+	// caller's tree, so it must share the caller's machine. A delegation resolves
+	// through memberFor instead, because it creates a tree of its own. Set before
+	// Msgs[0] so the environment block names the right machine from the first
+	// byte.
+	child.member = firstNonEmpty(ag.Member, parent.memberName())
 	child.Msgs = []Message{{Role: "system", Content: child.systemPrompt()}}
 
 	o.mu.Lock()

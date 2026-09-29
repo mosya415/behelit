@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -171,7 +172,11 @@ func (o *Orchestrator) reviewDelegation(ctx context.Context, child *Session, rev
 		return out
 	}
 	defer o.forgetChild(rev.ID) // the worktree dies with this call: not resumable via task_id
+	// The reviewer reads the worktree, so it runs WHERE the worktree is, whatever
+	// its own member: says. A reviewer pinned elsewhere produced a warning at
+	// load time; moving it silently is the thing that must not happen.
 	rev.jl, rev.isolated = child.jl, true
+	rev.member, rev.wtRem = child.member, child.wtRem
 	// rules() puts s.extra last, so this beats isolationRules' edit:* Allow: a
 	// reviewer must not be able to edit its way into the diff it is judging. The
 	// apply itself is safe regardless — diff and wt.changedFiles were captured
@@ -277,8 +282,22 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		checks = append(checks, extra)
 	}
 	check := strings.Join(checks, " && ")
+	// The machine this role's sessions work on, overridden by a workflow step's
+	// member:. The check is asked of THAT machine's sandbox, not the caller's: a
+	// GPU member's allowlist is the one the check will meet.
+	target := o.memberFor(role)
+	if tc.Member != "" {
+		m := o.member(tc.Member)
+		if m == nil {
+			// Not a fallback to the role's own machine: a caller that named a member
+			// has to be told its name is not one, or the work quietly runs elsewhere.
+			return marshalDelegate(delegateResult{Status: "error", TestTail: fmt.Sprintf(
+				"member %s is not a member (members: %s)", tc.Member, strings.Join(o.memberNames(), ", "))})
+		}
+		target = m
+	}
 	for _, c := range checks {
-		if err := s.jail().CheckCommand(c); err != nil {
+		if err := checkOn(o.policyOf(target), target, c); err != nil {
 			return marshalDelegate(delegateResult{Status: "error", TestTail: "check_cmd rejected by the sandbox: " + err.Error()})
 		}
 	}
@@ -295,9 +314,55 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		}
 	}
 
-	wt, err := o.worktrees.create(s.jail().Root, o.cfg.stateDir(), s.rootUID())
+	// The caller's TREE, which is not the same question as the caller's member: a
+	// nested delegation's caller is itself a worktree on that member (s.remote()
+	// is that worktree's transport), and applying a verified diff into the
+	// member's real checkout instead is an isolation escape the local path does
+	// not have.
+	caller := s.memberOf()
+	if rem := s.remote(); rem != nil && rem != caller.Rem {
+		c := *caller
+		c.Rem = rem
+		caller = &c
+	}
+	// Where the worktree is made depends on the TARGET alone; whether the caller's
+	// tree is that same tree is the second question. Branching both on one flag
+	// refused a role pinned to member local whenever the caller lived on a member
+	// — the laptop half of "build on the box, commit on the laptop" — with
+	// createOn's internal precondition note.
+	sameTree := target.IsLocal() && caller.IsLocal()
+	var wt *worktree
+	var err error
+	if target.IsLocal() {
+		wt, err = o.worktrees.create(s.jail().Root, o.cfg.stateDir(), s.rootUID())
+	} else {
+		wt, err = o.worktrees.createOn(tc.Ctx, target, s.rootUID())
+	}
 	if err != nil {
-		return "error: cannot create a worktree: " + err.Error()
+		// A member that could not be reached, has no git, or is not a repository
+		// is a delegation that did not happen — reported in the result contract,
+		// so a workflow step reads it like any other failure.
+		return marshalDelegate(delegateResult{Status: "error", TestTail: "cannot create a worktree: " + err.Error()})
+	}
+	wt.mem = target // createOn already knows; create does not, and heads() names it
+	if !sameTree {
+		// git diff paths are repository-relative, so the subagent's project must
+		// sit at the same place in its repository as the caller's does in the
+		// caller's. Compared right after create (one round trip fewer than probing
+		// first); a mismatch is a patch nothing could survive, so it is refused
+		// here rather than surfacing later as a mysterious conflict.
+		top, sub, cerr := o.callerLayout(tc.Ctx, caller, s.jail().Root)
+		if cerr != nil {
+			wt.remove()
+			return marshalDelegate(delegateResult{Status: "error", TestTail: cerr.Error()})
+		}
+		if sub != wt.sub {
+			wt.remove()
+			return marshalDelegate(delegateResult{Status: "error", TestTail: fmt.Sprintf(
+				"delegate to %s on member %s: the project sits at %s of its repository there, but at %s of yours on %s — a diff's paths are relative to the repository, so the two must match. Point members.%s dir: at the same subdirectory, or run %s on member local.",
+				roleName, target.MemberName(), layoutWord(wt.sub), layoutWord(sub), caller.MemberName(), target.MemberName(), roleName)})
+		}
+		wt.caller, wt.callerTop = caller, top
 	}
 	defer wt.remove()
 
@@ -307,19 +372,43 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 	}
 	o.forgetChild(child.ID) // its worktree dies with this call: not resumable via task_id
 	tc.TaskSession = child.UID
-	child.jl, err = NewJail(wt.root, o.jl.Allowed, o.jl.Unsafe)
-	if child.jl != nil {
-		child.jl.Shell = o.jl.Shell
-	}
-	if err != nil {
-		return "error: " + err.Error()
+	if target.IsLocal() {
+		// A worktree on this machine, so the child gets a local jail rooted in it —
+		// built from the TARGET member's policy, not the team's: the allowlist the
+		// check_cmd was just validated against has to be the one the subagent runs
+		// under, or a member's narrower allow:/shell: is bypassed by one delegate
+		// call. The member name travels with it so a refusal still names the machine.
+		base := o.policyOf(target)
+		child.member = target.MemberName()
+		child.jl, err = NewJail(wt.root, base.Allowed, base.Unsafe)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		child.jl.Shell, child.jl.Member = base.Shell, base.Member
+	} else {
+		// The worktree's own transport, so Remote.relPath confines the subagent to
+		// its worktree's project directory exactly as it confines a session to a
+		// project. No local jail: there is no local tree to confine.
+		child.member, child.wtRem, child.jl = target.MemberName(), wt.rem.withDir(wt.root), nil
+		child.view.Note(fmt.Sprintf("DELEGATE %s on %s — the subagent starts from THAT machine's working tree, not yours; its diff applies here only where the two agree",
+			roleName, target.Label()))
 	}
 	child.isolated = true
 	child.RefreshSystem()
 	// Before the task message and after RefreshSystem: the child's own system
 	// prompt stays Msgs[0], byte-identical to any other session of that role,
 	// because the prefix is the gateway's cache key.
-	if argBool(a, "fork", role.Fork) {
+	wantFork := argBool(a, "fork", role.Fork)
+	if wantFork && !sameTree {
+		// forkedContext resolves paths with child.jail().Resolve and seeds mtimes
+		// with os.ReadFile: inheriting one machine's bytes as another's truth would
+		// seed noteRead for files the child has never seen and let it edit without
+		// reading.
+		child.view.Note(fmt.Sprintf("FORK  skipped: your reads are from %s, %s works in its own tree on %s — it reads those files there itself",
+			caller.Label(), roleName, target.Label()))
+		wantFork = false
+	}
+	if wantFork {
 		src := s
 		if tc.ForkFrom != nil {
 			src = tc.ForkFrom
@@ -337,7 +426,7 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		prompt += fmt.Sprintf("\n\n---\nDefinition of done: `%s` exits 0 in this working tree. A verifier runs it after you stop; it decides, not you.", check)
 	}
 	child.Msgs = append(child.Msgs, Message{Role: "user", Content: prompt})
-	s.event("delegate", map[string]any{"task_id": child.ID, "role": roleName, "check": check, "worktree": wt.dir})
+	s.event("delegate", map[string]any{"task_id": child.ID, "role": roleName, "check": check, "worktree": wt.dir, "member": target.MemberName()})
 
 	entry := o.trackStart(child.ID, "delegate", roleName, task)
 	child.view.Begin()
@@ -408,15 +497,24 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 			v.Tail = strings.TrimSpace(v.Tail + "\n" + msg)
 		} else if err := wt.applyTo(s.jail().Root, diff); err != nil {
 			v.Status = "conflict"
-			v.Tail = strings.TrimSpace(v.Tail + "\n\napplying the diff to the caller's tree failed:\n" + err.Error())
+			why := "applying the diff to the caller's tree failed:\n" + err.Error()
+			if !sameTree {
+				why = fmt.Sprintf("applying %s's diff from %s to your tree on %s failed:\n%s\n%s",
+					roleName, target.MemberName(), caller.MemberName(), err.Error(), wt.heads(roleName))
+			}
+			v.Tail = strings.TrimSpace(v.Tail + "\n\n" + why)
 		} else {
 			applied = true
 			for _, f := range wt.changedFiles {
-				o.noteRead(s.jail(), f) // the caller has "seen" what it just merged
+				s.noteRead(tc.Ctx, f) // the caller has "seen" what it just merged
 			}
 		}
 	}
-	child.traceTask(task, v, check, len(diff), files, applied, review, start)
+	callerMember := ""
+	if !sameTree {
+		callerMember = caller.MemberName()
+	}
+	child.traceTask(task, v, check, len(diff), files, applied, review, start, callerMember)
 	detail := v.Tail
 	if applied {
 		detail = fmt.Sprintf("applied %s: %s\n\n%s", plural(files, "file", "files"), strings.Join(wt.changedFiles, ", "), v.Tail)
@@ -455,8 +553,16 @@ func (o *Orchestrator) applyPolicy() string {
 type worktrees struct{ mu sync.Mutex } // git's worktree bookkeeping isn't concurrency-safe
 
 type worktree struct {
-	mgr          *worktrees
-	top          string   // caller's repository top level
+	mgr *worktrees
+	// mem is the machine this worktree lives on (nil = this one) and rem is that
+	// machine's transport pointed AT the worktree. caller is the machine a passed
+	// diff is applied to, with callerTop that machine's repository top: the two
+	// are not the same question, because a build box's diff lands on the laptop.
+	mem          *Member
+	rem          *Remote
+	caller       *Member
+	callerTop    string
+	top          string   // the worktree's repository top level (on mem)
 	dir          string   // worktree directory
 	root         string   // the subagent's jail root inside it (same subdir as the caller's)
 	sub          string   // jail root relative to the repo top ("." = top)
@@ -471,6 +577,32 @@ func (w *worktree) pathspec() []string {
 		return nil
 	}
 	return []string{"--", w.sub}
+}
+
+// pathspecSh is pathspec for a shell line on a member.
+func (w *worktree) pathspecSh() string {
+	if w.sub == "." || w.sub == "" {
+		return ""
+	}
+	return " -- " + shellQuote(w.sub)
+}
+
+// normSub turns git's --show-prefix ("pkg/lex/", "" at the top) into the form
+// worktree.sub holds.
+func normSub(p string) string {
+	p = strings.TrimSuffix(strings.TrimSpace(p), "/")
+	if p == "" || p == "." {
+		return "."
+	}
+	return p
+}
+
+// layoutWord names where a project sits in its repository, for the refusal.
+func layoutWord(sub string) string {
+	if sub == "." || sub == "" {
+		return "the top"
+	}
+	return sub
 }
 
 func gitCmd(dir string, env []string, stdin []byte, args ...string) (string, error) {
@@ -569,9 +701,167 @@ func (m *worktrees) create(jailRoot, lcaDir, session string) (*worktree, error) 
 	return w, nil
 }
 
+// remoteWorktreeSentinel frames createOn's reply. It is read from the LAST line
+// of stdout that starts with it, so a login shell's chatty rc file printing to
+// stdout cannot be mistaken for our output.
+const remoteWorktreeSentinel = "lca-member-ok"
+
+// maxRemoteDiffBytes caps what a member may send back as a patch. A truncated
+// patch cannot apply, so going over it is an error, never a silent cut.
+const maxRemoteDiffBytes = 8 << 20
+
+// createOn is create for a member: the same sequence, in one ssh round trip,
+// because the far side has git and a shell and nothing of ours. Every reason is
+// the local create's reason — a temporary GIT_INDEX_FILE so the operator's index
+// and HEAD on that machine are untouched; add -A so uncommitted and new
+// non-ignored files are in the snapshot; core.hooksPath=/dev/null because
+// post-checkout scripts don't belong in an agent's scratch copy; the worktree
+// under that machine's own ${LCA_DIR:-$HOME/.lca}/worktrees and never inside the
+// project, because the next snapshot's `add -A` would swallow it (and /tmp may be
+// small or noexec).
+//
+// What it deliberately is NOT: a snapshot of the CALLER's tree. Locally that is
+// the whole safety property, but shipping the caller's dirty tree over ssh needs
+// a shared ancestor (git bundle) or copies the project behind the operator's
+// back (rsync). So the base is the MEMBER's working tree, and runDelegateTool
+// says so out loud rather than papering over it.
+//
+// Two lca processes delegating onto one member can still race git's worktree
+// bookkeeping there: worktrees.mu serialises one process only. A lock file on
+// the member, taken in this same round trip, is the honest fix and is not in
+// this pass.
+func (m *worktrees) createOn(ctx context.Context, mem *Member, session string) (*worktree, error) {
+	rem := mem.Rem
+	if rem == nil {
+		return nil, fmt.Errorf("member %s is this machine — use create", mem.MemberName())
+	}
+	if err := rem.ensureUp(ctx); err != nil {
+		return nil, err
+	}
+	script := `set -e
+command -v git >/dev/null 2>&1 || exit 97
+top=$(git rev-parse --show-toplevel)
+sub=$(git rev-parse --show-prefix)
+st=${LCA_DIR:-$HOME/.lca}/worktrees
+mkdir -p "$st"
+wt=$(mktemp -d "$st/` + shellWord(session) + `-XXXXXX")
+rm -rf "$wt"
+idx="$wt.index"
+cd "$top"
+export GIT_INDEX_FILE="$idx" GIT_TERMINAL_PROMPT=0
+export GIT_AUTHOR_NAME=lca GIT_AUTHOR_EMAIL=lca@localhost
+export GIT_COMMITTER_NAME=lca GIT_COMMITTER_EMAIL=lca@localhost
+head=$(git rev-parse --verify -q HEAD || true)
+if [ -n "$head" ]; then git read-tree "$head"; fi
+git add -A
+tree=$(git write-tree)
+if [ -n "$head" ]; then commit=$(git commit-tree "$tree" -p "$head" -m 'lca delegate snapshot')
+else commit=$(git commit-tree "$tree" -m 'lca delegate snapshot'); fi
+unset GIT_INDEX_FILE
+rm -f "$idx"
+git -c core.hooksPath=/dev/null worktree add --detach "$wt" "$commit" >/dev/null
+[ -d "$wt/$sub" ] || { git -c core.hooksPath=/dev/null worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"; exit 96; }
+printf '` + remoteWorktreeSentinel + `\t%s\t%s\t%s\t%s\n' "$top" "$sub" "$wt" "$commit"
+`
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, errs, exit := rem.plumb(ctx, script, nil, 10*time.Minute)
+	tail := strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 6, 600))
+	switch {
+	case exit == 0:
+	case exit == 97:
+		return nil, fmt.Errorf("member %s has no git at %s, and a delegation needs a worktree created there: install git on %s, or run this role on another member",
+			mem.MemberName(), rem.Dir, rem.Where())
+	case exit == 96:
+		return nil, fmt.Errorf("%s has no tracked or untracked non-ignored files on member %s, so it doesn't exist in the snapshot", rem.Dir, mem.MemberName())
+	case exit == 98:
+		return nil, fmt.Errorf("member %s: %s does not exist on %s", mem.MemberName(), rem.Dir, rem.Where())
+	case strings.Contains(errs, "not a git repository"):
+		return nil, fmt.Errorf("member %s: %s is not a git repository, so a delegation there has nothing to snapshot — git init or clone the project there, or run this role on another member",
+			mem.MemberName(), rem.Dir)
+	default:
+		return nil, fmt.Errorf("creating the worktree on %s failed: %s", rem.Where(), tail)
+	}
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), remoteWorktreeSentinel) {
+			line = strings.TrimSpace(l)
+		}
+	}
+	if line == "" {
+		return nil, fmt.Errorf("the worktree script on %s produced no result: %s — check that ssh %s prints nothing to stdout from a shell rc file",
+			rem.Where(), orNone(tail), firstNonEmpty(rem.Host, rem.Where()))
+	}
+	f := strings.Split(line, "\t")
+	if len(f) != 5 {
+		return nil, fmt.Errorf("the worktree script on %s produced %q, which is not its reply", rem.Where(), truncate(line, 200))
+	}
+	top, sub, dir, commit := f[1], normSub(f[2]), f[3], f[4]
+	w := &worktree{mgr: m, mem: mem, top: top, dir: dir, sub: sub, base: commit}
+	w.root = dir
+	if sub != "." {
+		w.root = dir + "/" + sub
+	}
+	w.rem = rem.withDir(dir)
+	return w, nil
+}
+
+// shellWord keeps only characters that are inert in a shell word. The session id
+// lca generates has none others, and a script built from a constant plus this is
+// one fewer thing to be wrong about later.
+func shellWord(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "lca"
+	}
+	return b.String()
+}
+
+// callerLayout is where the caller's project sits inside its repository, on
+// whatever machine that is. It is the other half of the layout guard.
+func (o *Orchestrator) callerLayout(ctx context.Context, m *Member, root string) (top, sub string, err error) {
+	if m.IsLocal() {
+		t, err := gitCmd(root, nil, nil, "rev-parse", "--show-toplevel")
+		if err != nil {
+			return "", "", fmt.Errorf("the caller's tree is not a git repository: %w", err)
+		}
+		p, err := gitCmd(root, nil, nil, "rev-parse", "--show-prefix")
+		if err != nil {
+			return "", "", err
+		}
+		top = strings.TrimSpace(t)
+		if real, e := filepath.EvalSymlinks(top); e == nil {
+			top = real
+		}
+		return top, normSub(p), nil
+	}
+	out, errs, exit := m.Rem.plumb(ctx, "git rev-parse --show-toplevel && git rev-parse --show-prefix", nil, 2*time.Minute)
+	if exit != 0 {
+		return "", "", fmt.Errorf("member %s: %s is not a git repository, so a diff cannot be applied there: %s",
+			m.MemberName(), m.Rem.Dir, strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 3, 300)))
+	}
+	// --show-prefix prints an empty line at the repository top, so a trimmed
+	// reply may be one line.
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	top, sub = strings.TrimSpace(lines[0]), "."
+	if len(lines) > 1 {
+		sub = normSub(lines[1])
+	}
+	return top, sub, nil
+}
+
 // diff returns the subagent's changes against the snapshot (new files
 // included) and how many files changed.
 func (w *worktree) diff() (string, int, error) {
+	if w.rem != nil {
+		return w.diffOn()
+	}
 	if _, err := gitCmd(w.dir, nil, nil, "add", "-A"); err != nil {
 		return "", 0, err
 	}
@@ -592,15 +882,97 @@ func (w *worktree) diff() (string, int, error) {
 	return d, len(w.changedFiles), err
 }
 
-// applyTo applies the diff to the caller's working tree (not its index).
+// diffOn is diff for a worktree on a member: two plumb calls, deliberately not
+// one framed script, because any sentinel byte can occur inside a text hunk.
+//
+// The two -c settings are on the REMOTE leg only — the local-to-local path keeps
+// today's exact invocation because it never crosses machines — and they are what
+// stop a patch made on one machine from failing to apply on another with
+// different git defaults. What keeps the patch free of either machine's absolute
+// paths is `diff --cached --binary <base>` itself, with its a/… b/… prefixes:
+// paths are repository-relative, which is also why the layout guard exists.
+//
+// There is no ctx here because diff()'s signature is the one the caller already
+// has; plumb's own timeout is the bound.
+func (w *worktree) diffOn() (string, int, error) {
+	ctx := context.Background()
+	git := "git -c core.quotepath=false -c core.autocrlf=false "
+	names, errs, exit := w.rem.plumb(ctx, "git add -A && "+git+"diff --cached --name-only "+shellQuote(w.base)+w.pathspecSh(), nil, 10*time.Minute)
+	if exit != 0 {
+		return "", 0, fmt.Errorf("listing the changed files on %s failed: %s", w.rem.Where(), strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), names), 4, 400)))
+	}
+	w.changedFiles = nil
+	for _, n := range strings.Split(strings.TrimSpace(names), "\n") {
+		if n == "" {
+			continue
+		}
+		if w.sub != "." && w.sub != "" {
+			n = strings.TrimPrefix(n, w.sub+"/")
+		}
+		w.changedFiles = append(w.changedFiles, n)
+	}
+	// The patch goes to a file on the member and is then capped from it, rather
+	// than piped into `head -c`: a pipe would give us head's exit status, so a git
+	// that failed halfway would come back as a short but successful diff — and a
+	// short diff that applies is worse than one that does not.
+	cmd := "d=$(mktemp) || exit 1\n" +
+		git + "--no-pager diff --cached --binary --no-ext-diff --no-textconv " + shellQuote(w.base) + w.pathspecSh() + " > \"$d\"\n" +
+		"rc=$?\nif [ $rc -eq 0 ]; then head -c " + strconv.Itoa(maxRemoteDiffBytes+1) + " \"$d\"; fi\nrm -f \"$d\"\nexit $rc\n"
+	d, errs, exit := w.rem.plumb(ctx, cmd, nil, 10*time.Minute)
+	if exit != 0 {
+		return "", 0, fmt.Errorf("collecting the diff on %s failed: %s", w.rem.Where(), strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), d), 4, 400)))
+	}
+	switch {
+	case len(d) > maxRemoteDiffBytes:
+		return "", 0, fmt.Errorf("the diff from member %s is %d MiB or larger; it was NOT applied — a truncated patch cannot apply, and that change is too big for a delegation",
+			w.mem.MemberName(), maxRemoteDiffBytes>>20)
+	case d != "" && !strings.HasPrefix(d, "diff --git "):
+		return "", 0, fmt.Errorf("member %s printed unexpected output before the diff — something on %s writes to stdout for non-interactive ssh (a shell rc file); guard it with [ -t 1 ], or the patch cannot be read",
+			w.mem.MemberName(), w.rem.Where())
+	}
+	return d, len(w.changedFiles), nil
+}
+
+// applyTo applies the diff to the caller's working tree (not its index) — on
+// whatever machine that tree is. jailRoot is unused (and was before members
+// existed): the repository top is what git apply needs.
 func (w *worktree) applyTo(jailRoot, diff string) error {
 	w.mgr.mu.Lock()
 	defer w.mgr.mu.Unlock()
-	if _, err := gitCmd(w.top, nil, []byte(diff), "apply", "--check", "--binary", "-"); err != nil {
+	top := firstNonEmpty(w.callerTop, w.top)
+	if w.caller != nil && !w.caller.IsLocal() {
+		rem := w.caller.Rem.withDir(top)
+		git := "git -c core.quotepath=false -c core.autocrlf=false apply"
+		for _, args := range []string{" --check --binary -", " --binary -"} {
+			out, errs, exit := rem.plumb(context.Background(), git+args, []byte(diff), 10*time.Minute)
+			if exit != 0 {
+				return fmt.Errorf("%s", strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 6, 800)))
+			}
+		}
+		return nil
+	}
+	if _, err := gitCmd(top, nil, []byte(diff), "apply", "--check", "--binary", "-"); err != nil {
 		return err
 	}
-	_, err := gitCmd(w.top, nil, []byte(diff), "apply", "--binary", "-")
+	_, err := gitCmd(top, nil, []byte(diff), "apply", "--binary", "-")
 	return err
+}
+
+// heads names both checkouts and their commits when an apply across machines
+// failed: the two share no object store and the patch is text, so there is no
+// 3-way merge to fall back on and the operator needs to know what to line up.
+func (w *worktree) heads(role string) string {
+	short := func(m *Member, dir string) string {
+		if m.IsLocal() {
+			out, _ := gitCmd(dir, nil, nil, "rev-parse", "--short", "HEAD")
+			return strings.TrimSpace(out)
+		}
+		out, _, _ := m.Rem.withDir(dir).plumb(context.Background(), "git rev-parse --short HEAD", nil, time.Minute)
+		return strings.TrimSpace(out)
+	}
+	caller := w.caller
+	return fmt.Sprintf("%s is at %s, %s is at %s — a patch only applies where its context matches. Put the two checkouts on the same commit, or run %s on member %s.",
+		w.mem.Label(), short(w.mem, w.top), caller.Label(), short(caller, firstNonEmpty(w.callerTop, w.top)), role, caller.MemberName())
 }
 
 func (w *worktree) remove() {
@@ -613,6 +985,14 @@ func (w *worktree) remove() {
 }
 
 func (w *worktree) removeLocked() {
+	if w.mem != nil && w.mem.Rem != nil {
+		// No `worktree prune` on a member: prune is safe locally because
+		// worktrees.mu serialises it, but across two lca processes it can prune a
+		// worktree another has just added.
+		w.mem.Rem.plumb(context.Background(), "git -C "+shellQuote(w.top)+" worktree remove --force "+shellQuote(w.dir)+
+			" >/dev/null 2>&1 || rm -rf "+shellQuote(w.dir), nil, 5*time.Minute)
+		return
+	}
 	if _, err := gitCmd(w.top, nil, nil, "worktree", "remove", "--force", w.dir); err != nil {
 		os.RemoveAll(w.dir)
 	}

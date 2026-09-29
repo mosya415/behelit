@@ -112,7 +112,7 @@ func (s *Session) compactor() *Session {
 		return s
 	}
 	cs := &Session{ID: s.ID + "-compact", UID: s.UID + "-compact", rootOverride: s.rootUID(), orch: s.orch, parent: s.parent,
-		agent: cheap, view: s.view, models: append([]string(nil), cheap.Models...)}
+		agent: cheap, view: s.view, member: s.member, models: append([]string(nil), cheap.Models...)}
 	cs.useModel(0)
 	return cs
 }

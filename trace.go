@@ -86,7 +86,11 @@ type TurnRecord struct {
 	RawReply      string          `json:"raw_reply,omitempty"` // the reply's own text, kept when a call didn't parse
 	Transport     string          `json:"transport"`
 	Tier          string          `json:"tier,omitempty"`
-	Error         string          `json:"error,omitempty"`
+	// Member is where this turn's tools ran. Always emitted, "local" on this
+	// machine: absent-means-local is a convention a consumer grouping by member
+	// cannot tell from a record written by an older binary.
+	Member string `json:"member"`
+	Error  string `json:"error,omitempty"`
 }
 
 // TaskRecord is the outcome of a verified task (a delegation, a -check run,
@@ -110,6 +114,8 @@ type TaskRecord struct {
 	Reviewer      string `json:"reviewer,omitempty"`
 	ReviewModel   string `json:"review_model,omitempty"`
 	ReviewVerdict string `json:"review_verdict,omitempty"` // approve | reject | unreviewed
+	Member        string `json:"member"`                   // where the worktree and the check ran
+	CallerMember  string `json:"caller_member,omitempty"`  // only when a diff crossed machines
 }
 
 func (s *Session) rootUID() string {
@@ -141,7 +147,8 @@ func (s *Session) traceTurn(step int, res ChatResult, fb []fallbackEvent, start 
 		ParentSession: s.parentUID(), Role: s.agent.Name, Model: s.client.Model(), Step: step,
 		Usage:  traceUsage{res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens},
 		TTFTMs: res.Usage.TTFT.Milliseconds(), DurationMs: time.Since(start).Milliseconds(), Finish: res.Finish,
-		Fallbacks: fb, ToolCalls: []traceToolCall{}, InvalidCalls: s.malformed, Transport: transportName(s.client), Tier: s.tier()}
+		Fallbacks: fb, ToolCalls: []traceToolCall{}, InvalidCalls: s.malformed, Transport: transportName(s.client), Tier: s.tier(),
+		Member: s.memberName()}
 	s.malformed = 0
 	for _, c := range calls {
 		tc := traceToolCall{Name: c.name, Args: truncate(canonicalArgs(c.args), 300), OK: !c.failed, Invalid: c.invalid, ResultBytes: c.resultBytes, Ms: c.ms}
@@ -172,10 +179,14 @@ func transportName(c *Client) string {
 	return transportText
 }
 
-func (s *Session) traceTask(task string, v Verdict, check string, diffBytes, files int, applied bool, review *reviewOutcome, start time.Time) {
+// traceTask records a finished task. caller is the machine a diff was applied
+// to, and is set only when it is not this session's own: a delegation that
+// crossed machines is the one case where "where it ran" is not the whole story.
+func (s *Session) traceTask(task string, v Verdict, check string, diffBytes, files int, applied bool, review *reviewOutcome, start time.Time, caller string) {
 	rec := TaskRecord{Type: "task", TS: nowTS(), RootSession: s.rootUID(), Session: s.UID,
 		ParentSession: s.parentUID(), Role: s.agent.Name, Task: truncate(task, 500), Status: v.Status, CheckCmd: check,
-		Attempts: v.Attempts, DiffBytes: diffBytes, FilesChanged: files, Applied: applied, DurationMs: time.Since(start).Milliseconds()}
+		Attempts: v.Attempts, DiffBytes: diffBytes, FilesChanged: files, Applied: applied, DurationMs: time.Since(start).Milliseconds(),
+		Member: s.memberName(), CallerMember: caller}
 	if review != nil {
 		rec.Reviewer, rec.ReviewModel, rec.ReviewVerdict = review.Role, review.Model, review.Verdict
 	}

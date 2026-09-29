@@ -23,10 +23,50 @@ import (
 
 // ── lca init ────────────────────────────────────────────────────────────────
 
+// memberFlags collects repeated -member name=host:/dir so a whole fleet can be
+// written in one command. The parse is strict: a mistyped member would write a
+// roles.yaml that fails to load, and the failure would be nowhere near the
+// command that caused it.
+type memberFlags struct {
+	list []struct{ name, host, dir string }
+}
+
+func (m *memberFlags) String() string {
+	var out []string
+	for _, e := range m.list {
+		out = append(out, e.name+"="+e.host+":"+e.dir)
+	}
+	return strings.Join(out, ",")
+}
+
+func (m *memberFlags) Set(v string) error {
+	name, target, ok := strings.Cut(v, "=")
+	name = strings.TrimSpace(name)
+	host, dir, ok2 := strings.Cut(target, ":")
+	if !ok || name == "" || !ok2 || host == "" || !strings.HasPrefix(dir, "/") {
+		return fmt.Errorf("-member wants name=host:/absolute/path, got %q", v)
+	}
+	if !reMemberName.MatchString(name) {
+		return fmt.Errorf("-member %q: a member name is lower-case letters, digits, - and _", name)
+	}
+	if name == localMemberName {
+		return fmt.Errorf("-member local=… is not allowed: local always means this machine")
+	}
+	for _, e := range m.list {
+		if e.name == name {
+			return fmt.Errorf("-member %s given twice", name)
+		}
+	}
+	m.list = append(m.list, struct{ name, host, dir string }{name, host, dir})
+	return nil
+}
+
 func runInit(cfg Config, args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	force := fs.Bool("force", false, "overwrite an existing roles.yaml")
 	remote := fs.String("remote", "", "work on another machine over ssh: host:/path/to/project")
+	members := &memberFlags{}
+	fs.Var(members, "member", "a machine the team works on: name=host:/path/to/project (repeatable)")
 	out := fs.String("o", filepath.Join(".lca", "roles.yaml"), "where to write")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -56,14 +96,32 @@ func runInit(cfg Config, args []string) int {
 		errLine("the gateway at %s lists no models", hostOf(gw.Endpoint()))
 		return 1
 	}
-	var remoteBlock string
-	if *remote != "" {
+	var remoteBlock, defaultsMember string
+	switch {
+	case *remote != "" && len(members.list) > 0:
+		errLine("-remote and -member both given: -remote writes the single-member block, -member writes a members: fleet — pick one")
+		return 1
+	case *remote != "":
 		host, rdir, ok := strings.Cut(*remote, ":")
 		if !ok || host == "" || !strings.HasPrefix(rdir, "/") {
 			errLine("-remote wants host:/absolute/path, got %q", *remote)
 			return 1
 		}
 		remoteBlock = fmt.Sprintf("# the project lives on another machine; ssh is outbound only, no ports opened\nremote:\n  host: %s\n  dir: %s\n\n", host, rdir)
+	case len(members.list) > 0:
+		var b strings.Builder
+		b.WriteString("# the machines this team works on; ssh is outbound only, no ports opened.\n# pin a role to one with \"member: <name>\" under it.\nmembers:\n")
+		for _, m := range members.list {
+			fmt.Fprintf(&b, "  %s:\n    host: %s\n    dir: %s\n", m.name, m.host, m.dir)
+		}
+		b.WriteString("\n")
+		remoteBlock = b.String()
+		// One member is unambiguous: it is where the team works. Several are a
+		// fleet, and guessing which role belongs where would be worse than saying
+		// nothing.
+		if len(members.list) == 1 {
+			defaultsMember = "  member: " + members.list[0].name + "\n"
+		}
 	}
 	lead := pickModels(names, leadPref, 2)
 	coder := pickModels(names, coderPref, 2)
@@ -83,7 +141,7 @@ apply: verified        # a delegate's diff reaches your tree only when its check
 #   some-model: {transport: text}
 
 defaults:
-  context: 128000
+%s  context: 128000
   verify_attempts: 2
   check_timeout: 900
 
@@ -122,7 +180,7 @@ roles:
     effort: off
     context: 32000
     tools: []
-`, filepath.Base(cfg.Root), strings.TrimRight(gw.Endpoint(), "/"), remoteBlock, strings.Join(allow, ", "),
+`, filepath.Base(cfg.Root), strings.TrimRight(gw.Endpoint(), "/"), remoteBlock, defaultsMember, strings.Join(allow, ", "),
 		strings.Join(lead, ", "), strings.Join(coder, ", "), checkLine(check), cheap)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -135,6 +193,12 @@ roles:
 	}
 	section("lca init")
 	okLine("wrote %s", prettyPath(path, cfg.Root))
+	for _, m := range members.list {
+		row("member", m.name+faint(" · %s:%s", m.host, m.dir))
+	}
+	if len(members.list) > 1 {
+		hint("pin a role with \"member: <name>\" under it")
+	}
 	table([]string{"role", "models", "check"}, [][]string{
 		{"lead", strings.Join(lead, faint(" → ")), faint("—")},
 		{"coder", strings.Join(coder, faint(" → ")), faint("%s", firstNonEmpty(check, "— add check_cmd"))},
@@ -256,6 +320,7 @@ func runDoctor(cfg Config, args []string) int {
 	noProbe := fs.Bool("no-probe", false, "don't call the models (only list and configuration checks)")
 	all := fs.Bool("all", false, "probe every model in every chain, not just the first of each role")
 	tierFlag := fs.String("tier", "", "run every tier-declaring role on that chain (roles.yaml tiers:)")
+	memberFlag := fs.String("member", "", "probe only this member (roles.yaml members:)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -404,34 +469,102 @@ func runDoctor(cfg Config, args []string) int {
 		}
 	}
 
-	if roles != nil && roles.Remote != nil {
-		rem := roles.Remote
-		section("remote", faint("%s", rem.Label()))
-		out, exit := rem.run(context.Background(), "pwd && git rev-parse --show-toplevel 2>/dev/null; command -v git", 30*time.Second, nil, nil)
-		if exit != 0 {
-			fail("ssh to %s failed: %s", rem.Where(), strings.TrimSpace(lastLines(out, 3, 200)))
-			hint("check `ssh %s` by hand: keys, ~/.ssh/config, VPN. No inbound ports are needed, only outbound ssh", rem.Host)
-		} else {
-			okLine("ssh works · project directory reachable")
-			var missing []string
-			for _, c := range allowlistOf(cfg, roles) {
-				if c == "bsk" {
-					continue
-				}
-				if _, e := rem.run(context.Background(), "command -v "+c+" >/dev/null", 20*time.Second, nil, nil); e != 0 {
-					missing = append(missing, c)
-				}
-			}
-			if len(missing) > 0 {
-				warnLine("not installed on %s: %s", rem.Where(), strings.Join(missing, ", "))
+	// The fleet. Every non-local member is probed: ssh reachable, dir exists, git
+	// present and the dir inside a repository, the worktree base writable, and
+	// THAT member's allowlist resolved there — an operator has to find all of this
+	// before a run does, not twenty minutes into one.
+	if orch := doctorOrchestrator(cfg, roles); orch != nil {
+		names := orch.memberNames()
+		if *memberFlag != "" {
+			if orch.member(*memberFlag) == nil {
+				fail("-member %q is not a member (members: %s)", *memberFlag, strings.Join(names, ", "))
+				names = nil
 			} else {
-				okLine("every allowlisted command exists on %s", rem.Where())
-			}
-			if _, e := rem.run(context.Background(), "git rev-parse --show-toplevel >/dev/null 2>&1", 20*time.Second, nil, nil); e != 0 {
-				warnLine("the remote directory is not a git repository — /diff and /undo have nothing to compare")
+				names = []string{*memberFlag}
 			}
 		}
-		hint("delegate is off in remote mode (its worktree is local) — subagents share the remote tree via task")
+		remotes := 0
+		for _, n := range names {
+			if !orch.member(n).IsLocal() {
+				remotes++
+			}
+		}
+		if remotes > 0 {
+			section("members", faint("%s", plural(remotes, "other machine", "other machines")))
+			reach := probeMembers(context.Background(), orch, names)
+			for _, n := range names {
+				m := orch.member(n)
+				if m.IsLocal() {
+					continue // the workspace section below is this machine's
+				}
+				rem := m.Rem
+				row("member", n+faint(" · %s", rem.Label()))
+				if err := reach[n]; err != nil {
+					fail("%s", err.Error())
+					if memberDirMissing(err) {
+						// ssh demonstrably works: sending the operator to their keys
+						// would be advice for a problem they do not have.
+						hint("create or clone the project at %s on %s, or point members.%s dir: at where it is", rem.Dir, rem.Where(), n)
+					} else {
+						hint("check `ssh %s` by hand: keys, ~/.ssh/config, VPN — only outbound ssh is needed", firstNonEmpty(rem.Host, rem.Where()))
+					}
+					continue
+				}
+				okLine("ssh works · %s exists", rem.Dir)
+				if _, e := rem.run(context.Background(), "command -v git >/dev/null", 20*time.Second, nil, nil); e != 0 {
+					fail("git is not installed on %s — a delegation there cannot create a worktree", rem.Where())
+					hint("install git on %s, or run that role on another member", rem.Where())
+				} else if _, e := rem.run(context.Background(), "git rev-parse --show-toplevel >/dev/null 2>&1", 20*time.Second, nil, nil); e != 0 {
+					warnLine("%s is not a git repository on %s — delegate has nothing to snapshot there", rem.Dir, rem.Where())
+					hint("git init or clone the project at %s on %s", rem.Dir, rem.Where())
+				} else {
+					okLine("git repository — delegate can create a worktree there")
+				}
+				if _, e := rem.run(context.Background(), `mkdir -p "${LCA_DIR:-$HOME/.lca}/worktrees" && test -w "${LCA_DIR:-$HOME/.lca}/worktrees"`, 20*time.Second, nil, nil); e != 0 {
+					warnLine("the worktree base ${LCA_DIR:-$HOME/.lca}/worktrees is not writable on %s", rem.Where())
+				}
+				// One connection for the whole list: an eight-member fleet over a VPN
+				// would otherwise pay a handshake per allowlisted command, and doctor
+				// is the command an operator runs when something is already wrong.
+				var missing, noBsk []string
+				if list := memberAllowlist(cfg, roles, m); len(list) > 0 {
+					var words []string
+					for _, c := range list {
+						words = append(words, shellQuote(c))
+					}
+					out, e := rem.run(context.Background(), "for c in "+strings.Join(words, " ")+`; do command -v "$c" >/dev/null 2>&1 || echo "$c"; done`, 60*time.Second, nil, nil)
+					if e != 0 {
+						warnLine("could not check the allowlist on %s: %s", rem.Where(), strings.TrimSpace(lastLines(out, 2, 200)))
+					}
+					for _, c := range strings.Fields(out) {
+						if c == "bsk" {
+							noBsk = append(noBsk, c)
+							continue
+						}
+						missing = append(missing, c)
+					}
+				}
+				switch {
+				case len(missing) > 0:
+					warnLine("not installed on %s: %s", rem.Where(), strings.Join(missing, ", "))
+				default:
+					okLine("every allowlisted command exists on %s", rem.Where())
+				}
+				if len(noBsk) > 0 {
+					warnLine("bsk is not installed on %s — that member cannot schedule GPU jobs, and bsk submit is the only path to one", rem.Where())
+				}
+			}
+			if roles != nil && len(roles.Roles) > 0 {
+				var rows [][]string
+				for _, a := range roles.Roles {
+					rows = append(rows, []string{a.Name, orch.memberFor(a).MemberName()})
+				}
+				table([]string{"role", "member"}, rows)
+			}
+			if orch.legacyFleet() {
+				hint("delegate is off on the old remote: block (its worktree would be local) — move it into members: for cross-machine worktrees")
+			}
+		}
 	}
 
 	section("workspace")
@@ -647,6 +780,36 @@ func probeReplay(ctx context.Context, c *Client, roles *RolesConfig, res *probeR
 		return
 	}
 	res.warns = append(res.warns, "could not check reasoning replay: "+shortErr(err))
+}
+
+// memberAllowlist is the list in force ON a member: its own if it has one, else
+// the team's. A member's list replaces the team's rather than intersecting it,
+// so a GPU node that allows only [python3, bsk] is checked for exactly those.
+func memberAllowlist(cfg Config, roles *RolesConfig, m *Member) []string {
+	if m != nil && m.Allow != nil {
+		return m.Allow
+	}
+	return allowlistOf(cfg, roles)
+}
+
+// doctorOrchestrator is the fleet as the runtime resolves it, without starting a
+// session: doctor must report the members that will actually be used (including
+// the one LCA_REMOTE alone defines), not just what roles.yaml spelled out.
+func doctorOrchestrator(cfg Config, roles *RolesConfig) *Orchestrator {
+	o := &Orchestrator{}
+	if roles != nil {
+		o.roles = roles
+	}
+	o.setFleet(roles)
+	jl, err := NewJail(cfg.Root, allowlistOf(cfg, roles), cfg.Unsafe)
+	if err != nil {
+		return nil
+	}
+	if roles != nil && roles.Shell {
+		jl.Shell = true
+	}
+	o.jl = jl
+	return o
 }
 
 // allowlistOf is the sandbox allowlist in force: roles.yaml's, else the config's.

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,23 +27,198 @@ import (
 //	  dir: /home/u/llmbench        # the project on that machine
 //	  ssh: [-o, BatchMode=yes]     # extra ssh options (optional)
 //
-// Or LCA_REMOTE=cab-node:/home/u/llmbench.
+// Or LCA_REMOTE=cab-node:/home/u/llmbench. `members:` in roles.yaml is the same
+// thing per machine (members.go); this block is the one-machine spelling and
+// means a member named "remote".
 //
 // The sandbox still applies: the allowlist is checked against the command we
 // send, paths stay inside dir, and GPU work still has to go through bsk (a
 // remote srun is refused just like a local one).
 
 type Remote struct {
+	Name string // the member's name, so a failure can say which machine it was
 	Host string
 	Dir  string
-	SSH  []string // the transport command; default: ssh -o BatchMode=yes
+	SSH  []string // extra flags for the default transport, or the whole transport argv
+	up   *reach   // shared by withDir copies: it is one machine
 }
 
+// sshCmd builds the transport. SSH is either extra flags for the default
+// transport (its first element starts with "-") or the whole transport command.
+// Both spellings are live: the first is what this file's own documentation
+// always promised and what an operator writes, and the second is what lets a
+// test stand in for ssh with [sh, -c] — the only network-free harness there is.
+// Returning r.SSH as the whole argv for a flag list would exec("-o", …).
 func (r *Remote) sshCmd() []string {
-	if len(r.SSH) > 0 {
-		return r.SSH
+	def := []string{"ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}
+	switch {
+	case len(r.SSH) == 0:
+		return def
+	case strings.HasPrefix(r.SSH[0], "-"):
+		return append(def, r.SSH...)
 	}
-	return []string{"ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"}
+	return r.SSH
+}
+
+// memberName names this machine in a message; "" happens for a Remote built
+// before members existed (LCA_REMOTE, a test), and it is the legacy member.
+func (r *Remote) memberName() string {
+	if r == nil || r.Name == "" {
+		return legacyMemberName
+	}
+	return r.Name
+}
+
+// ── reachability ────────────────────────────────────────────────────────────
+
+// reach is a member's reachability. Success is cached until the transport itself
+// fails (forget); failure is cached for memberRetryAfter, so a laptop that joins
+// the VPN mid-session recovers without a restart, a machine that is down is not
+// re-probed on every tool call, and one that dies mid-run is not still reported
+// as ok. There is no else-branch anywhere below: a failed gate fails
+// the caller, and no code path chooses a different machine. Silently running on
+// the wrong machine is the single worst thing this feature could do, so it is
+// made structurally impossible rather than merely avoided.
+type reach struct {
+	mu   sync.Mutex
+	ok   bool
+	err  error
+	last time.Time
+}
+
+const memberRetryAfter = 30 * time.Second
+
+// memberDown is why a member cannot be used, and WHICH of the two things the
+// probe proves failed. The fixes have nothing in common — ssh (keys,
+// ~/.ssh/config, VPN) or the directory (mkdir, clone, a corrected dir:) — so the
+// distinction travels in the error instead of being re-read out of its text.
+type memberDown struct {
+	dirGone bool // ssh answered; the shell over there could not cd into Dir
+	msg     string
+}
+
+func (e *memberDown) Error() string { return e.msg }
+
+// memberDirMissing reports the second case, which is what doctor's hint turns on.
+func memberDirMissing(err error) bool {
+	var d *memberDown
+	return errors.As(err, &d) && d.dirGone
+}
+
+// reachAlloc guards the lazy creation of Remote.up. A Remote is shared by every
+// session pinned to that member, so two of them may gate at once.
+var reachAlloc sync.Mutex
+
+func (r *Remote) gate() *reach {
+	reachAlloc.Lock()
+	defer reachAlloc.Unlock()
+	if r.up == nil {
+		r.up = &reach{}
+	}
+	return r.up
+}
+
+// probeTimeout bounds the probe itself. On top of the default transport's
+// BatchMode=yes it can never hang on a password prompt.
+func (r *Remote) probeTimeout() time.Duration {
+	if n := atoiDefault(os.Getenv("LCA_MEMBER_PROBE"), 0); n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 10 * time.Second
+}
+
+// ensureUp proves the member is reachable and its project directory exists —
+// exec wraps every command in `cd <Dir> && …`, so one `pwd` proves both. Which of
+// the two failed is in the exit code: 255 is ssh's own code and -1 is "could not
+// run it at all", so the far side never answered; any other code came from the
+// shell over there, which answered and could not cd. Blaming ssh for a missing
+// directory sends the operator after keys and a VPN when the fix is a mkdir.
+func (r *Remote) ensureUp(ctx context.Context) error {
+	g := r.gate()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.ok {
+		return nil
+	}
+	if g.err != nil && time.Since(g.last) < memberRetryAfter {
+		return g.err
+	}
+	out, exit := r.exec(ctx, "pwd", r.probeTimeout(), nil, nil)
+	g.last = time.Now()
+	switch {
+	case exit == 0:
+		g.ok, g.err = true, nil
+		return nil
+	case exit == 255 || exit == -1:
+		g.err = &memberDown{msg: fmt.Sprintf(
+			"member %s (%s) is unreachable: %s\nnothing ran there, and nothing runs on another machine instead — fix ssh (keys, ~/.ssh/config, VPN), or point this role or step at another member",
+			r.memberName(), r.Label(), probeFail(out))}
+	default:
+		g.err = &memberDown{dirGone: true, msg: fmt.Sprintf(
+			"member %s: ssh to %s works, but %s is not there: %s\nnothing ran there, and nothing runs on another machine instead — create or clone the project at that path, or point this member's dir: at it",
+			r.memberName(), r.Where(), r.Dir, probeFail(out))}
+	}
+	return g.err
+}
+
+// forget drops a cached "ok" once the transport has failed mid-session: a
+// machine that answered an hour ago proves nothing now, and a stale gate is what
+// turns ssh's own exit into "your check failed" and leaves /members and doctor
+// printing ok for a machine that is gone. It records no error of its own — the
+// next ensureUp probes and produces the authoritative one, so a command that
+// merely looked like an ssh failure costs one probe instead of declaring a
+// healthy member down for the whole retry window.
+func (r *Remote) forget() {
+	g := r.gate()
+	g.mu.Lock()
+	g.ok, g.err = false, nil
+	g.mu.Unlock()
+}
+
+// sshOwnFailure recognises the transport's own complaint as opposed to a remote
+// command that happens to exit 255: ssh reuses the remote command's exit code for
+// everything else, so its own diagnostics are the only signal there is.
+func sshOwnFailure(out string) bool {
+	if strings.Contains(out, "ssh") { // "ssh: connect to host …", "ssh: Could not resolve …"
+		return true
+	}
+	for _, s := range []string{"Permission denied (publickey", "Host key verification failed",
+		"kex_exchange_identification", "Connection closed by "} {
+		if strings.Contains(out, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// probeFail compresses the transport's own complaint to one line: exec appends a
+// note of its own about ssh, and a blank line between the two would put the fix
+// hint a screen away from the cause it belongs to.
+func probeFail(out string) string {
+	var keep []string
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "(ssh could not run the command") {
+			continue
+		}
+		keep = append(keep, l)
+	}
+	if len(keep) > 2 {
+		keep = keep[len(keep)-2:]
+	}
+	if len(keep) == 0 {
+		return "ssh gave no reason"
+	}
+	return truncate(strings.Join(keep, " · "), 300)
+}
+
+// withDir is the same machine, another directory (a delegation's worktree over
+// there). The reachability state is shared, because it is one machine.
+func (r *Remote) withDir(dir string) *Remote {
+	g := r.gate()
+	c := *r
+	c.Dir, c.up = dir, g
+	return &c
 }
 
 // Label is how the remote is shown in the UI.
@@ -83,6 +259,7 @@ func parseRemote(n *yNode) (*Remote, error) {
 	if r == nil {
 		return nil, nil
 	}
+	r.Name = legacyMemberName // the remote: block IS the member named "remote"
 	if r.Dir == "" {
 		return nil, fmt.Errorf("remote: dir is required (the project's path on %s)", firstNonEmpty(r.Host, "the remote"))
 	}
@@ -109,43 +286,88 @@ func (r *Remote) script(cmd string) string {
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// run executes a command in the project directory and returns its combined
-// output and exit code (-1 when it could not run). stdin, if non-nil, is fed to
-// the remote command.
+// run is the single funnel every remote operation passes through — the file
+// tools, the verifier, the workflow runner, doctor — which is why the
+// reachability gate lives here and not in each of them. A failed gate returns
+// (message, -1), the shape every caller already treats as "could not run".
 func (r *Remote) run(ctx context.Context, cmd string, timeout time.Duration, stdin []byte, live io.Writer) (string, int) {
+	if err := r.ensureUp(ctx); err != nil {
+		return err.Error(), -1
+	}
+	out, exit, down := r.execT(ctx, cmd, timeout, stdin, live)
+	if down {
+		r.forget()
+	}
+	return out, exit
+}
+
+// spawn is the one place a transport process is started. exec and plumb differ
+// only in how they frame the script and shape the result, and a fix to the
+// timeout, the process group or the exit code has to reach both of them: two
+// copies is how the git-plumbing path ends up reporting a raw exit code where a
+// tool call reports "ssh could not run the command on …". stdout and stderr are
+// the caller's, because plumb has to keep them apart — a git warning spliced into
+// the middle of a patch is a patch that cannot apply.
+func (r *Remote) spawn(ctx context.Context, script string, stdin []byte, stdout, stderr io.Writer, timeout time.Duration) (exit int, timedOut bool) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	argv := r.argv(r.script(cmd))
+	argv := r.argv(script)
 	c := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	inProcessGroup(c)
 	if stdin != nil {
 		c.Stdin = bytes.NewReader(stdin)
 	}
-	var buf bytes.Buffer
-	if live != nil {
-		pw := &prefixWriter{w: live, prefix: "   " + cFaint + "│ " + cReset}
-		c.Stdout, c.Stderr = io.MultiWriter(&buf, pw), io.MultiWriter(&buf, pw)
-		defer pw.flush()
-	} else {
-		c.Stdout, c.Stderr = &buf, &buf
-	}
+	c.Stdout, c.Stderr = stdout, stderr
 	err := c.Run()
-	out := buf.String()
 	switch {
 	case cctx.Err() == context.DeadlineExceeded:
-		return out + fmt.Sprintf("\n(timed out after %s)", timeout), -1
+		return -1, true
 	case err == nil:
-		return out, 0
+		return 0, false
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		// 255 is ssh's own failure (host unreachable, auth), not the command's
-		if ee.ExitCode() == 255 && strings.Contains(out, "ssh") {
-			return out + "\n(ssh could not run the command on " + r.Host + ")", -1
-		}
-		return out, ee.ExitCode()
+		return ee.ExitCode(), false
 	}
-	return out + "\n" + err.Error(), -1
+	// The transport could not be started at all (no ssh on PATH, fork failure):
+	// there is no exit code, and -1 is what every caller reads as "could not run".
+	fmt.Fprintf(stderr, "\n%s", err.Error())
+	return -1, false
+}
+
+// exec runs a command in the project directory and returns its combined output
+// and exit code (-1 when it could not run). stdin, if non-nil, is fed to the
+// remote command. It is deliberately ungated: ensureUp itself calls it.
+func (r *Remote) exec(ctx context.Context, cmd string, timeout time.Duration, stdin []byte, live io.Writer) (string, int) {
+	out, exit, _ := r.execT(ctx, cmd, timeout, stdin, live)
+	return out, exit
+}
+
+// execT is exec plus whether the TRANSPORT failed — ssh never ran the command.
+// run turns that into forget(), because the reachability gate is only as true as
+// its last answer.
+func (r *Remote) execT(ctx context.Context, cmd string, timeout time.Duration, stdin []byte, live io.Writer) (string, int, bool) {
+	var buf bytes.Buffer
+	var w io.Writer = &buf
+	if live != nil {
+		pw := &prefixWriter{w: live, prefix: "   " + cFaint + "│ " + cReset}
+		w = io.MultiWriter(&buf, pw)
+		defer pw.flush()
+	}
+	exit, timedOut := r.spawn(ctx, r.script(cmd), stdin, w, w, timeout)
+	out := buf.String()
+	switch {
+	case timedOut:
+		return out + fmt.Sprintf("\n(timed out after %s)", timeout), -1, false
+	case exit == 0:
+		return out, 0, false
+	case exit == 255 && sshOwnFailure(out):
+		// 255 is ssh's own failure (host unreachable, auth), not the command's
+		return out + "\n(ssh could not run the command on " + r.Host + ")", -1, true
+	case exit == -1:
+		return out, -1, true
+	}
+	return out, exit, false
 }
 
 // capture runs a command and returns its output, or an "error: …" string in the
@@ -156,6 +378,36 @@ func (r *Remote) capture(ctx context.Context, cmd string) (string, string) {
 		return "", "error: " + strings.TrimSpace(lastLines(out, 5, 500))
 	}
 	return out, ""
+}
+
+// plumb runs one of lca's OWN scripts on the member: the git dance that makes a
+// delegation's worktree and the diff it brings back. Two reasons it is not run:
+//
+//   - stdout and stderr come back SEPARATELY. run merges them into one buffer,
+//     which would splice a git warning into the middle of a patch.
+//   - it bypasses CheckCommand for the same reason the local path's gitCmd does:
+//     every byte is a constant or a path lca computed. Nothing model-supplied may
+//     ever reach it, and it is not reachable from a tool.
+//
+// It still passes the reachability gate. The cd is `|| exit 98`, not
+// Remote.script's `cd d && cmd`, whose && would bind to the script's first line
+// only and run the rest even when the cd failed.
+func (r *Remote) plumb(ctx context.Context, script string, stdin []byte, timeout time.Duration) (stdout, stderr string, exit int) {
+	if err := r.ensureUp(ctx); err != nil {
+		return "", err.Error(), -1
+	}
+	var out, errb bytes.Buffer
+	code, timedOut := r.spawn(ctx, "cd "+shellQuote(r.Dir)+" || exit 98\n"+script, stdin, &out, &errb, timeout)
+	switch {
+	case timedOut:
+		return out.String(), errb.String() + fmt.Sprintf("\n(timed out after %s)", timeout), -1
+	case code == -1, code == 255 && sshOwnFailure(errb.String()):
+		// The transport, not the script: the same note a tool call gets, and the
+		// gate goes with it so the next caller is told about the machine.
+		r.forget()
+		return out.String(), errb.String() + "\n(ssh could not run the command on " + r.Where() + ")", -1
+	}
+	return out.String(), errb.String(), code
 }
 
 // ── path safety ─────────────────────────────────────────────────────────────

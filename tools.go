@@ -320,7 +320,7 @@ func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Du
 		return res + "\n(interrupted by user)"
 	case ctx.Err() == context.DeadlineExceeded:
 		say("   " + warn("%s timed out after %s", gDown, timeout))
-		return res + fmt.Sprintf("\n(command timed out after %s — retry with a larger timeout if it is expected to take longer)", timeout)
+		return fmt.Sprintf("error: the command timed out after %s — retry with a larger timeout if it is expected to take longer\n", timeout) + res
 	case err != nil:
 		_, desc := exitInfo(err)
 		say("   " + cRed + gDown + cReset + faint(" %s", desc))
