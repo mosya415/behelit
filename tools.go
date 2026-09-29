@@ -366,7 +366,7 @@ func exitInfo(err error) (int, string) {
 // no approval prompt: the verifier is the harness, not the model) and returns
 // its combined output and exit code. exit is -1 when it could not run or
 // timed out.
-func execCheck(parent context.Context, j *Jail, cmdline string, timeout time.Duration) (string, int) {
+func execCheck(parent context.Context, j *Jail, cmdline string, timeout time.Duration, live ...io.Writer) (string, int) {
 	if err := j.CheckCommand(cmdline); err != nil {
 		return "sandbox: " + err.Error(), -1
 	}
@@ -376,7 +376,13 @@ func execCheck(parent context.Context, j *Jail, cmdline string, timeout time.Dur
 	cmd.Dir = j.Root
 	inProcessGroup(cmd)
 	var buf bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &buf, &buf
+	sink := io.Writer(&buf)
+	// A workflow step's output must reach run.log as it is produced: a run that
+	// crashes mid-check is still diagnosable.
+	if len(live) > 0 && live[0] != nil {
+		sink = io.MultiWriter(&buf, live[0])
+	}
+	cmd.Stdout, cmd.Stderr = sink, sink // one writer ⇒ os/exec serializes the two streams
 	err := cmd.Run()
 	out := buf.String()
 	switch {

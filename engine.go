@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -197,12 +198,13 @@ type Session struct {
 	Msgs   []Message
 	extra  Ruleset // session-level restrictions (subagents)
 
-	jl           *Jail    // own working tree (delegate worktree); nil = the orchestrator's
-	isolated     bool     // works in a scratch worktree: edits/commands there are the point
-	rootOverride string   // root session id for detached helper sessions (compaction)
-	transport    string   // tool transport, fixed per session ("" = the client's provider)
-	malformed    int      // text-protocol tool tags in the last reply that didn't parse
-	models       []string // role model chain (gateway names); empty = fixed client
+	checkLive    io.Writer // where a verifier check's output streams live (nil: nowhere)
+	jl           *Jail     // own working tree (delegate worktree); nil = the orchestrator's
+	isolated     bool      // works in a scratch worktree: edits/commands there are the point
+	rootOverride string    // root session id for detached helper sessions (compaction)
+	transport    string    // tool transport, fixed per session ("" = the client's provider)
+	malformed    int       // text-protocol tool tags in the last reply that didn't parse
+	models       []string  // role model chain (gateway names); empty = fixed client
 	modelIdx     int
 	schemas      []ToolSchema // tool schemas, computed once: the request prefix never changes
 	toolDefs     []*ToolDef

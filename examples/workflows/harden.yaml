@@ -1,0 +1,55 @@
+description: Plan a change, build it in a worktree, review it across families, then commit.
+role: lead
+
+vars:
+  task:                       # no value: required, pass -var task=…
+  tests: ./...
+
+steps:
+  baseline:
+    run: go test -count=1 ${vars.tests}
+    timeout: 1800
+    # A red baseline means the verifier can't tell this change's breakage from what
+    # was already broken, so nothing else should run.
+
+  plan:
+    prompt: |
+      Write a build brief for this change:
+      ${vars.task}
+
+      Name the files to touch, the failure mode to avoid, and the test that proves it
+      works. Answer with the brief only — it is handed verbatim to another model that
+      sees none of this conversation.
+
+  build:
+    delegate: |
+      ${steps.plan.out}
+
+      Implement exactly this. Stay inside the files named above.
+    role: coder
+    check: go build ./... && go test -count=1 ${vars.tests}
+    retries: 1
+
+  fmt:
+    run: gofmt -w .
+    # Zero tokens: never ask a model to do what gofmt does.
+
+  review:
+    prompt: |
+      Review this diff for correctness and for the constraints in AGENTS.md:
+
+      ${steps.build.diff}
+
+      Write your verdict to review.md, first line exactly "VERDICT: ship" or
+      "VERDICT: rework", then the reasons.
+    role: reviewer
+    check: grep -q '^VERDICT: ship' review.md
+    retries: 0
+    # retries: 0 on purpose — a retry re-prompts with "the check FAILED", which
+    # pressures a model into flipping its verdict instead of reconsidering it.
+
+  integrate:
+    run: git commit -am "wf ${vars.task}"
+    when: ${steps.build.status} == ok && ${steps.review.status} == ok
+    # Last on purpose: a resume re-runs the step that failed, and this one is not
+    # idempotent.

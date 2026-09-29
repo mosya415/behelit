@@ -119,3 +119,47 @@ func (r *Repl) cmdStats(string) bool {
 	}
 	return false
 }
+
+// cmdRun is the REPL door onto `lca run`: the same runner, the same orchestrator
+// and trace, driven inside interruptible so Ctrl-C reaches it as it does
+// everywhere else. The CLI path is the deliverable; this keeps a workflow one
+// keystroke away mid-conversation.
+func (r *Repl) cmdRun(arg string) bool {
+	name, rest, _ := strings.Cut(strings.TrimSpace(arg), " ")
+	if name == "" {
+		printWorkflows(r.cfg)
+		return false
+	}
+	vars := kvFlag{}
+	for _, kv := range strings.Fields(rest) {
+		if err := vars.Set(kv); err != nil {
+			errLine("%v", err)
+			hint("usage: /run <name> [k=v …]")
+			return false
+		}
+	}
+	wf, err := findWorkflow(r.cfg, name)
+	if err != nil {
+		errLine("%v", err)
+		return false
+	}
+	effective := wf.effectiveVars(vars)
+	if err := wf.bind(r.orch, r.sess.agent.Name, effective); err != nil {
+		errLine("%v", err)
+		return false
+	}
+	dir, st := newRunState(r.cfg, r.orch, wf, effective)
+	runner, err := newRunner(r.orch, r.sess, wf, dir, st)
+	if err != nil {
+		errLine("%v", err)
+		return false
+	}
+	defer runner.Close()
+	interruptible(r.sess, func(ctx context.Context) { runner.Run(ctx) })
+	// Keep the conversation coherent: the lead model sees what the program did.
+	r.sess.Msgs = append(r.sess.Msgs,
+		Message{Role: "user", Content: fmt.Sprintf("[The user ran the %s workflow]\n%s", wf.Name, runner.digest())},
+		Message{Role: "assistant", Content: "Understood.", Agent: r.sess.agent.Name})
+	r.sess.saveTranscript()
+	return false
+}

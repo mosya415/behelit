@@ -60,6 +60,7 @@ func replRegistry() []replCmd {
 		{name: "/role", aliases: []string{"/roles"}, args: "[<name> <setting> <value>]", desc: "show or change roles by hand (model, effort, tools, check)", group: "agents", run: (*Repl).cmdRole},
 		{name: "/delegate", args: "<role> <task>", desc: "hand one task to a role now (worktree + verifier)", group: "agents",
 			show: func(r *Repl) bool { return r.teamMode() && r.orch.remote == nil }, run: (*Repl).cmdDelegate},
+		{name: "/run", args: "<name> [k=v …]", desc: "run a workflow (deterministic steps)", group: "agents", run: (*Repl).cmdRun},
 		{name: "/tasks", args: "[<id>]", desc: "subagent runs and their results", group: "agents", run: (*Repl).cmdTasks},
 		{name: "/todo", aliases: []string{"/todos"}, desc: "the agent's todo list", group: "agents", run: (*Repl).cmdTodo},
 		{name: "/skills", desc: "skills agents can load", group: "agents", show: func(r *Repl) bool { return len(r.orch.skills) > 0 }, run: (*Repl).cmdSkills},

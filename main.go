@@ -19,6 +19,8 @@ func main() {
 		switch os.Args[1] {
 		case "eval":
 			os.Exit(runEval(cfg, os.Args[2:]))
+		case "run":
+			os.Exit(runWorkflow(cfg, os.Args[2:]))
 		case "init":
 			os.Exit(runInit(cfg, os.Args[2:]))
 		case "doctor":

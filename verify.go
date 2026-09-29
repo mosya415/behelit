@@ -100,9 +100,9 @@ func (s *Session) RunVerifiedAll(ctx context.Context, checks []string, attempts 
 		for _, check = range checks {
 			cstart := time.Now()
 			if rem := s.remote(); rem != nil {
-				out, exit = rem.run(ctx, check, s.orch.checkTimeout(), nil, nil)
+				out, exit = rem.run(ctx, check, s.orch.checkTimeout(), nil, s.checkLive)
 			} else {
-				out, exit = execCheck(ctx, s.jail(), check, s.orch.checkTimeout())
+				out, exit = execCheck(ctx, s.jail(), check, s.orch.checkTimeout(), s.checkLive)
 			}
 			s.stats.VerifyRuns++
 			s.view.Check(check, exit, time.Since(cstart), attempt, attempts)
