@@ -132,6 +132,10 @@ func (o *Orchestrator) newChild(parent *Session, ag *Agent, desc string) (*Sessi
 
 	child := &Session{ID: id, UID: parent.rootUID() + "-" + id, orch: o, parent: parent, depth: parent.depth + 1, agent: ag, title: desc,
 		wake: make(chan struct{}, 1), Raw: parent.Raw}
+	// A workflow's delegate step sets this on the caller so the subagent's
+	// verifier streams into run.log: a delegation killed after twenty minutes
+	// must have left something diagnosable behind.
+	child.checkLive = parent.checkLive
 	// Model: the role's chain, the agent's own, else the caller's.
 	if len(ag.Models) > 0 {
 		child.models = append([]string(nil), ag.Models...)

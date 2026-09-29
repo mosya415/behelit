@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,9 @@ import (
 // so a test workflow uses single commands (echo, cat, test, ls) or `sh -c '…'`
 // — never `&&`.
 
-const wfRoles = testRoles + `  reviewer:
+// bind refuses a command this team's allowlist would reject, so the team needs
+// gofmt: the shipped example's fmt step runs it.
+var wfRoles = strings.Replace(testRoles, ", sh, go]", ", sh, go, gofmt]", 1) + `  reviewer:
     description: Reviews diffs.
     models: [cheap-a]
     effort: low
@@ -60,7 +63,7 @@ func readSteps(t *testing.T, h *harness) []StepRecord {
 func buildWF(t *testing.T, h *harness, dir, text string, vars map[string]string) *wfRunner {
 	t.Helper()
 	wf := loadWF(t, h, dir, text, vars)
-	rdir, st := newRunState(h.orch.cfg, h.orch, wf, wf.effectiveVars(vars))
+	rdir, st := newRunState(h.orch.cfg, h.orch, wf, h.sess.agent.Name, wf.effectiveVars(vars))
 	r, err := newRunner(h.orch, h.sess, wf, rdir, st)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +111,7 @@ func resumeRunner(t *testing.T, h *harness, wf *Workflow, dir string, cliVars ma
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkResume(wf, st, cliVars); err != nil {
+	if err := checkResume(wf, st, cliVars, h.orch.jl.Root); err != nil {
 		t.Fatal(err)
 	}
 	attachRun(h.orch, dir, st)
@@ -116,7 +119,7 @@ func resumeRunner(t *testing.T, h *harness, wf *Workflow, dir string, cliVars ma
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.log.header("== resume %s (session %s) ==", wfNow(), h.orch.rec.id)
+	r.log.header("== resume %s (session %s) ==", nowTS(), h.orch.rec.id)
 	return r
 }
 
@@ -127,6 +130,16 @@ func readLog(t *testing.T, r *wfRunner) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// mustRuns is listRuns without its warnings, which no test expects to see.
+func mustRuns(t *testing.T, cfg Config) []*WorkflowState {
+	t.Helper()
+	runs, warns := listRuns(cfg, 0)
+	if len(warns) > 0 {
+		t.Fatalf("unreadable run state: %v", warns)
+	}
+	return runs
 }
 
 func stepByName(st *WorkflowState, name string) *StepState {
@@ -286,7 +299,7 @@ func TestWorkflowValidateReferences(t *testing.T) {
 	if n := len(fs.reqs()); n != 0 {
 		t.Fatalf("validation must cost no tokens, got %d requests", n)
 	}
-	if runs := listRuns(h.orch.cfg, 0); len(runs) != 0 {
+	if runs := mustRuns(t, h.orch.cfg); len(runs) != 0 {
 		t.Fatalf("validation must create no run directory, got %d", len(runs))
 	}
 }
@@ -372,7 +385,6 @@ func TestWorkflowExpandPlaceholders(t *testing.T) {
 		{"x ${steps.a.out} y", "x hello world y"},
 		{"${steps.a.status}", stepOK},
 		{"${steps.a.exit}", "2"},
-		{"${steps.s.out}", ""},
 		{"${steps.s.status}", stepSkipped},
 		{"${steps.s.exit}", "0"},
 		{"nothing", "nothing"},
@@ -387,6 +399,11 @@ func TestWorkflowExpandPlaceholders(t *testing.T) {
 	}
 	if _, err := r.expand("${vars.ghost}", false); err == nil {
 		t.Fatal("an unknown variable must be an error")
+	}
+	// A skipped step produced nothing: handing "" on would let the next step
+	// succeed on no input at all.
+	if _, err := r.expand("${steps.s.out}", false); err == nil {
+		t.Fatal("the output of a skipped step must be an error, not the empty string")
 	}
 }
 
@@ -813,7 +830,7 @@ func TestWorkflowResumeRefusesChangedWorkflow(t *testing.T) {
 	if code := runCLI(t, h, "chg"); code != 1 {
 		t.Fatalf("first run exit %d", code)
 	}
-	runs := listRuns(h.orch.cfg, 0)
+	runs := mustRuns(t, h.orch.cfg)
 	if len(runs) != 1 {
 		t.Fatalf("want one run, got %d", len(runs))
 	}
@@ -978,8 +995,8 @@ func TestWorkflowStateIsAtomicAndComplete(t *testing.T) {
 			t.Fatalf("state.json mid-run lacks %s:\n%s", want, peek)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(r.dir, "state.json.tmp")); err == nil {
-		t.Fatal("the temp file must not survive the run")
+	if left, _ := filepath.Glob(filepath.Join(r.dir, "state.json*.tmp")); len(left) > 0 {
+		t.Fatalf("no temp file may survive the run: %v", left)
 	}
 	if _, err := loadRunState(r.dir); err != nil {
 		t.Fatalf("final state must parse: %v", err)
@@ -1058,9 +1075,11 @@ func TestWorkflowRunLogSurvivesFailure(t *testing.T) {
 	}
 }
 
+// A command bind cannot pre-check (it is built from an earlier step's output) is
+// still refused when it runs, and that refusal is a failed step.
 func TestWorkflowSandboxRefusalIsFailedStep(t *testing.T) {
 	h, dir := wfHarness(t, alwaysReply(t, "ok"))
-	code, st, r := runWF(t, h, dir, "steps:\n  nope:\n    run: curl http://example.invalid\n", nil)
+	code, st, r := runWF(t, h, dir, "steps:\n  pick:\n    run: echo curl\n  nope:\n    run: ${steps.pick.out} http://example.invalid\n", nil)
 	ss := stepByName(st, "nope")
 	if code != 1 || ss.Status != stepFailed || ss.Exit != -1 {
 		t.Fatalf("exit %d step %+v", code, ss)
@@ -1128,7 +1147,7 @@ func TestRunWorkflowFlagParsing(t *testing.T) {
 	if code := runCLI(t, h, "flagwf", "-dry-run", "-var", "k=v"); code != 0 {
 		t.Fatalf("-dry-run exit %d", code)
 	}
-	if runs := listRuns(h.orch.cfg, 0); len(runs) != 0 {
+	if runs := mustRuns(t, h.orch.cfg); len(runs) != 0 {
 		t.Fatalf("-dry-run must create no run directory, got %d", len(runs))
 	}
 	if n := len(fs.reqs()); n != 0 {
@@ -1140,7 +1159,7 @@ func TestRunWorkflowFlagParsing(t *testing.T) {
 			t.Fatalf("%v: exit %d", args, code)
 		}
 	}
-	runs := listRuns(h.orch.cfg, 0)
+	runs := mustRuns(t, h.orch.cfg)
 	if len(runs) != 2 {
 		t.Fatalf("want two runs, got %d", len(runs))
 	}
@@ -1224,12 +1243,561 @@ func TestWorkflowPruneKeepsUnfinishedRuns(t *testing.T) {
 	okRun.Close()
 	_, _, badRun := runWF(t, h, filepath.Join(dir, "b"), "steps:\n  a:\n    run: test -f nope\n", nil)
 	badRun.Close()
-	if len(listRuns(h.orch.cfg, 0)) != 2 {
-		t.Fatalf("want two runs: %+v", listRuns(h.orch.cfg, 0))
+	if len(mustRuns(t, h.orch.cfg)) != 2 {
+		t.Fatalf("want two runs: %+v", mustRuns(t, h.orch.cfg))
 	}
 	pruneRuns(h.orch.cfg, 0)
-	left := listRuns(h.orch.cfg, 0)
+	left := mustRuns(t, h.orch.cfg)
 	if len(left) != 1 || left[0].Status != stepFailed {
 		t.Fatalf("an unfinished run is someone's resumable work: %+v", left)
+	}
+}
+
+// ── review fixes ────────────────────────────────────────────────────────────
+
+// coderWritesFile is a team whose coder creates done.txt, so a delegate step
+// produces a real diff its check accepts.
+func coderWritesFile(t *testing.T) *fakeServer {
+	return newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		if req.Model == "coder-a" {
+			if strings.Contains(req.Body, `"role":"tool"`) {
+				return fakeReply{content: "created done.txt"}
+			}
+			return fakeReply{calls: []ToolCall{call("w", "write", map[string]any{"path": "done.txt", "content": "ok\n"})}}
+		}
+		return fakeReply{content: "ok"}
+	})
+}
+
+// expand shell-quotes an untrusted step output, which is only safe where the
+// author wrote no quotes of their own: `echo '${steps.x.out}'` with the output
+// `x; git reset --hard origin/main` would close the quote and run a second
+// command. The value does not exist at load, so refusing the spelling is the
+// only enforcement there can be.
+func TestWorkflowRefusesQuotedStepReference(t *testing.T) {
+	for _, yaml := range []string{
+		"steps:\n  a:\n    run: echo x\n  b:\n    run: echo '${steps.a.out}'\n",
+		"steps:\n  a:\n    run: echo x\n  b:\n    run: echo \"${steps.a.out}\"\n",
+		"steps:\n  a:\n    run: echo x\n  b:\n    run: echo y\n    check: grep -q '${steps.a.out}' out.txt\n",
+	} {
+		_, err := parseWorkflow("t", "t.yaml", yaml)
+		if err == nil || !strings.Contains(err.Error(), "inside quotes") {
+			t.Fatalf("%q: error %v", yaml, err)
+		}
+	}
+	// Unquoted is the supported spelling, and a var may still be quoted: it comes
+	// from the file or the command line, not from a model.
+	if _, err := parseWorkflow("t", "t.yaml", "vars:\n  m: hi\nsteps:\n  a:\n    run: echo x\n  b:\n    run: echo ${steps.a.out} \"${vars.m}\"\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkflowWhenTypoFailsAtLoad(t *testing.T) {
+	for _, expr := range []string{"step.build.status == ok", "build.status == ok", "${steps.b.status} == ok.ish"} {
+		yaml := "steps:\n  b:\n    run: echo x\n  c:\n    run: echo y\n    when: " + expr + "\n"
+		_, err := parseWorkflow("t", "t.yaml", yaml)
+		if err == nil || !strings.Contains(err.Error(), "misspelt reference") {
+			t.Fatalf("%q: error %v — a near-miss reference would skip the step on every run in silence", expr, err)
+		}
+	}
+	// A quoted literal with a dot is still a literal.
+	wf, err := parseWorkflow("t", "t.yaml", "steps:\n  b:\n    run: echo x\n  c:\n    run: echo y\n    when: ${steps.b.out} == \"1.2\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wf.byName["c"].When[0].terms[0].rhs.literal; got != "1.2" {
+		t.Fatalf("quoted literal: %q", got)
+	}
+}
+
+func TestWorkflowStepsAsAListIsNamed(t *testing.T) {
+	_, err := parseWorkflow("t", "t.yaml", "steps:\n  - name: build\n    run: go build ./...\n  - name: test\n    run: go test ./...\n")
+	if err == nil || !strings.Contains(err.Error(), "not a list") {
+		t.Fatalf("error %v — the message must point at the `- `, not at a step nobody wrote", err)
+	}
+}
+
+// bind asks the sandbox, so a command that could only ever fail says so before
+// the first token is spent instead of at step 9 of a pipeline.
+func TestWorkflowBindChecksTheSandbox(t *testing.T) {
+	fs := alwaysReply(t, "ok")
+	h, dir := wfHarness(t, fs)
+	for _, c := range []struct{ name, yaml, want string }{
+		{"chained action", "steps:\n  a:\n    run: go build ./... && go test ./...\n", "one argv per command"},
+		{"chained check", "steps:\n  a:\n    run: echo x\n    check: test -f a && test -f b\n", "one argv per command"},
+		{"piped", "steps:\n  a:\n    run: cat x | grep y\n", "one argv per command"},
+		{"not allowlisted", "steps:\n  a:\n    run: curl http://example.invalid\n", "allowlist"},
+		{"in a var", "vars:\n  t: ./... && rm -rf /\nsteps:\n  a:\n    run: go test ${vars.t}\n", "one argv per command"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			wf, err := parseWorkflow("t", filepath.Join(dir, "t.yaml"), c.yaml)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = wf.bind(h.orch, "lead", wf.effectiveVars(nil))
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("bind error %v, want %q", err, c.want)
+			}
+			if !strings.Contains(err.Error(), "step a") {
+				t.Fatalf("the error must name the step: %v", err)
+			}
+		})
+	}
+	// An operator inside quotes is an argument to sh, not a shell line here.
+	wf, err := parseWorkflow("t", filepath.Join(dir, "ok.yaml"), "steps:\n  a:\n    run: sh -c 'echo one >> counter.txt'\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.bind(h.orch, "lead", wf.effectiveVars(nil)); err != nil {
+		t.Fatalf("a quoted operator is one argv word: %v", err)
+	}
+	if n := len(fs.reqs()); n != 0 {
+		t.Fatalf("bind must cost no tokens, got %d requests", n)
+	}
+}
+
+func TestWorkflowUnknownVarIsRefused(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	wf, err := parseWorkflow("t", filepath.Join(dir, "t.yaml"), "vars:\n  tests: ./...\nsteps:\n  a:\n    run: go test ${vars.tests}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars := wf.effectiveVars(map[string]string{"tset": "./pkg/..."})
+	err = wf.bind(h.orch, "lead", vars)
+	if err == nil || !strings.Contains(err.Error(), "not a variable this workflow uses") {
+		t.Fatalf("bind error %v — a typo'd -var must not be dropped in silence", err)
+	}
+	if err := wf.bind(h.orch, "lead", wf.effectiveVars(map[string]string{"tests": "./pkg/..."})); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two processes on one run directory would execute every remaining step twice —
+// a delegation applied twice, a `git commit` step committing twice — and each
+// would rewrite state.json over the other.
+func TestWorkflowRunDirIsLocked(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	r := buildWF(t, h, dir, "steps:\n  a:\n    run: echo a\n", nil)
+	held, err := os.ReadFile(filepath.Join(r.dir, "lock"))
+	if err != nil || strings.TrimSpace(string(held)) != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("the lock must name the holder: %q %v", held, err)
+	}
+	st2, err := loadRunState(r.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRunner(h.orch, h.sess, r.wf, r.dir, st2); err == nil || !strings.Contains(err.Error(), "still going") {
+		t.Fatalf("a second runner on a live run: %v", err)
+	}
+	r.Close()
+
+	// The lock dies with the run, so a resume can take the directory.
+	r2, err := newRunner(h.orch, h.sess, r.wf, r.dir, st2)
+	if err != nil {
+		t.Fatalf("after Close the directory must be free: %v", err)
+	}
+	r2.Close()
+
+	// A lock whose process is gone is a crash, not a conflict: a crashed run has
+	// to stay resumable.
+	if err := os.WriteFile(filepath.Join(r.dir, "lock"), []byte("2147483646\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var r3 *wfRunner
+	out := captureStdout(t, func() { r3, err = newRunner(h.orch, h.sess, r.wf, r.dir, st2) })
+	if err != nil {
+		t.Fatalf("a stale lock must be taken over: %v", err)
+	}
+	r3.Close()
+	if !strings.Contains(out, "taking over") {
+		t.Fatalf("taking over a lock must say so:\n%s", out)
+	}
+}
+
+// runs/ is shared by every project on the machine, so a resume that matched on
+// the workflow name alone could continue another repository's run in this tree.
+func TestWorkflowResumeGuards(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	text := "vars:\n  who: world\nsteps:\n  one:\n    run: echo ${vars.who}\n  two:\n    run: test -f nope\n"
+	_, _, r := runWF(t, h, dir, text, nil)
+	r.Close()
+	st, err := loadRunState(r.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf := loadWF(t, h, dir, text, nil)
+	if err := checkResume(wf, st, nil, filepath.Join(h.root, "elsewhere")); err == nil || !strings.Contains(err.Error(), "belongs to") {
+		t.Fatalf("resume across projects: %v", err)
+	}
+	if err := checkResume(wf, st, map[string]string{"who": "world", "extra": "1"}, h.orch.jl.Root); err == nil || !strings.Contains(err.Error(), "cannot add") {
+		t.Fatalf("a -var the run never had: %v", err)
+	}
+	if err := checkResume(wf, st, map[string]string{"who": "world"}, h.orch.jl.Root); err != nil {
+		t.Fatalf("the recorded vars must still resume: %v", err)
+	}
+}
+
+func TestWorkflowFindRunPicksTheResumableOne(t *testing.T) {
+	h, _ := wfHarness(t, alwaysReply(t, "ok"))
+	cfg := h.orch.cfg
+	write := func(id, status, root string, cursor, n int, started string) {
+		dir := filepath.Join(runsDir(cfg), id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		st := &WorkflowState{Version: wfStateVersion, Run: id, Workflow: "wf", Path: "wf.yaml",
+			Root: root, Cursor: cursor, NSteps: n, Status: status, Started: started}
+		if err := saveRunState(dir, st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("wf-20260101-000000-1", "paused", h.orch.jl.Root, 1, 3, "2026-01-01T00:00:00Z")
+	write("wf-20260102-000000-2", stepFailed, h.orch.jl.Root, 3, 3, "2026-01-02T00:00:00Z")
+	write("wf-20260103-000000-3", stepFailed, filepath.Join(h.root, "other"), 0, 3, "2026-01-03T00:00:00Z")
+
+	_, st, err := findRun(cfg, "wf", "", h.orch.jl.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Run != "wf-20260101-000000-1" {
+		t.Fatalf("resumed %s: the newest run with work left in THIS project is the one", st.Run)
+	}
+	if err := os.RemoveAll(filepath.Join(runsDir(cfg), "wf-20260101-000000-1")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = findRun(cfg, "wf", "", h.orch.jl.Root)
+	if err == nil || !strings.Contains(err.Error(), "wf-20260102-000000-2") {
+		t.Fatalf("with nothing resumable, name the finished run that was skipped: %v", err)
+	}
+}
+
+func TestWorkflowListRunsWarnsOnUnreadableState(t *testing.T) {
+	h, _ := wfHarness(t, alwaysReply(t, "ok"))
+	dir := filepath.Join(runsDir(h.orch.cfg), "wf-20260101-000000-9")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("{truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runs, warns := listRuns(h.orch.cfg, 0)
+	if len(runs) != 0 || len(warns) != 1 || !strings.Contains(warns[0], "state.json") {
+		t.Fatalf("a run on disk that will not parse is a warning, not a disappearance: %d runs, %v", len(runs), warns)
+	}
+	out := captureStdout(t, func() { printRuns(h.orch.cfg) })
+	if !strings.Contains(out, "state.json") {
+		t.Fatalf("-list must say the run is there but unreadable:\n%s", out)
+	}
+}
+
+// The step's name must not reach the system prompt: newChild puts a description
+// there, and a difference near the front of the prefix costs the gateway's KV
+// cache the whole system message on every step after the first.
+func TestWorkflowPromptStepsShareTheSystemPrefix(t *testing.T) {
+	fs := alwaysReply(t, "done")
+	h, dir := wfHarness(t, fs)
+	code, _, r := runWF(t, h, dir, "steps:\n  plan:\n    prompt: think\n    role: cheap\n  review:\n    prompt: think again\n    role: cheap\n", nil)
+	r.Close()
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	reqs := fs.reqs()
+	if len(reqs) != 2 {
+		t.Fatalf("want two requests, got %d", len(reqs))
+	}
+	if reqs[0].system() != reqs[1].system() {
+		t.Fatalf("the prefix diverges between two steps of one role:\n%q\n%q", reqs[0].system(), reqs[1].system())
+	}
+	for _, name := range []string{"plan", "review"} {
+		if strings.Contains(reqs[0].system(), name) {
+			t.Fatalf("the step name is in the system prompt: %q", reqs[0].system())
+		}
+	}
+}
+
+// Contract 6 for the most expensive kind of step: what the model said must be on
+// disk while it is being said, not only once the step returns.
+func TestWorkflowPromptReplyReachesLog(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "THE-BRIEF: touch nothing"))
+	code, _, r := runWF(t, h, dir, "steps:\n  plan:\n    prompt: write a brief\n    role: cheap\n", nil)
+	r.Close()
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	log := readLog(t, r)
+	if !strings.Contains(log, "THE-BRIEF: touch nothing") {
+		t.Fatalf("run.log has no record of the reply:\n%s", log)
+	}
+	if !strings.Contains(log, "plan says:") {
+		t.Fatalf("a teed line must say which step wrote it:\n%s", log)
+	}
+}
+
+func TestWorkflowDelegateVerifierReachesLog(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "nothing to do"))
+	r := buildWF(t, h, dir, "steps:\n  build:\n    delegate: create done.txt\n    role: coder\n", nil)
+	code := runRunner(t, r)
+	r.Close()
+	if code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	// The subagent's check is `ls done.txt` (the coder role's check_cmd) and it
+	// fails in the worktree: without it, a delegation killed after twenty minutes
+	// leaves one header line in run.log.
+	log := strings.ToLower(readLog(t, r))
+	if !strings.Contains(log, "no such file") && !strings.Contains(log, "cannot access") {
+		t.Fatalf("the subagent's verifier must stream into run.log:\n%s", log)
+	}
+}
+
+// A run step is announced after its placeholders are expanded: a line showing
+// ${vars.who} says nothing about what ran.
+func TestWorkflowAnnouncesTheExpandedCommand(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	r := buildWF(t, h, dir, "vars:\n  who: world\nsteps:\n  hello:\n    run: echo hello-${vars.who}\n", nil)
+	out := captureStdout(t, func() { r.Run(context.Background()) })
+	r.Close()
+	if !strings.Contains(out, "echo hello-world") || strings.Contains(out, "${vars.who}") {
+		t.Fatalf("the step line must show the command that ran:\n%s", out)
+	}
+}
+
+func TestWorkflowRunStepTimeoutSaysWhatTimedOut(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	_, st, r := runWF(t, h, dir, "steps:\n  slow:\n    run: sh -c 'sleep 5'\n    timeout: 1\n", nil)
+	r.Close()
+	ss := stepByName(st, "slow")
+	if ss.Status != stepFailed || !strings.Contains(ss.Detail, "the command timed out") {
+		t.Fatalf("the step's own action timed out, not a check: %+v", ss)
+	}
+}
+
+// A dependent step must fail honestly rather than succeed on nothing: the diff
+// exists nowhere but this file, so losing it is not an ok step.
+func TestWorkflowDiffThatCannotBeStoredFailsTheStep(t *testing.T) {
+	h, dir := wfHarness(t, coderWritesFile(t))
+	r := buildWF(t, h, dir, "steps:\n  build:\n    delegate: create done.txt\n    role: coder\n", nil)
+	if err := os.WriteFile(filepath.Join(r.dir, "steps"), []byte("in the way\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code := runRunner(t, r)
+	r.Close()
+	ss := stepByName(r.st, "build")
+	if code != 1 || ss.Status != stepFailed || !strings.Contains(ss.Detail, "could not store the diff") {
+		t.Fatalf("exit %d step %+v", code, ss)
+	}
+	if ss.DiffFile != "" {
+		t.Fatalf("no diff was stored, so nothing may point at one: %q", ss.DiffFile)
+	}
+}
+
+func TestWorkflowMissingDiffIsAnError(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	r := buildWF(t, h, dir, "steps:\n  z:\n    run: echo z\n", nil)
+	defer r.Close()
+	// A delegation the verifier passed on an unchanged tree: the review step that
+	// reads its diff must not be handed the empty string and pass.
+	r.res["build"] = &StepState{Name: "build", Kind: stepDelegate, Status: stepOK}
+	if _, err := r.expand("review this:\n${steps.build.diff}", false); err == nil {
+		t.Fatal("a step with no diff must not expand to nothing")
+	}
+}
+
+// On a remote project a run step used to bypass the sandbox entirely, so the
+// same line was refused locally and waved through on the remote host.
+func TestWorkflowRemoteRunStepIsStillChecked(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	h.orch.remote = localRemote(h.root)
+	defer func() { h.orch.remote = nil }()
+	_, st, r := runWF(t, h, dir, "steps:\n  pick:\n    run: echo curl\n  nope:\n    run: ${steps.pick.out} http://example.invalid\n", nil)
+	r.Close()
+	if got := stepByName(st, "pick"); got == nil || got.Status != stepOK {
+		t.Fatalf("an allowlisted command must still run on a remote project: %+v", got)
+	}
+	ss := stepByName(st, "nope")
+	if ss.Status != stepFailed || !strings.Contains(ss.Detail, "allowlist") {
+		t.Fatalf("the allowlist must decide on a remote project too: %+v", ss)
+	}
+}
+
+func TestWorkflowDelegateStepJoinsItsTaskRecord(t *testing.T) {
+	h, dir := wfHarness(t, coderWritesFile(t))
+	code, _, r := runWF(t, h, dir, "steps:\n  build:\n    delegate: create done.txt\n    role: coder\n", nil)
+	r.Close()
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	steps := readSteps(t, h)
+	_, tasks := readTrace(t, h)
+	if len(steps) != 1 || len(tasks) != 1 {
+		t.Fatalf("%d step records, %d task records", len(steps), len(tasks))
+	}
+	if steps[0].TaskSession == "" || steps[0].TaskSession != tasks[0].Session {
+		t.Fatalf("a delegate step must be joinable to its task: %q vs %q", steps[0].TaskSession, tasks[0].Session)
+	}
+}
+
+func TestParseVarWords(t *testing.T) {
+	// /run has no shell to quote with, so a word with no `=` belongs to the
+	// value before it — the shipped example's task is free text.
+	got, err := parseVarWords("task=fix the parser tests=./pkg/...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["task"] != "fix the parser" || got["tests"] != "./pkg/..." {
+		t.Fatalf("%#v", got)
+	}
+	if _, err := parseVarWords("the parser"); err == nil {
+		t.Fatal("a line that starts with no k= is still an error")
+	}
+}
+
+func TestRunWorkflowArgumentShapes(t *testing.T) {
+	h, _ := wfHarness(t, alwaysReply(t, "ok"))
+	wfdir := t.TempDir()
+	t.Setenv("LCA_WORKFLOWS", wfdir)
+	text := "steps:\n  one:\n    run: echo one\n  two:\n    run: test -f gate.txt\n"
+	if err := os.WriteFile(filepath.Join(wfdir, "shapes.yaml"), []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runCLI(t, h, "shapes"); code != 1 {
+		t.Fatalf("first run exit %d", code)
+	}
+	runs := mustRuns(t, h.orch.cfg)
+	if len(runs) != 1 {
+		t.Fatalf("want one run, got %d", len(runs))
+	}
+	runid := runs[0].Run
+
+	for _, c := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"run id without -resume", []string{runid}, "did you mean"},
+		{"-resume with nothing to name it", []string{"-resume"}, "needs the workflow name"},
+		{"-pause with a workflow name", []string{"shapes", "-pause"}, "not a run id"},
+		{"-role with -resume", []string{"shapes", "-resume", "-role", "cheap"}, "cannot be combined"},
+		{"a run id that is not one", []string{"shapes", "-resume", "nonsense"}, "not a run id"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := ""
+			code := 0
+			out = captureStdout(t, func() { code = runWorkflow(h.orch.cfg, c.args) })
+			if code != 2 || !strings.Contains(out, c.want) {
+				t.Fatalf("exit %d, output %q, want %q", code, out, c.want)
+			}
+		})
+	}
+
+	// The pinned spelling: the name and the run id together.
+	if err := os.WriteFile(filepath.Join(h.root, "gate.txt"), []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runCLI(t, h, "shapes", "-resume", runid); code != 0 {
+		t.Fatalf("`lca run <name> -resume <runid>` exit %d", code)
+	}
+	st, err := loadRunState(filepath.Join(runsDir(h.orch.cfg), runid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != stepOK || st.Cursor != 2 {
+		t.Fatalf("the named run must be the one that continued: %+v", st)
+	}
+}
+
+// The shipped example workflow and the shipped example team must fit each other:
+// a role harden.yaml names but examples/roles.yaml lacks, or a command that
+// team's sandbox refuses, aborts `lca run harden` before anything runs.
+func TestExampleWorkflowFitsExampleRoles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	abs, err := filepath.Abs(filepath.Join("examples", "roles.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LCA_ROLES", abs)
+	cfg := Config{Dir: t.TempDir(), Root: t.TempDir()}
+	rc, err := loadRoles(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join("examples", "workflows", "harden.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf, err := parseWorkflow("harden", path, string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	has := func(name string) bool {
+		for _, a := range rc.Roles {
+			if a.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	jl, err := NewJail(cfg.Root, rc.Allow, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jl.Shell = rc.Shell
+	vars := wf.effectiveVars(map[string]string{"task": "demo"})
+	for _, s := range wf.Steps {
+		if s.Kind != stepRun {
+			role := firstNonEmpty(s.Role, wf.Role, rc.Entry)
+			if !has(role) {
+				t.Fatalf("step %s wants role %q, which examples/roles.yaml does not define", s.Name, role)
+			}
+		}
+		for _, cmd := range []string{s.Cmd, s.Check} {
+			if cmd == "" || strings.Contains(cmd, "${steps.") {
+				continue
+			}
+			line, err := substVars(cmd, vars)
+			if err != nil {
+				t.Fatalf("step %s: %v", s.Name, err)
+			}
+			if op := shellOperatorOutsideQuotes(line); op != "" && !jl.Shell {
+				t.Fatalf("step %s: %q needs sandbox.shell, which examples/roles.yaml leaves off", s.Name, op)
+			}
+			if err := jl.CheckCommand(line); err != nil {
+				t.Fatalf("step %s: %v", s.Name, err)
+			}
+		}
+	}
+}
+
+// A resume that the lock refuses must not have un-paused the run on its way in.
+func TestWorkflowRefusedResumeKeepsThePause(t *testing.T) {
+	h, _ := wfHarness(t, alwaysReply(t, "ok"))
+	wfdir := t.TempDir()
+	t.Setenv("LCA_WORKFLOWS", wfdir)
+	if err := os.WriteFile(filepath.Join(wfdir, "held.yaml"),
+		[]byte("steps:\n  one:\n    run: echo one\n  two:\n    run: test -f nope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runCLI(t, h, "held"); code != 1 {
+		t.Fatalf("first run exit %d", code)
+	}
+	runs := mustRuns(t, h.orch.cfg)
+	dir := filepath.Join(runsDir(h.orch.cfg), runs[0].Run)
+
+	// A live run of another process: the lock names a pid that exists (ours).
+	if err := os.WriteFile(filepath.Join(dir, "lock"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := pauseRun(h.orch.cfg, runs[0].Run); err != nil {
+		t.Fatal(err)
+	}
+	out := ""
+	code := 0
+	out = captureStdout(t, func() { code = runWorkflow(h.orch.cfg, []string{"held", "-resume"}) })
+	if code != 2 || !strings.Contains(out, "still going") {
+		t.Fatalf("exit %d output:\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pause")); err != nil {
+		t.Fatal("the pause file must survive a refused resume")
 	}
 }

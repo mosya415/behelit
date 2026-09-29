@@ -52,6 +52,17 @@ roles:
       relevant code first, make the smallest correct change, and run the check
       command yourself until it passes. Don't refactor unrelated code.
 
+  reviewer:
+    description: Reads a finished diff and judges it, on a different family than the coder.
+    models: [glm-5.2, kimi-k2.6]
+    effort: high
+    context: 200000
+    tools: [list_dir, glob, grep, read_file, write, run_command]
+    prompt: |
+      You review one finished diff. Read the files it touches before judging it,
+      run what you need to convince yourself, and name the failure mode you
+      found — not style. A verdict with no reason is worthless.
+
   cheap:
     description: Summaries and compaction.
     models: [qwen3-30b-a3b-instruct]

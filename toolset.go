@@ -47,6 +47,10 @@ type ToolCtx struct {
 	S      *Session
 	CallID string
 	Name   string
+	// TaskSession is filled in by runDelegateTool with the subagent's session
+	// UID — the Session of the TaskRecord it writes — so a caller that records
+	// the call (a workflow step) can be joined to that record.
+	TaskSession string
 }
 
 // Args are decoded tool arguments. Text-protocol attributes arrive as strings,

@@ -1,6 +1,9 @@
 description: Plan a change, build it in a worktree, review it across families, then commit.
 role: lead
 
+# Every run:/check: line here is ONE command: without sandbox: {shell: true} the
+# line is exec'd as argv, so `a && b` would hand "&&" to a as an argument. bind
+# refuses that before anything runs — use two steps, as `build` does below.
 vars:
   task:                       # no value: required, pass -var task=…
   tests: ./...
@@ -27,8 +30,10 @@ steps:
 
       Implement exactly this. Stay inside the files named above.
     role: coder
-    check: go build ./... && go test -count=1 ${vars.tests}
+    check: go build ./...
     retries: 1
+    # Two independent checks must pass: the coder role's check_cmd (its tests) and
+    # this one. Only then is the diff applied to your tree.
 
   fmt:
     run: gofmt -w .
@@ -49,7 +54,10 @@ steps:
     # pressures a model into flipping its verdict instead of reconsidering it.
 
   integrate:
-    run: git commit -am "wf ${vars.task}"
+    run: git commit -am "verified by the harden workflow"
     when: ${steps.build.status} == ok && ${steps.review.status} == ok
+    # The task is in the run's state.json, not in this message: a ${vars.*} goes in
+    # verbatim (a step's output is quoted, a var is not), so a task containing a
+    # quote or a " #" would rewrite the command.
     # Last on purpose: a resume re-runs the step that failed, and this one is not
     # idempotent.

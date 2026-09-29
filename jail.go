@@ -18,14 +18,25 @@ type Jail struct {
 	allowed map[string]bool
 }
 
-func NewJail(root string, allowed []string, unsafe bool) (*Jail, error) {
+// realRoot canonicalises a project root the way the jail holds it: absolute
+// with symlinks resolved, so a root recorded by one process can be compared to
+// the tree another process is running in.
+func realRoot(root string) (string, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return nil, fmt.Errorf("root %q: %w", root, err)
+		return "", fmt.Errorf("root %q: %w", root, err)
+	}
+	return real, nil
+}
+
+func NewJail(root string, allowed []string, unsafe bool) (*Jail, error) {
+	real, err := realRoot(root)
+	if err != nil {
+		return nil, err
 	}
 	set := map[string]bool{}
 	for _, c := range allowed {

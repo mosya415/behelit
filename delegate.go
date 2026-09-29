@@ -132,6 +132,7 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		return "error: " + err.Error()
 	}
 	o.forgetChild(child.ID) // its worktree dies with this call: not resumable via task_id
+	tc.TaskSession = child.UID
 	child.jl, err = NewJail(wt.root, o.jl.Allowed, o.jl.Unsafe)
 	if child.jl != nil {
 		child.jl.Shell = o.jl.Shell

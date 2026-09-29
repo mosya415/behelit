@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -35,7 +37,11 @@ import (
 //     on_fail: continue, and then the author must guard it with `when`.
 //   - `run` steps are not approved. They were authored in a file, not chosen by
 //     a model, so they are harness commands exactly like a check_cmd. The
-//     sandbox allowlist, the GPU policy and the deny rules still apply.
+//     sandbox allowlist, the GPU policy and the deny rules still apply, on a
+//     remote project too.
+//   - a `run:` or `check:` line is ONE argv, not a shell line, unless the team
+//     sets sandbox: {shell: true} (or -unsafe): `a && b` would hand "&&" to a
+//     as an argument, so bind refuses it and asks for two steps.
 //
 // An unquoted " #" is a comment anywhere in a scalar (stripComment), so a value
 // that contains one must be quoted: run: "git commit -m fix #42".
@@ -104,18 +110,19 @@ type whenOperand struct {
 
 // stepOutcome is what one step produced, before it becomes state.
 type stepOutcome struct {
-	Status    string // stepOK | stepFailed | stepSkipped
-	Out       string // capped: what ${steps.x.out} yields
-	Diff      string // delegate only: the full diff
-	Exit      int
-	Check     string // the expanded check, for the trace
-	CheckExit *int   // what the check decided; nil when none ran
-	Checked   bool   // a check ran and decided this
-	Attempts  int
-	Detail    string // why it failed: check tail, delegate status, sandbox refusal, "cancelled"
-	Model     string
-	Session   string      // the step's own session UID (prompt steps)
-	Usage     *traceUsage // non-nil only when a model ran
+	Status      string // stepOK | stepFailed | stepSkipped
+	Out         string // capped: what ${steps.x.out} yields
+	Diff        string // delegate only: the full diff
+	Exit        int
+	Check       string // the expanded check, for the trace
+	CheckExit   *int   // what the check decided; nil when none ran
+	Checked     bool   // a check ran and decided this
+	Attempts    int
+	Detail      string // why it failed: check tail, delegate status, sandbox refusal, "cancelled"
+	Model       string
+	Session     string      // the step's own session UID (prompt steps)
+	TaskSession string      // delegate only: the subagent session its TaskRecord carries
+	Usage       *traceUsage // non-nil only when a model ran
 }
 
 // StepState is one step as state.json and a resume see it.
@@ -152,6 +159,8 @@ type WorkflowState struct {
 	Sessions []string          `json:"sessions"` // one rec.id per process that worked on this run
 	Traces   []string          `json:"traces"`   // the trace file each of those wrote
 	Vars     map[string]string `json:"vars"`
+	Lead     string            `json:"lead,omitempty"`    // the lead role the run bound to
+	NSteps   int               `json:"n_steps,omitempty"` // how many steps the file had: Cursor alone cannot say whether work is left
 	Started  string            `json:"started"`
 	Updated  string            `json:"updated"`
 	Cursor   int               `json:"cursor"` // index of the NEXT step to execute
@@ -170,7 +179,8 @@ type StepRecord struct {
 	Workflow    string      `json:"workflow"`
 	Step        string      `json:"step"`
 	Index       int         `json:"index"`
-	Kind        string      `json:"kind"` // run | prompt | delegate
+	Kind        string      `json:"kind"`                   // run | prompt | delegate
+	TaskSession string      `json:"task_session,omitempty"` // delegate: the subagent session, joining this step to its TaskRecord
 	Role        string      `json:"role,omitempty"`
 	Model       string      `json:"model,omitempty"`
 	Status      string      `json:"status"` // ok | failed | skipped
@@ -262,7 +272,16 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 			stepsNode = n
 		}
 	}
-	if stepsNode == nil || len(stepsNode.Children) == 0 {
+	if stepsNode == nil {
+		return fail("no steps: a workflow is an ordered mapping of steps")
+	}
+	// parseYAMLish has no list-of-maps, so "- name: build" would arrive as the
+	// string key "name: build" and every other key of that step would hang off
+	// steps: itself — an error naming a step nobody wrote.
+	if len(stepsNode.List) > 0 {
+		return fail(`steps: is a mapping keyed by step name, not a list — write "build:" with "run: …" indented under it, not "- name: build"`)
+	}
+	if len(stepsNode.Children) == 0 {
 		return fail("no steps: a workflow is an ordered mapping of steps")
 	}
 
@@ -338,6 +357,11 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 	// Every reference, before anything runs: a typo in ${steps.buidl.out} must
 	// not surface at step 9 of a pipeline that has already spent an hour.
 	for _, s := range wf.Steps {
+		for _, text := range []string{s.Cmd, s.Check} {
+			if span := quotedStepRef(text); span != "" {
+				return fail("step %s: %s sits inside quotes — the runner already quotes a step's output, and your quotes would let that output close them and start a second command; drop them", s.Name, span)
+			}
+		}
 		for _, text := range []string{s.Cmd, s.Text, s.Check} {
 			refs, err := scanRefs(text)
 			if err != nil {
@@ -411,6 +435,55 @@ func scanRefs(text string) ([]string, error) {
 		i += end
 	}
 	return refs, nil
+}
+
+// quotedStepRef returns the first ${steps.…} placeholder that sits inside a
+// quoted region of a command line, or "". expand shell-quotes an untrusted step
+// output, which is only safe in an unquoted position: with the author's own
+// quotes around it, `run: echo '${steps.x.out}'` and the output
+// `x; git reset --hard origin/main` would close the quote and run a command
+// nobody wrote. Refusing at load is the only enforcement there can be, since
+// the value does not exist yet.
+func quotedStepRef(cmd string) string {
+	var q byte
+	for i := 0; i < len(cmd); i++ {
+		switch c := cmd[i]; {
+		case q == 0 && (c == '\'' || c == '"'):
+			q = c
+		case q != 0 && c == q:
+			q = 0
+		case q != 0 && c == '$' && strings.HasPrefix(cmd[i:], "${steps."):
+			if end := strings.IndexByte(cmd[i:], '}'); end > 0 {
+				return cmd[i : i+end+1]
+			}
+			return cmd[i:]
+		}
+	}
+	return ""
+}
+
+// shellOperatorOutsideQuotes finds an operator that only a shell would act on.
+// Without sandbox: {shell: true} the line is one argv, so `go build && go test`
+// runs go with "&&" as an argument and can only ever fail.
+func shellOperatorOutsideQuotes(cmd string) string {
+	var q byte
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case q == 0 && (c == '\'' || c == '"'):
+			q = c
+		case q != 0 && c == q:
+			q = 0
+		case q != 0:
+		case strings.HasPrefix(cmd[i:], "&&"):
+			return "&&"
+		case strings.HasPrefix(cmd[i:], "||"):
+			return "||"
+		case c == '|' || c == ';' || c == '>' || c == '<':
+			return string(c)
+		}
+	}
+	return ""
 }
 
 func refOf(m []string) string {
@@ -487,6 +560,12 @@ func parseWhenOperand(s string) (whenOperand, error) {
 		}
 		return whenOperand{ref: refOf(m)}, nil
 	}
+	// A dotted bare word is a misspelt reference, not a literal: `step.build.status`
+	// would compare two literals, hold never, and skip the step on every run
+	// without a word of diagnostic.
+	if strings.Contains(s, ".") && unquote(s) == s {
+		return whenOperand{}, fmt.Errorf("%q looks like a misspelt reference (did you mean ${steps.<name>.status}?) — quote it if you really meant the literal", s)
+	}
 	return whenOperand{literal: unquote(s)}, nil
 }
 
@@ -516,14 +595,45 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 			return fail("vars: %s is declared without a value — pass it with -var %s=…", k, k)
 		}
 	}
+	used := map[string]bool{}
 	for _, ref := range wf.varRefs {
 		k := strings.TrimPrefix(ref, "vars.")
+		used[k] = true
 		if _, ok := vars[k]; !ok {
 			return fail("${vars.%s} is neither declared in vars: nor passed with -var", k)
 		}
 	}
+	// The other direction, or a typo'd -var does nothing and the run goes green
+	// with the operator believing they changed it.
+	for _, k := range sortedKeys(vars) {
+		if _, declared := wf.Vars[k]; declared || used[k] {
+			continue
+		}
+		return fail("-var %s=… is not a variable this workflow uses (it uses: %s)", k, orNone(strings.Join(sortedKeys(wf.Vars), ", ")))
+	}
 	delegates := false
 	for _, s := range wf.Steps {
+		// Ask the sandbox now. A command it would refuse, or a shell line this
+		// team cannot run, must not surface at step 9 of a pipeline that has
+		// already spent an hour; only a command built from a step's output
+		// (unknown until then) is left to run time.
+		for _, cmd := range []string{s.Cmd, s.Check} {
+			if cmd == "" || strings.Contains(cmd, "${steps.") {
+				continue
+			}
+			line, err := substVars(cmd, vars)
+			if err != nil {
+				return fail("step %s: %v", s.Name, err)
+			}
+			if !o.jl.Shell && !o.jl.Unsafe {
+				if op := shellOperatorOutsideQuotes(line); op != "" {
+					return fail("step %s: this team runs one argv per command (no sandbox.shell), so %q is passed to the command as an argument — use two steps, or set sandbox: {shell: true} in roles.yaml", s.Name, op)
+				}
+			}
+			if err := o.jl.CheckCommand(line); err != nil {
+				return fail("step %s: %v", s.Name, err)
+			}
+		}
 		if s.Kind != stepRun {
 			s.Role = firstNonEmpty(s.Role, wf.Role, lead)
 			if ag := o.agents[s.Role]; ag == nil || !ag.IsRole {
@@ -562,6 +672,24 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 	}
 	wf.attempts = o.verifyAttempts()
 	return nil
+}
+
+// substVars fills in ${vars.*} only, for a bind-time sandbox check: a var comes
+// from the file or the command line, so its value is known before anything runs.
+func substVars(text string, vars map[string]string) (string, error) {
+	var bad error
+	out := reWFRef.ReplaceAllStringFunc(text, func(span string) string {
+		m := reWFRef.FindStringSubmatch(span)
+		if m[1] != "vars" {
+			return span
+		}
+		v, ok := vars[m[2]]
+		if !ok && bad == nil {
+			bad = fmt.Errorf("unknown variable ${vars.%s}", m[2])
+		}
+		return v
+	})
+	return out, bad
 }
 
 // plan renders the bound workflow for -dry-run. A delegate step's two budgets
@@ -668,8 +796,6 @@ func newRunID(workflow, recID string) string { return workflow + "-" + recID }
 // workflow name or a run id without an -id flag.
 var reRunID = regexp.MustCompile(`^.+-\d{8}-\d{6}-\d+$`)
 
-func wfNow() string { return time.Now().UTC().Format(time.RFC3339Nano) }
-
 func loadRunState(dir string) (*WorkflowState, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if err != nil {
@@ -689,12 +815,15 @@ func loadRunState(dir string) (*WorkflowState, error) {
 // a crash mid-write must not leave a half-parsed state, which is the whole
 // point of writing state after every step.
 func saveRunState(dir string, st *WorkflowState) error {
-	st.Updated = wfNow()
+	st.Updated = nowTS()
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, "state.json.tmp")
+	// Per process: if a lock bug ever let two processes share a run, two writers
+	// of one fixed temp path would publish a mixture of both documents as
+	// state.json, which is the corruption temp+rename exists to prevent.
+	tmp := filepath.Join(dir, fmt.Sprintf("state.json.%d.tmp", os.Getpid()))
 	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
 		os.Remove(tmp)
 		return err
@@ -706,33 +835,41 @@ func saveRunState(dir string, st *WorkflowState) error {
 	return nil
 }
 
-// listRuns returns recorded runs, newest first. limit <= 0 means all of them.
-func listRuns(cfg Config, limit int) []*WorkflowState {
+// listRuns returns recorded runs, newest first. limit <= 0 means all of them. A
+// state that will not parse becomes a warning, like listWorkflows': dropping it
+// silently would hide a run whose directory, log and diffs are all on disk.
+func listRuns(cfg Config, limit int) ([]*WorkflowState, []string) {
 	ents, err := os.ReadDir(runsDir(cfg))
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	var out []*WorkflowState
+	var warns []string
 	for _, e := range ents {
 		if !e.IsDir() {
 			continue
 		}
 		st, err := loadRunState(filepath.Join(runsDir(cfg), e.Name()))
 		if err != nil {
+			warns = append(warns, err.Error())
 			continue
 		}
 		out = append(out, st)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Started > out[j].Started })
+	sort.Strings(warns)
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
-	return out
+	return out, warns
 }
 
 // findRun locates the run to resume: that run id, or the newest unfinished run
-// of that workflow.
-func findRun(cfg Config, workflow, runid string) (string, *WorkflowState, error) {
+// of this workflow in this project. runs/ is shared by every project on the
+// machine, so a candidate from another root is not this user's work; and a run
+// whose cursor is past its last step has nothing left to do, so picking it would
+// hide the run that has.
+func findRun(cfg Config, workflow, runid, root string) (string, *WorkflowState, error) {
 	if runid != "" {
 		dir := filepath.Join(runsDir(cfg), runid)
 		st, err := loadRunState(dir)
@@ -741,10 +878,28 @@ func findRun(cfg Config, workflow, runid string) (string, *WorkflowState, error)
 		}
 		return dir, st, nil
 	}
-	for _, st := range listRuns(cfg, 0) {
-		if st.Workflow == workflow && st.Status != stepOK {
-			return filepath.Join(runsDir(cfg), st.Run), st, nil
+	runs, warns := listRuns(cfg, 0)
+	finished := ""
+	for _, st := range runs {
+		if st.Workflow != workflow || st.Status == stepOK {
+			continue
 		}
+		if st.Root != "" && root != "" && st.Root != root {
+			continue // another project's run of a workflow with the same name
+		}
+		if st.NSteps > 0 && st.Cursor >= st.NSteps && st.Status != "paused" {
+			if finished == "" {
+				finished = st.Run
+			}
+			continue
+		}
+		return filepath.Join(runsDir(cfg), st.Run), st, nil
+	}
+	if len(warns) > 0 {
+		return "", nil, fmt.Errorf("a run is on disk but unreadable, so it cannot be resumed: %s", warns[0])
+	}
+	if finished != "" {
+		return "", nil, fmt.Errorf("no unfinished run of %q to resume: %s reached its last step (lca run -list shows it)", workflow, finished)
 	}
 	return "", nil, fmt.Errorf("no unfinished run of %q to resume", workflow)
 }
@@ -752,17 +907,20 @@ func findRun(cfg Config, workflow, runid string) (string, *WorkflowState, error)
 // pauseRun asks a running pipeline to stop at the next step boundary. It is
 // cooperative on purpose: no signal is sent to a run that may be mid-test.
 func pauseRun(cfg Config, runid string) error {
+	if !reRunID.MatchString(runid) {
+		return fmt.Errorf("%q is not a run id — -pause takes one, not a workflow name (lca run -list shows them)", runid)
+	}
 	dir := filepath.Join(runsDir(cfg), runid)
 	if _, err := loadRunState(dir); err != nil {
 		return fmt.Errorf("no run %q: %w", runid, err)
 	}
-	return os.WriteFile(filepath.Join(dir, "pause"), []byte(wfNow()+"\n"), 0o600)
+	return os.WriteFile(filepath.Join(dir, "pause"), []byte(nowTS()+"\n"), 0o600)
 }
 
 // pruneRuns drops the oldest finished runs. An unfinished run is someone's
 // resumable work, not garbage, so it is never deleted.
 func pruneRuns(cfg Config, keep int) {
-	runs := listRuns(cfg, 0)
+	runs, _ := listRuns(cfg, 0)
 	n := len(runs)
 	for i := len(runs) - 1; i >= 0 && n > keep; i-- {
 		if runs[i].Status != stepOK {
@@ -772,6 +930,48 @@ func pruneRuns(cfg Config, keep int) {
 			n--
 		}
 	}
+}
+
+// lockRun keeps two processes off one run directory. Both would execute every
+// remaining step — a delegation's diff applied twice, a `git commit` step
+// committing twice — and both would rewrite state.json, so the loser's write
+// drops the winner's step records. A lock whose pid is gone is a crash, not a
+// conflict: it is taken over, because a crashed run must stay resumable.
+func lockRun(dir string) (func(), error) {
+	path := filepath.Join(dir, "lock")
+	id := filepath.Base(dir)
+	for try := 0; try < 2; try++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			f.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		b, rerr := os.ReadFile(path)
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if rerr == nil && pid > 0 && pidAlive(pid) {
+			return nil, fmt.Errorf("run %s is still going (pid %d) — `lca run %s -pause` stops it at its next step boundary", id, pid, id)
+		}
+		warnLine("taking over run %s: its process (pid %d) is gone", id, pid)
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("run %s: another process is opening it right now", id)
+}
+
+// pidAlive is deliberately coarse: os.FindProcess plus a zero signal is what the
+// standard library offers on every platform this ships to, and a wrong "alive"
+// only costs a refused resume with the pid in the message.
+func pidAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return !errors.Is(proc.Signal(syscall.Signal(0)), os.ErrProcessDone)
 }
 
 // ── run.log ─────────────────────────────────────────────────────────────────
@@ -819,14 +1019,67 @@ func (l *runLog) Close() {
 }
 
 // workflowView tees a model step's activity into run.log. Embedding View means
-// only the methods that must also reach the log are written here. Delegate
-// steps keep their own childView (newChild assigns it and there is no hook to
-// redirect a subagent's output), so for them the log holds the step header and
-// the returned {status, test_tail} — not the subagent's own lines.
+// only the methods that must also reach the log are written here. Delegate steps
+// keep their own childView (newChild assigns it and there is no hook to redirect
+// a subagent's output), so for them the log holds the step header, the
+// subagent's verifier runs (Session.checkLive) and the returned
+// {status, test_tail} — not the subagent's own tool lines.
 type workflowView struct {
 	View
 	log  *runLog
 	step string
+}
+
+// Stream tees the reply into run.log as it arrives, so a step killed during a
+// long model call still leaves what the model said. Reasoning stays out: it is
+// not the step's output and it can dwarf everything else in the log.
+func (v *workflowView) Stream() StreamView {
+	return &wfStream{inner: v.View.Stream(), log: v.log, step: v.step}
+}
+
+type wfStream struct {
+	inner StreamView
+	log   *runLog
+	step  string
+	any   bool
+}
+
+func (s *wfStream) Start(model string) { s.inner.Start(model) }
+
+func (s *wfStream) Sink() StreamSink {
+	sink := s.inner.Sink()
+	content := sink.Content
+	sink.Content = func(delta string) {
+		if !s.any {
+			s.log.line(s.step + " says:")
+			s.any = true
+		}
+		s.log.Write([]byte(delta))
+		if content != nil {
+			content(delta)
+		}
+	}
+	discard := sink.Discard
+	sink.Discard = func() {
+		// The turn is being repeated, so what is in the log is void: two replies
+		// with nothing between them would read as one.
+		if s.any {
+			s.log.line("\n(that reply was discarded and the turn repeated)")
+			s.any = false
+		}
+		if discard != nil {
+			discard()
+		}
+	}
+	return sink
+}
+
+func (s *wfStream) End() []string {
+	if s.any {
+		s.log.line("")
+		s.any = false
+	}
+	return s.inner.End()
 }
 
 func (v *workflowView) Live() io.Writer {
@@ -836,29 +1089,31 @@ func (v *workflowView) Live() io.Writer {
 	return v.log
 }
 
+// The step's name goes on every teed line: a subagent can write while a command
+// streams, and run.log is read long after the step header has scrolled past.
 func (v *workflowView) Note(text string) {
-	v.log.line(text)
+	v.log.line(v.step + ": " + text)
 	v.View.Note(text)
 }
 
 func (v *workflowView) Warn(text string) {
-	v.log.line("warning: " + text)
+	v.log.line(v.step + ": warning: " + text)
 	v.View.Warn(text)
 }
 
 func (v *workflowView) Error(text string) {
-	v.log.line("error: " + text)
+	v.log.line(v.step + ": error: " + text)
 	v.View.Error(text)
 }
 
 func (v *workflowView) ToolStart(name, summary string) {
-	v.log.line(toolVerb(name) + " " + summary)
+	v.log.line(v.step + ": " + toolVerb(name) + " " + summary)
 	v.View.ToolStart(name, summary)
 }
 
 func (v *workflowView) ToolDone(name string, args Args, result string) {
 	if strings.HasPrefix(result, "error:") {
-		v.log.line(firstLine(result))
+		v.log.line(v.step + ": " + firstLine(result))
 	}
 	v.View.ToolDone(name, args, result)
 }
@@ -881,6 +1136,7 @@ type wfRunner struct {
 	log     *runLog
 	st      *WorkflowState
 	res     map[string]*StepState // by name, including steps restored from a resume
+	unlock  func()                // releases the run directory's lock
 	stop    atomic.Bool           // Ctrl-C: stop at the next step boundary
 	signals bool                  // own SIGINT (the CLI); the REPL passes an interruptible ctx instead
 }
@@ -889,11 +1145,19 @@ func newRunner(o *Orchestrator, lead *Session, wf *Workflow, dir string, st *Wor
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	lg, err := newRunLog(dir)
+	unlock, err := lockRun(dir)
 	if err != nil {
 		return nil, err
 	}
-	r := &wfRunner{wf: wf, orch: o, lead: lead, dir: dir, log: lg, st: st, res: map[string]*StepState{}}
+	lg, err := newRunLog(dir)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	r := &wfRunner{wf: wf, orch: o, lead: lead, dir: dir, log: lg, st: st, res: map[string]*StepState{}, unlock: unlock}
+	// Written on a resume too: a state from before this field existed cannot say
+	// whether the cursor has work left.
+	st.NSteps = len(wf.Steps)
 	for i := range st.Steps {
 		ss := st.Steps[i]
 		r.res[ss.Name] = &ss
@@ -902,12 +1166,19 @@ func newRunner(o *Orchestrator, lead *Session, wf *Workflow, dir string, st *Wor
 	// can see a run that has not reached its first step yet.
 	if err := saveRunState(dir, st); err != nil {
 		lg.Close()
+		unlock()
 		return nil, err
 	}
 	return r, nil
 }
 
-func (r *wfRunner) Close() { r.log.Close() }
+func (r *wfRunner) Close() {
+	r.log.Close()
+	if r.unlock != nil {
+		r.unlock()
+		r.unlock = nil
+	}
+}
 
 func (r *wfRunner) paused() bool {
 	_, err := os.Stat(filepath.Join(r.dir, "pause"))
@@ -932,10 +1203,12 @@ func (r *wfRunner) save() {
 	}
 }
 
-// Run executes from state.Cursor and returns the exit status. Two SIGINT
+// Run executes from state.Cursor and returns the exit status. Three SIGINT
 // stages: the first stops at the next step boundary (fully resumable), the
 // second cancels the step in flight — stage one alone would leave a long
-// delegation unkillable without SIGKILL, which loses the state write.
+// delegation unkillable without SIGKILL, which loses the state write — and the
+// third hands the signal back to the runtime, so a step that honours neither
+// (a model call wedged on a half-open socket) is still escapable.
 func (r *wfRunner) Run(ctx context.Context) int {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -946,14 +1219,29 @@ func (r *wfRunner) Run(ctx context.Context) int {
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
+			n := 0
 			for {
 				select {
 				case <-sigch:
-					if r.stop.Swap(true) {
+					n++
+					switch n {
+					case 1:
+						r.stop.Store(true)
+						warnLine("stopping after this step — Ctrl-C again to abort it")
+					case 2:
 						cancel()
+						warnLine("aborting the step in flight — Ctrl-C again to kill the process")
+					default:
+						// The state written so far is the resumable one; the step
+						// in flight is not honouring cancellation, so stop
+						// intercepting and let SIGINT do what it normally does.
+						signal.Stop(sigch)
+						errLine("%s did not stop; resume with: lca run %s -resume", r.wf.Name, r.st.Run)
+						if pr, err := os.FindProcess(os.Getpid()); err == nil {
+							pr.Signal(os.Interrupt)
+						}
 						return
 					}
-					warnLine("stopping after this step — Ctrl-C again to abort it")
 				case <-done:
 					return
 				}
@@ -985,29 +1273,35 @@ func (r *wfRunner) Run(ctx context.Context) int {
 		start := time.Now()
 		ready, werr := r.ready(s)
 		if werr == nil && !ready {
-			ss := r.record(s, stepOutcome{Status: stepSkipped}, start, 0)
+			skipped := stepOutcome{Status: stepSkipped}
+			ss := r.record(s, &skipped, start, 0)
 			r.announce(i, s, "")
 			fmt.Println("    " + stepStatusWord(stepSkipped) + "  " + faint("condition not met"))
 			r.log.header("== %d/%d %s (%s) skipped ==", i+1, len(r.wf.Steps), s.Name, s.Kind)
-			r.traceStep(s, ss, stepOutcome{Status: stepSkipped})
+			r.traceStep(s, ss, skipped)
 			r.st.Cursor = i + 1
 			r.save()
 			continue
 		}
 
-		r.announce(i, s, r.headline(s))
-		r.log.header("== %d/%d %s (%s%s) %s ==", i+1, len(r.wf.Steps), s.Name, s.Kind, roleSuffix(s), wfNow())
+		// Announced by the step itself, once its placeholders are expanded: a
+		// line showing ${steps.plan.out} says nothing about what actually ran.
+		announce := func(detail string) {
+			r.announce(i, s, detail)
+			r.log.header("== %d/%d %s (%s%s) %s ==", i+1, len(r.wf.Steps), s.Name, s.Kind, roleSuffix(s), nowTS())
+		}
 		out := stepOutcome{Status: stepFailed, Exit: -1, Attempts: 1}
 		if werr != nil {
 			// Every reference was validated at load, so this is a real failure
 			// (a deleted diff file, say) — a failed step, never a silent skip.
+			announce(r.headline(s, s.Cmd))
 			out.Detail = "when: " + werr.Error()
 			r.log.line(out.Detail)
 		} else {
-			out = r.runStep(ctx, s)
+			out = r.runStep(ctx, s, announce)
 		}
 		d := time.Since(start)
-		ss := r.record(s, out, start, d)
+		ss := r.record(s, &out, start, d)
 		r.traceStep(s, ss, out)
 		r.log.header("-- %s, exit %d, %s --", out.Status, out.Exit, fmtDurShort(d))
 		r.report(s, out, d)
@@ -1047,12 +1341,12 @@ func roleSuffix(s *WorkflowStep) string {
 	return " " + s.Role
 }
 
-// headline is what the step's line shows after its kind: the command, the
-// check, or the role's model.
-func (r *wfRunner) headline(s *WorkflowStep) string {
+// headline is what the step's line shows after its kind: the command as it will
+// run, the check, or the role.
+func (r *wfRunner) headline(s *WorkflowStep, cmd string) string {
 	switch s.Kind {
 	case stepRun:
-		return truncate(firstLine(s.Cmd), 60)
+		return truncate(firstLine(cmd), 60)
 	case stepDelegate:
 		if s.Check != "" {
 			return s.Role + "  " + faint("check: %s", truncate(firstLine(s.Check), 40))
@@ -1138,34 +1432,42 @@ func (r *wfRunner) summary() {
 
 // ── one step ────────────────────────────────────────────────────────────────
 
-func (r *wfRunner) runStep(ctx context.Context, s *WorkflowStep) stepOutcome {
-	check, err := r.expand(s.Check, true)
-	if err != nil {
+// runStep expands the step's placeholders, announces what that produced and
+// executes it. timeout bounds ONE attempt of a run or delegate step; on a prompt
+// step the retry loop is RunVerified's, which has no per-attempt hook, so there
+// it bounds the turn and its retries together.
+func (r *wfRunner) runStep(ctx context.Context, s *WorkflowStep, announce func(string)) stepOutcome {
+	if s.Kind != stepRun {
+		announce(r.headline(s, ""))
+	}
+	fail := func(err error) stepOutcome {
+		if s.Kind == stepRun {
+			announce(r.headline(s, s.Cmd))
+		}
 		return stepOutcome{Status: stepFailed, Exit: -1, Detail: err.Error(), Attempts: 1}
 	}
-	if s.Timeout > 0 && s.Kind != stepRun {
-		// A run step's timeout is execCheck's; a model step's is the whole turn.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
-		defer cancel()
+	check, err := r.expand(s.Check, true)
+	if err != nil {
+		return fail(err)
 	}
 	switch s.Kind {
 	case stepRun:
 		cmd, err := r.expand(s.Cmd, true)
 		if err != nil {
-			return stepOutcome{Status: stepFailed, Exit: -1, Detail: err.Error(), Attempts: 1}
+			return fail(err)
 		}
+		announce(r.headline(s, cmd))
 		return r.shellSteps(ctx, s, cmd, check)
 	case stepPrompt:
 		text, err := r.expand(s.Text, false)
 		if err != nil {
-			return stepOutcome{Status: stepFailed, Exit: -1, Detail: err.Error(), Attempts: 1}
+			return fail(err)
 		}
 		return r.promptStep(ctx, s, text, check)
 	default:
 		text, err := r.expand(s.Text, false)
 		if err != nil {
-			return stepOutcome{Status: stepFailed, Exit: -1, Detail: err.Error(), Attempts: 1}
+			return fail(err)
 		}
 		return r.delegateStep(ctx, s, text, check)
 	}
@@ -1176,6 +1478,12 @@ func (r *wfRunner) runStep(ctx context.Context, s *WorkflowStep) stepOutcome {
 // refuses is a failed step whose Detail is the refusal, never a silent skip.
 func (r *wfRunner) shellStep(ctx context.Context, s *WorkflowStep, cmd string, timeout time.Duration) (string, int) {
 	if rem := r.lead.remote(); rem != nil {
+		// Remote.run consults no policy of its own, so the allowlist and the GPU
+		// rules are applied here — the same line must not be refused locally and
+		// waved through on a remote host.
+		if err := r.lead.jail().CheckCommand(cmd); err != nil {
+			return "sandbox: " + err.Error(), -1
+		}
 		return rem.run(ctx, cmd, timeout, nil, r.log)
 	}
 	return execCheck(ctx, r.lead.jail(), cmd, timeout, r.log)
@@ -1195,6 +1503,12 @@ func (r *wfRunner) shellSteps(ctx context.Context, s *WorkflowStep, cmd, check s
 		}
 		r.log.header("$ %s", cmd)
 		out, exit := r.shellStep(ctx, s, cmd, s.Timeout)
+		if exit == -1 {
+			// execCheck words a timeout for a verifier, and this leg is the
+			// step's own action — the summary table is the one place an author
+			// reads it.
+			out = strings.Replace(out, "(check timed out after", "(the command timed out after", 1)
+		}
 		o.Out, o.Exit, o.Detail, o.Checked, o.CheckExit = lastLines(strings.TrimSpace(out), tailLines, tailBytes), exit, "", false, nil
 		if exit == -1 && strings.HasPrefix(out, "sandbox: ") {
 			r.log.line(out) // refused before it ran, so nothing streamed
@@ -1229,12 +1543,21 @@ func (r *wfRunner) shellSteps(ctx context.Context, s *WorkflowStep, cmd, check s
 // several prompt steps would collide in the trace. And a fresh child per step,
 // not one reused session per role: reuse would let step 5 see step 2's
 // conversation, grow context without bound over a long pipeline and trigger a
-// compaction mid-run. Steps communicate through declared placeholders; the
-// role's system prefix stays byte-stable either way, which is what the
-// gateway's KV cache needs.
+// compaction mid-run. Steps communicate through declared placeholders.
+//
+// The description is one constant for every step, not s.Name: newChild puts it
+// in the system prompt ("You are the %q subagent … for one task: %s"), so a step
+// name there would move bytes near the FRONT of the prefix and cost the
+// gateway's KV cache the whole system message on every step after the first. The
+// step's name is in run.log, the trace and state.json instead.
 func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check string) stepOutcome {
 	o := stepOutcome{Check: check, Attempts: 1}
-	child, err := r.orch.newChild(r.lead, r.orch.agents[s.Role], s.Name)
+	if s.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
+		defer cancel()
+	}
+	child, err := r.orch.newChild(r.lead, r.orch.agents[s.Role], "one step of a workflow")
 	if err != nil {
 		o.Status, o.Exit, o.Detail = stepFailed, -1, err.Error()
 		return o
@@ -1292,18 +1615,32 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 //
 // Model and Usage stay empty: runDelegateTool returns only
 // {status, diff, test_tail}. The delegation's cost is in its own turn records
-// under this root session.
+// under this root session, and TaskSession is the key that joins this step's
+// record to the TaskRecord holding them.
 func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, check string) stepOutcome {
 	o := stepOutcome{Check: check}
 	task := text
 	attempts := s.Retries + 1
+	// The subagent's verifier streams into run.log for as long as this step runs:
+	// a delegation is the longest thing a workflow does, and a crash twenty
+	// minutes in must not leave one header line behind. Restored afterwards,
+	// because on the REPL path the lead is the user's own session.
+	prevLive := r.lead.checkLive
+	r.lead.checkLive = r.log
+	defer func() { r.lead.checkLive = prevLive }()
 	for attempt := 1; attempt <= attempts; attempt++ {
 		o.Attempts = attempt
 		if attempts > 1 {
 			r.log.header("-- attempt %d/%d --", attempt, attempts)
 		}
-		tc := &ToolCtx{Ctx: ctx, S: r.lead, Name: "delegate"}
+		actx, cancel := ctx, context.CancelFunc(func() {})
+		if s.Timeout > 0 {
+			actx, cancel = context.WithTimeout(ctx, s.Timeout)
+		}
+		tc := &ToolCtx{Ctx: actx, S: r.lead, Name: "delegate"}
 		raw := runDelegateTool(tc, Args{"role": s.Role, "task": task, "check_cmd": check})
+		cancel()
+		o.TaskSession = tc.TaskSession
 		var dr delegateResult
 		if err := json.Unmarshal([]byte(raw), &dr); err != nil {
 			o.Status, o.Exit, o.Detail = stepFailed, -1, strings.TrimSpace(raw)
@@ -1312,6 +1649,12 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 		}
 		o.Out, o.Diff = lastLines(dr.TestTail, tailLines, tailBytes), dr.Diff
 		o.Detail = "delegate status " + dr.Status
+		if dr.Status == "passed" && dr.Diff == "" {
+			// The verifier passed on an unchanged tree. Not a failure by itself
+			// (a step may exist to confirm something), but it must be visible:
+			// a later ${steps.x.diff} would otherwise review nothing.
+			o.Detail += " (no diff: nothing changed)"
+		}
 		r.log.line(o.Detail)
 		r.log.line(o.Out)
 		o.Checked = dr.Status == "passed" || dr.Status == "failed"
@@ -1327,6 +1670,10 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 		if ctx.Err() != nil {
 			o.Detail = "cancelled"
 			return o
+		}
+		if actx.Err() != nil {
+			o.Detail = fmt.Sprintf("the delegation timed out after %s", s.Timeout)
+			r.log.line(o.Detail)
 		}
 		if attempt < attempts {
 			task = text + "\n\n---\nA previous attempt did not pass the verifier. Last lines of its output:\n```\n" + o.Out + "\n```"
@@ -1396,10 +1743,15 @@ func (r *wfRunner) lookup(ref string) (string, error) {
 		case "exit":
 			return strconv.Itoa(ss.Exit), nil
 		case "out":
+			// A FAILED step's output is meaningful — handing it to a repair step
+			// is why on_fail: continue exists. A skipped step has none.
+			if ss.Status == stepSkipped {
+				return "", fmt.Errorf("step %s was skipped, so ${steps.%s.out} has nothing in it", name, name)
+			}
 			return ss.Out, nil
 		case "diff":
 			if ss.DiffFile == "" {
-				return "", nil
+				return "", fmt.Errorf("step %s (%s) stored no diff, so ${steps.%s.diff} would hand this step nothing", name, ss.Status, name)
 			}
 			// The full diff is on disk, not in state.json: handing a reviewer a
 			// truncated diff would be worse than handing it none.
@@ -1462,18 +1814,25 @@ func (r *wfRunner) operand(op whenOperand) (string, error) {
 
 // ── recording ───────────────────────────────────────────────────────────────
 
-func (r *wfRunner) record(s *WorkflowStep, o stepOutcome, start time.Time, d time.Duration) *StepState {
+func (r *wfRunner) record(s *WorkflowStep, o *stepOutcome, start time.Time, d time.Duration) *StepState {
+	rel := ""
+	if o.Diff != "" {
+		var err error
+		if rel, err = r.storeDiff(s, o.Diff); err != nil {
+			// The diff is nowhere else (state.json deliberately does not hold
+			// it) and a later ${steps.x.diff} depends on this file, so a step
+			// whose diff was lost is not ok.
+			o.Status, o.Exit, o.Detail = stepFailed, 1, "could not store the diff: "+err.Error()
+			r.log.line(o.Detail)
+			rel = ""
+		}
+	}
 	ss := &StepState{Name: s.Name, Index: s.Index, Kind: s.Kind, Role: s.Role, Model: o.Model, Session: o.Session,
 		Status: o.Status, Exit: o.Exit, Checked: o.Checked, Attempts: o.Attempts, Out: o.Out,
-		Detail: truncate(o.Detail, 2000), Started: start.UTC().Format(time.RFC3339Nano),
-		Finished: wfNow(), DurationMs: d.Milliseconds(), Usage: o.Usage}
-	if o.Diff != "" {
-		rel := filepath.ToSlash(filepath.Join("steps", s.Name+".diff"))
-		if err := os.MkdirAll(filepath.Join(r.dir, "steps"), 0o700); err == nil {
-			if err := os.WriteFile(filepath.Join(r.dir, rel), []byte(o.Diff), 0o600); err == nil {
-				ss.DiffFile, ss.DiffBytes = rel, len(o.Diff)
-			}
-		}
+		Detail: truncate(o.Detail, 2000), Started: traceTS(start),
+		Finished: nowTS(), DurationMs: d.Milliseconds(), Usage: o.Usage}
+	if rel != "" {
+		ss.DiffFile, ss.DiffBytes = rel, len(o.Diff)
 	}
 	r.res[s.Name] = ss
 	for i := range r.st.Steps {
@@ -1486,9 +1845,21 @@ func (r *wfRunner) record(s *WorkflowStep, o stepOutcome, start time.Time, d tim
 	return ss
 }
 
+// storeDiff keeps a delegation's full diff on disk under the run.
+func (r *wfRunner) storeDiff(s *WorkflowStep, diff string) (string, error) {
+	rel := filepath.ToSlash(filepath.Join("steps", s.Name+".diff"))
+	if err := os.MkdirAll(filepath.Join(r.dir, "steps"), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(r.dir, rel), []byte(diff), 0o600); err != nil {
+		return "", err
+	}
+	return rel, nil
+}
+
 func (r *wfRunner) traceStep(s *WorkflowStep, ss *StepState, o stepOutcome) {
-	rec := StepRecord{Type: "step", TS: wfNow(), RootSession: r.lead.rootUID(), Session: ss.Session,
-		Run: r.st.Run, Workflow: r.wf.Name, Step: ss.Name, Index: ss.Index, Kind: ss.Kind, Role: ss.Role,
+	rec := StepRecord{Type: "step", TS: nowTS(), RootSession: r.lead.rootUID(), Session: ss.Session,
+		Run: r.st.Run, Workflow: r.wf.Name, Step: ss.Name, Index: ss.Index, Kind: ss.Kind, TaskSession: o.TaskSession, Role: ss.Role,
 		Model: ss.Model, Status: ss.Status, Exit: ss.Exit, Check: o.Check, CheckExit: o.CheckExit,
 		Checked: ss.Checked, Attempts: ss.Attempts, DurationMs: ss.DurationMs, Usage: ss.Usage,
 		Detail: truncate(firstLine(ss.Detail), 300)}
@@ -1517,6 +1888,28 @@ func (k kvFlag) Set(s string) error {
 	return nil
 }
 
+// parseVarWords reads `k=v` pairs from a REPL argument line, where there are no
+// shell quotes to lean on: a word with no `=` belongs to the value before it, so
+// `/run harden task=fix the parser` passes the whole phrase.
+func parseVarWords(rest string) (kvFlag, error) {
+	vars := kvFlag{}
+	last := ""
+	for _, w := range strings.Fields(rest) {
+		if key, _, ok := strings.Cut(w, "="); ok && key != "" && !strings.Contains(key, " ") {
+			if err := vars.Set(w); err != nil {
+				return nil, err
+			}
+			last = key
+			continue
+		}
+		if last == "" {
+			return nil, fmt.Errorf("want k=v, got %q", w)
+		}
+		vars[last] += " " + w
+	}
+	return vars, nil
+}
+
 // splitLeadingName takes a bare leading argument off the front, so flags may
 // follow the name (flag.Parse stops at the first non-flag).
 func splitLeadingName(args []string) (string, []string) {
@@ -1533,6 +1926,7 @@ func runUsage() {
 		"  lca run <name>               run it",
 		"  lca run <name> -dry-run      validate and print the plan",
 		"  lca run <name> -resume       continue its newest unfinished run",
+		"  lca run <name> -resume <runid>  continue that run",
 		"  lca run <runid> -pause       stop it at the next step boundary",
 	}, "\n"))
 }
@@ -1556,7 +1950,23 @@ func runWorkflow(cfg Config, args []string) int {
 	if bare == "" && fset.NArg() > 0 {
 		bare, _ = splitLeadingName(fset.Args())
 	}
-	if fset.NArg() > 1 || (bare != "" && fset.NArg() == 1 && fset.Arg(0) != bare) {
+	// The pinned spelling `lca run <name> -resume <runid>` leaves the run id in
+	// Args(), which every other shape would call a second workflow name.
+	second := ""
+	if *resume && bare != "" && fset.NArg() == 1 && fset.Arg(0) != bare {
+		if reRunID.MatchString(bare) {
+			errLine("%s and %s are both run ids — name one", bare, fset.Arg(0))
+			runUsage()
+			return 2
+		}
+		if !reRunID.MatchString(fset.Arg(0)) {
+			errLine("%q is not a run id (lca run -list shows them)", fset.Arg(0))
+			runUsage()
+			return 2
+		}
+		second = fset.Arg(0)
+	} else if fset.NArg() > 1 || (bare != "" && fset.NArg() == 1 && fset.Arg(0) != bare) {
+		errLine("`lca run` takes one workflow name or run id, and %q came after it", fset.Arg(fset.NArg()-1))
 		runUsage()
 		return 2
 	}
@@ -1583,16 +1993,32 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 
 	// One bare argument, told apart by shape: a run id or a workflow name.
-	name, runid := bare, ""
+	name, runid := bare, second
 	if reRunID.MatchString(bare) {
+		if !*resume {
+			errLine("%s is a run id — did you mean `lca run %s -resume`?", bare, bare)
+			return 2
+		}
 		name, runid = "", bare
 	}
+	if *resume && bare == "" {
+		errLine("-resume needs the workflow name or a run id")
+		hint("lca run -list shows the runs")
+		return 2
+	}
+	if *resume && *roleFlag != "" {
+		// Steps 1..n already ran with the recorded team; finishing the rest with
+		// another one would report a single green result over two teams.
+		errLine("-role cannot be combined with -resume — start a fresh run to change the team")
+		return 2
+	}
 
+	root, _ := realRoot(cfg.Root)
 	var dir string
 	var st *WorkflowState
 	var err error
 	if *resume {
-		if dir, st, err = findRun(cfg, name, runid); err != nil {
+		if dir, st, err = findRun(cfg, name, runid, root); err != nil {
 			errLine("%v", err)
 			return 2
 		}
@@ -1617,7 +2043,7 @@ func runWorkflow(cfg Config, args []string) int {
 
 	cliVars := map[string]string(vars)
 	if st != nil {
-		if err := checkResume(wf, st, cliVars); err != nil {
+		if err := checkResume(wf, st, cliVars, root); err != nil {
 			errLine("%v", err)
 			hint("start a fresh run: lca run %s", wf.Name)
 			return 2
@@ -1647,6 +2073,12 @@ func runWorkflow(cfg Config, args []string) int {
 		entry = orch.roles.Entry
 	}
 	leadName := firstNonEmpty(wf.Role, entry, cfg.Agent)
+	if st != nil && st.Lead != "" && st.Lead != leadName {
+		// roles.yaml's entry: can change between two invocations, and nothing
+		// else would notice that the rest of the run bound to another lead.
+		errLine("this run started with the %s lead role, and %s leads now — start a fresh run", st.Lead, leadName)
+		return 2
+	}
 	if err := wf.bind(orch, leadName, effective); err != nil {
 		errLine("%v", err)
 		return 2
@@ -1672,11 +2104,10 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 	sess.view = newTermView(sess)
 
-	if st == nil {
+	resumed := st != nil
+	if !resumed {
 		pruneRuns(cfg, atoiDefault(os.Getenv("LCA_KEEP_RUNS"), 50))
-		dir, st = newRunState(cfg, orch, wf, effective)
-	} else {
-		attachRun(orch, dir, st)
+		dir, st = newRunState(cfg, orch, wf, leadName, effective)
 	}
 
 	runner, err := newRunner(orch, sess, wf, dir, st)
@@ -1686,8 +2117,12 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 	defer runner.Close()
 	runner.signals = true
-	if *resume {
-		runner.log.header("== resume %s (session %s) ==", wfNow(), orch.rec.id)
+	if resumed {
+		// Only now that the lock is held: a resume refused because the run is
+		// still going must not have cleared the pause someone just asked for.
+		attachRun(orch, dir, st)
+		runner.save()
+		runner.log.header("== resume %s (session %s) ==", nowTS(), orch.rec.id)
 	}
 	if *ask {
 		for _, s := range wf.Steps {
@@ -1708,13 +2143,25 @@ func runWorkflow(cfg Config, args []string) int {
 // already ran with the recorded vars — continuing anyway is exactly the
 // dishonest failure this design exists to prevent. It also re-runs the step that
 // failed, so a step with side effects (git commit, a migration) belongs last.
-func checkResume(wf *Workflow, st *WorkflowState, cliVars map[string]string) error {
+func checkResume(wf *Workflow, st *WorkflowState, cliVars map[string]string, root string) error {
 	if wf.Sum != st.Sum {
 		return fmt.Errorf("the workflow changed since this run started (%s)", wf.Path)
 	}
+	// runs/ is shared by every project on the machine, so a run of the same
+	// workflow name can belong to another repository; its cursor, its recorded
+	// outputs and its `git commit` steps would land in this tree.
+	if st.Root != "" && root != "" && st.Root != root {
+		return fmt.Errorf("run %s belongs to %s, not to %s", st.Run, shortDir(st.Root), shortDir(root))
+	}
 	for _, k := range sortedKeys(cliVars) {
-		if old, ok := st.Vars[k]; ok && old != cliVars[k] {
+		old, ok := st.Vars[k]
+		if ok && old != cliVars[k] {
 			return fmt.Errorf("-var %s=%s contradicts the value %q this run started with", k, cliVars[k], old)
+		}
+		// Silently dropping it would leave the operator believing they had
+		// narrowed the remaining steps.
+		if !ok {
+			return fmt.Errorf("-var %s=%s was not part of this run, and a resume cannot add one", k, cliVars[k])
 		}
 	}
 	return nil
@@ -1731,7 +2178,7 @@ func attachRun(o *Orchestrator, dir string, st *WorkflowState) {
 // newRunState opens a fresh run: its own directory under runs/, the vars it was
 // started with, and the trace this process writes. The id carries the workflow
 // name so `lca run -list` reads without a lookup.
-func newRunState(cfg Config, o *Orchestrator, wf *Workflow, vars map[string]string) (string, *WorkflowState) {
+func newRunState(cfg Config, o *Orchestrator, wf *Workflow, lead string, vars map[string]string) (string, *WorkflowState) {
 	id := newRunID(wf.Name, o.rec.id)
 	// Two runs in one process (two /run calls) must not share a directory.
 	for n := 2; ; n++ {
@@ -1741,8 +2188,8 @@ func newRunState(cfg Config, o *Orchestrator, wf *Workflow, vars map[string]stri
 		id = newRunID(wf.Name, fmt.Sprintf("%s-%d%d", time.Now().Format("20060102-150405"), os.Getpid(), n))
 	}
 	st := &WorkflowState{Version: wfStateVersion, Run: id, Workflow: wf.Name, Path: wf.Path, Sum: wf.Sum,
-		Root: o.jl.Root, Sessions: []string{o.rec.id}, Traces: []string{o.tracer.Path},
-		Vars: vars, Started: wfNow(), Status: "running"}
+		Root: o.jl.Root, Lead: lead, NSteps: len(wf.Steps), Sessions: []string{o.rec.id}, Traces: []string{o.tracer.Path},
+		Vars: vars, Started: nowTS(), Status: "running"}
 	return filepath.Join(runsDir(cfg), id), st
 }
 
@@ -1784,9 +2231,9 @@ func printWorkflows(cfg Config) {
 }
 
 func printRuns(cfg Config) {
-	runs := listRuns(cfg, 20)
+	runs, warns := listRuns(cfg, 20)
 	section("runs")
-	if len(runs) == 0 {
+	if len(runs) == 0 && len(warns) == 0 {
 		fmt.Println("  " + faint("none yet"))
 		return
 	}
@@ -1800,5 +2247,8 @@ func printRuns(cfg Config) {
 		rows = append(rows, []string{st.Run, st.Workflow, stepStatusWord(st.Status), step, st.Updated})
 	}
 	table([]string{"run", "workflow", "status", "at", "updated"}, rows)
+	for _, w := range warns {
+		warnLine("%s", w)
+	}
 	hint("resume one: lca run <runid> -resume · pause: lca run <runid> -pause")
 }

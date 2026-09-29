@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 )
@@ -130,13 +131,11 @@ func (r *Repl) cmdRun(arg string) bool {
 		printWorkflows(r.cfg)
 		return false
 	}
-	vars := kvFlag{}
-	for _, kv := range strings.Fields(rest) {
-		if err := vars.Set(kv); err != nil {
-			errLine("%v", err)
-			hint("usage: /run <name> [k=v …]")
-			return false
-		}
+	vars, err := parseVarWords(rest)
+	if err != nil {
+		errLine("%v", err)
+		hint("usage: /run <name> [k=v …]")
+		return false
 	}
 	wf, err := findWorkflow(r.cfg, name)
 	if err != nil {
@@ -148,7 +147,8 @@ func (r *Repl) cmdRun(arg string) bool {
 		errLine("%v", err)
 		return false
 	}
-	dir, st := newRunState(r.cfg, r.orch, wf, effective)
+	pruneRuns(r.cfg, atoiDefault(os.Getenv("LCA_KEEP_RUNS"), 50))
+	dir, st := newRunState(r.cfg, r.orch, wf, r.sess.agent.Name, effective)
 	runner, err := newRunner(r.orch, r.sess, wf, dir, st)
 	if err != nil {
 		errLine("%v", err)

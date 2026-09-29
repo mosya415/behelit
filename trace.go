@@ -119,6 +119,12 @@ func (s *Session) rootUID() string {
 	return r.UID
 }
 
+// traceTS is the one timestamp spelling of the trace and of a run's state:
+// UTC and RFC3339Nano, so records from several processes sort as text.
+func traceTS(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+func nowTS() string { return traceTS(time.Now()) }
+
 func (s *Session) parentUID() string {
 	if s.parent != nil {
 		return s.parent.UID
@@ -127,7 +133,7 @@ func (s *Session) parentUID() string {
 }
 
 func (s *Session) traceTurn(step int, res ChatResult, fb []fallbackEvent, start time.Time, calls []pendingCall, err error) {
-	rec := TurnRecord{Type: "turn", TS: start.UTC().Format(time.RFC3339Nano), RootSession: s.rootUID(), Session: s.UID,
+	rec := TurnRecord{Type: "turn", TS: traceTS(start), RootSession: s.rootUID(), Session: s.UID,
 		ParentSession: s.parentUID(), Role: s.agent.Name, Model: s.client.Model(), Step: step,
 		Usage:  traceUsage{res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens},
 		TTFTMs: res.Usage.TTFT.Milliseconds(), DurationMs: time.Since(start).Milliseconds(), Finish: res.Finish,
@@ -163,7 +169,7 @@ func transportName(c *Client) string {
 }
 
 func (s *Session) traceTask(task string, v Verdict, check string, diffBytes, files int, applied bool, start time.Time) {
-	rec := TaskRecord{Type: "task", TS: time.Now().UTC().Format(time.RFC3339Nano), RootSession: s.rootUID(), Session: s.UID,
+	rec := TaskRecord{Type: "task", TS: nowTS(), RootSession: s.rootUID(), Session: s.UID,
 		ParentSession: s.parentUID(), Role: s.agent.Name, Task: truncate(task, 500), Status: v.Status, CheckCmd: check,
 		Attempts: v.Attempts, DiffBytes: diffBytes, FilesChanged: files, Applied: applied, DurationMs: time.Since(start).Milliseconds()}
 	if v.Checked {
