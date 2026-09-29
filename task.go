@@ -1,0 +1,260 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// The task tool — subagent orchestration (ported from opencode's tool/task.ts).
+// A call creates a child session for the named subagent: its own system
+// prompt, model, step budget and permissions; the prompt is its first user
+// message; the same Run loop drives it; its final answer comes back as the
+// tool result. Several task calls in one reply run concurrently (bounded by
+// LCA_MAX_PARALLEL). task_id resumes a child with its context intact;
+// background=true returns at once and delivers the result to the caller's
+// next step. Nesting is limited by subagent_depth (default 1: subagents cannot
+// spawn subagents).
+
+func init() {
+	registerTool(&ToolDef{
+		Name: "task",
+		Desc: "Delegate a task to a subagent.", // replaced per session by taskDescription
+		Params: []Param{
+			{Name: "description", Type: "string", Desc: "A short (3-5 words) description of the task", Required: true},
+			{Name: "prompt", Type: "string", Desc: "The complete task for the subagent: goal, context, constraints, and what to return", Required: true},
+			{Name: "agent", Type: "string", Desc: "Which subagent to use (see the list in the description)", Required: true},
+			{Name: "task_id", Type: "string", Desc: "Resume a previous subagent session (its id from an earlier result) instead of starting fresh"},
+			{Name: "background", Type: "boolean", Desc: "Run in the background and continue working; the result is delivered automatically when it finishes"},
+		},
+		Body: "prompt",
+		TextDoc: `Delegate self-contained work to a subagent (see the agent list below); several
+<task> tags in one reply run in parallel, background="true" returns immediately:
+<task agent="explore" description="find auth middleware">
+Find where HTTP auth middleware is defined and which routes use it. Medium thoroughness.
+Return file paths with line numbers.
+</task>`,
+		Parallel: true,
+		Run:      runTaskTool,
+	})
+}
+
+func taskDescription(s *Session) string {
+	var b strings.Builder
+	b.WriteString(`Launch a subagent to handle a task autonomously in its own context.
+
+When to use: broad codebase searches and questions (explore), independent multi-step work that can run in parallel (general), or any specialized agent below whose description matches.
+
+Rules:
+- Launch several subagents in ONE response when their work is independent — they run concurrently.
+- The subagent starts with none of your context. Write a complete prompt: the goal, relevant paths and facts, constraints, whether it may change code or only research, and exactly what to return.
+- Its result is returned to you, not shown to the user — summarize what matters for the user.
+- Don't redo work you delegated. Use task_id to continue a previous subagent with its context.
+- background=true: the subagent runs while you continue; its result is delivered automatically on a later step. Don't poll or wait for it.
+
+Available agents:
+`)
+	for _, a := range s.orch.subagentsFor(s) {
+		fmt.Fprintf(&b, "- %s: %s\n", a.Name, strings.TrimSpace(a.Description))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func runTaskTool(tc *ToolCtx, a Args) string {
+	s, o := tc.S, tc.S.orch
+	if s.depth >= o.subagentDepth() {
+		return fmt.Sprintf("error: subagent depth limit reached (%d) — do this work yourself (raise subagent_depth to allow nesting)", o.subagentDepth())
+	}
+	name := firstNonEmpty(a.Str("agent"), a.Str("subagent_type"))
+	desc := firstNonEmpty(a.Str("description"), "task")
+	prompt := strings.TrimSpace(a.Str("prompt"))
+	if prompt == "" {
+		return "error: prompt is required"
+	}
+
+	var child *Session
+	if id := a.Str("task_id"); id != "" {
+		o.mu.Lock()
+		child = o.children[id]
+		o.mu.Unlock()
+		if child == nil || child.parent != s {
+			return fmt.Sprintf("error: unknown task_id %q for this agent — start a new task without task_id", id)
+		}
+		// Claim it atomically: two resumes of one child must not run it twice.
+		if !child.running.CompareAndSwap(false, true) {
+			return fmt.Sprintf("error: subagent %s is still running — wait for its result", id)
+		}
+		name = child.agent.Name
+	} else {
+		ag := o.agents[name]
+		if ag == nil || !ag.isSubagent() || ag.Hidden {
+			var names []string
+			for _, x := range o.subagentsFor(s) {
+				names = append(names, x.Name)
+			}
+			return fmt.Sprintf("error: unknown agent %q. Available: %s", name, strings.Join(names, ", "))
+		}
+		if msg, ok := tc.Ask("task", name, "TASK "+name+": "+desc, "  "+truncate(prompt, 300)); !ok {
+			return msg
+		}
+		var err error
+		child, err = o.newChild(s, ag, desc)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		child.running.Store(true)
+	}
+	child.Msgs = append(child.Msgs, Message{Role: "user", Content: prompt})
+	s.event("task", map[string]any{"task_id": child.ID, "subagent": name, "description": desc, "model": child.client.Ref(), "background": a.Bool("background")})
+
+	if a.Bool("background") {
+		s.mu.Lock()
+		s.bgRunning++
+		s.mu.Unlock()
+		child.view = newChildView(child, true)
+		child.background = true
+		go func() {
+			res := o.runChild(context.Background(), child)
+			s.deliver(res)
+		}()
+		return fmt.Sprintf("<task id=%q agent=%q state=\"running\">\nStarted in the background. Its result will be delivered automatically when it finishes — do not wait or poll; continue with other work, or end your reply if nothing else remains.\n</task>", child.ID, name)
+	}
+	return o.runChild(tc.Ctx, child)
+}
+
+// newChild creates a subagent session under parent.
+func (o *Orchestrator) newChild(parent *Session, ag *Agent, desc string) (*Session, error) {
+	o.mu.Lock()
+	o.nextTask++
+	id := fmt.Sprintf("t%d", o.nextTask)
+	o.mu.Unlock()
+
+	child := &Session{ID: id, UID: parent.rootUID() + "-" + id, orch: o, parent: parent, depth: parent.depth + 1, agent: ag, title: desc,
+		wake: make(chan struct{}, 1), Raw: parent.Raw}
+	// Model: the role's chain, the agent's own, else the caller's.
+	if len(ag.Models) > 0 {
+		child.models = append([]string(nil), ag.Models...)
+		child.useModel(0)
+	} else if ag.Model != "" {
+		if err := child.SetModel(ag.Model); err != nil {
+			return nil, fmt.Errorf("agent %s: %w", ag.Name, err)
+		}
+	} else {
+		// A private copy: /model or /endpoint on the REPL must not retarget a
+		// subagent mid-conversation.
+		c := *parent.client
+		child.client = &c
+		child.models, child.modelIdx = parent.models, parent.modelIdx
+	}
+	// Session restrictions: the parent's denies carry down; a subagent can't
+	// keep a todo list or spawn further subagents unless its agent explicitly
+	// grants it (and the depth limit allows).
+	// The parent agent's denies carry down too, so e.g. plan mode's no-edit
+	// rule can't be sidestepped by delegating the edit.
+	for _, rs := range []Ruleset{parent.agent.BaseRules, parent.agent.Rules, parent.extra} {
+		for _, r := range rs {
+			if r.Action == Deny && !(r.Permission == "*" && r.Pattern == "*") {
+				child.extra = append(child.extra, r)
+			}
+		}
+	}
+	if !mentions(ag.Rules, "todo") && !mentions(ag.BaseRules, "todo") {
+		child.extra = append(child.extra, Rule{"todo", "*", Deny})
+	}
+	if !mentions(ag.Rules, "task") && !mentions(ag.BaseRules, "task") {
+		child.extra = append(child.extra, Rule{"task", "*", Deny})
+	}
+	child.view = newChildView(child, false)
+	if ev, ok := parent.view.(*evalView); ok {
+		child.view = ev // eval output stays compact
+	}
+	child.Msgs = []Message{{Role: "system", Content: child.systemPrompt()}}
+
+	o.mu.Lock()
+	o.children[id] = child
+	o.mu.Unlock()
+	return child, nil
+}
+
+func mentions(rs Ruleset, perm string) bool {
+	for _, r := range rs {
+		if r.Permission == perm {
+			return true
+		}
+	}
+	return false
+}
+
+// runChild runs a child session to completion and formats its result.
+func (o *Orchestrator) runChild(ctx context.Context, child *Session) string {
+	child.running.Store(true)
+	defer child.running.Store(false)
+	// Only top-level subagents take a concurrency slot: a nested one waiting
+	// for a slot its own ancestor holds would deadlock.
+	if child.depth == 1 {
+		select {
+		case o.slots <- struct{}{}:
+		case <-ctx.Done():
+			return formatTask(child, "cancelled", "the task was cancelled before it started")
+		}
+		defer func() { <-o.slots }()
+	}
+
+	start := time.Now()
+	entry := o.trackStart(child.ID, "task", child.agent.Name, child.title)
+	child.view.Begin()
+	err := child.Run(ctx)
+	state, text := "completed", ""
+	for i := len(child.Msgs) - 1; i > 0; i-- {
+		if child.Msgs[i].Role == "assistant" {
+			if text = finalText(child.Msgs[i]); text != "" {
+				break
+			}
+		}
+	}
+	switch {
+	case err == context.Canceled:
+		state = "cancelled"
+		if text == "" {
+			text = "the task was interrupted before it finished"
+		}
+	case err != nil:
+		state = "error"
+		text = strings.TrimSpace(text + "\n\nsubagent failed: " + err.Error())
+	case text == "":
+		text = "(the subagent finished without a final message)"
+	}
+	child.view.Finish(state, time.Since(start))
+	o.trackEnd(entry, state, text)
+	child.event("task_done", map[string]any{"state": state, "ms": time.Since(start).Milliseconds(), "bytes": len(text)})
+	return formatTask(child, state, text)
+}
+
+func formatTask(child *Session, state, text string) string {
+	tag := "task_result"
+	if state == "error" {
+		tag = "task_error"
+	}
+	return fmt.Sprintf("<task id=%q agent=%q description=%q state=%q>\n<%s>\n%s\n</%s>\n</task>\n(continue this subagent with task_id %q)",
+		child.ID, child.agent.Name, child.title, state, tag, text, tag, child.ID)
+}
+
+func (o *Orchestrator) forgetChild(id string) {
+	o.mu.Lock()
+	delete(o.children, id)
+	o.mu.Unlock()
+}
+
+// Tasks lists the subagent sessions of this orchestrator, for /tasks.
+func (o *Orchestrator) Tasks() []*Session {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make([]*Session, 0, len(o.children))
+	for i := 1; i <= o.nextTask; i++ {
+		if c := o.children[fmt.Sprintf("t%d", i)]; c != nil {
+			out = append(out, c)
+		}
+	}
+	return out
+}

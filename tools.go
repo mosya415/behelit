@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,6 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -21,6 +24,7 @@ const (
 	maxGrepMatches = 200
 	maxListEntries = 400
 	maxCmdOutput   = 64_000
+	maxToolOutput  = 50_000
 )
 
 // cmdTimeout bounds run_command; overridable via LCA_CMD_TIMEOUT (see main).
@@ -172,8 +176,10 @@ func parseRange(s string, max int) (lo, hi int, ok bool) {
 }
 
 // grepTree walks path (default: jail root) and returns "file:line:text" matches
-// for a regexp, skipping .git and obviously binary files. Capped.
-func grepTree(j *Jail, pattern, path string) string {
+// for a regexp, skipping .git, heavy dependency dirs and obviously binary
+// files. include, if set, is a file-name glob ("*.go", "*.{ts,tsx}"). Capped.
+// allow, if non-nil, filters files by jail-relative path (per-file read rules).
+func grepTree(j *Jail, pattern, path, include string, allow ...func(rel string) bool) string {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return "error: bad pattern: " + err.Error()
@@ -193,9 +199,12 @@ func grepTree(j *Jail, pattern, path string) string {
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" {
+			if p != root && (d.Name() == ".git" || heavyDir[d.Name()]) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if include != "" && !matchInclude(include, d.Name()) {
 			return nil
 		}
 		data, err := os.ReadFile(p)
@@ -203,6 +212,11 @@ func grepTree(j *Jail, pattern, path string) string {
 			return nil
 		}
 		rel, _ := filepath.Rel(j.Root, p)
+		for _, ok := range allow {
+			if !ok(filepath.ToSlash(rel)) {
+				return nil
+			}
+		}
 		for i, ln := range strings.Split(string(data), "\n") {
 			if re.MatchString(ln) {
 				out = append(out, fmt.Sprintf("%s:%d:%s", rel, i+1, strings.TrimRight(ln, "\r")))
@@ -239,80 +253,143 @@ func isBinary(data []byte) bool {
 
 // runCommand executes an allowlisted command with NO shell — argv is tokenized
 // and exec'd directly, so pipes, redirects and substitutions are inert. Runs
-// with cwd pinned to the jail root under a timeout. Output is streamed to the
-// terminal LIVE (behind a dim gutter) as it is produced — so a slow command
-// looks like it is working, not frozen — and also captured for the model. stdin
-// is the null device, so a command that would wait for input gets EOF instead
-// of hanging until the timeout.
-func runCommand(j *Jail, cmdline string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+// with cwd pinned to the jail root under a timeout. When live is non-nil the
+// output is streamed LIVE (behind a dim gutter) as it is produced — so a slow
+// command looks like it is working, not frozen — and Ctrl-C interrupts just
+// this command, not the agent; subagents pass nil and are canceled through
+// ctx. The output is always captured for the model. stdin is the null device,
+// so a command that would wait for input gets EOF instead of hanging.
+func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Duration, live io.Writer) string {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if j.Unsafe {
-		// unsafe: run through a shell, so pipes/redirects/substitutions work
-		cmd = exec.CommandContext(ctx, "sh", "-c", cmdline)
-	} else {
-		argv, err := tokenize(cmdline)
-		if err != nil {
-			return "error: " + err.Error()
-		}
-		if len(argv) == 0 {
-			return "error: empty command"
-		}
-		if !j.AllowCommand(argv[0]) {
-			return fmt.Sprintf("error: command %q is not on the allowlist", argv[0])
-		}
-		cmd = exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if err := j.CheckCommand(cmdline); err != nil {
+		return "error: " + err.Error()
 	}
-
-	fmt.Println(" " + faint("%s $ %s   %s", gNone, cmdline, faint("(Ctrl-C to interrupt)")))
+	cmd := commandFor(ctx, j, cmdline)
 
 	cmd.Dir = j.Root
 	cmd.Stdin = nil // null device → reads get EOF, no interactive hang
+	inProcessGroup(cmd)
 
 	var buf bytes.Buffer
-	live := &prefixWriter{w: os.Stdout, prefix: "   " + cFaint + "│ " + cReset}
-	mw := io.MultiWriter(&buf, live)
-	cmd.Stdout = mw
-	cmd.Stderr = mw // same writer ⇒ os/exec serializes the two streams for us
+	var pw *prefixWriter
+	if live != nil {
+		fmt.Fprintln(live, " "+faint("%s $ %s   %s", gNone, cmdline, faint("(Ctrl-C to interrupt)")))
+		pw = &prefixWriter{w: live, prefix: "   " + cFaint + "│ " + cReset}
+		mw := io.MultiWriter(&buf, pw)
+		cmd.Stdout = mw
+		cmd.Stderr = mw // same writer ⇒ os/exec serializes the two streams for us
+	} else {
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+	}
 
-	// Ctrl-C interrupts just this command (cancels its context), not the agent.
-	sigch := make(chan os.Signal, 1)
-	signal.Notify(sigch, os.Interrupt)
+	var userInt atomic.Bool
 	done := make(chan struct{})
-	go func() {
-		select {
-		case <-sigch:
-			cancel()
-		case <-done:
-		}
-	}()
+	if live != nil {
+		// Ctrl-C interrupts just this command (cancels its context), not the agent.
+		sigch := make(chan os.Signal, 1)
+		signal.Notify(sigch, os.Interrupt)
+		defer signal.Stop(sigch)
+		go func() {
+			select {
+			case <-sigch:
+				userInt.Store(true)
+				cancel()
+			case <-done:
+			}
+		}()
+	}
 
 	err := cmd.Run()
-	cancelled := ctx.Err() == context.Canceled
 	close(done)
-	signal.Stop(sigch)
-	live.flush()
+	if pw != nil {
+		pw.flush()
+	}
+	say := func(s string) {
+		if live != nil {
+			fmt.Fprintln(live, s)
+		}
+	}
 
-	res := headTail(string(buf.Bytes()), maxCmdOutput)
+	res := headTail(buf.String(), maxCmdOutput)
 	switch {
-	case cancelled:
-		fmt.Println("   " + warn("%s interrupted", gDown))
+	case userInt.Load() || parent.Err() != nil:
+		say("   " + warn("%s interrupted", gDown))
 		return res + "\n(interrupted by user)"
 	case ctx.Err() == context.DeadlineExceeded:
-		fmt.Println("   " + warn("%s timed out after %s", gDown, cmdTimeout))
-		return res + fmt.Sprintf("\n(command timed out after %s)", cmdTimeout)
+		say("   " + warn("%s timed out after %s", gDown, timeout))
+		return res + fmt.Sprintf("\n(command timed out after %s — retry with a larger timeout if it is expected to take longer)", timeout)
 	case err != nil:
-		fmt.Println("   " + cRed + gDown + cReset + faint(" %s", err.Error()))
-		return res + "\n(exit: " + err.Error() + ")"
+		_, desc := exitInfo(err)
+		say("   " + cRed + gDown + cReset + faint(" %s", desc))
+		if strings.TrimSpace(res) == "" {
+			return "(no output, " + desc + ")"
+		}
+		return res + "\n(" + desc + ")"
 	default:
-		fmt.Println("   " + cGreen + gUp + cReset + faint(" exit 0"))
+		say("   " + cGreen + gUp + cReset + faint(" exit 0"))
 		if strings.TrimSpace(res) == "" {
 			return "(no output, exit 0)"
 		}
 		return res
 	}
+}
+
+// commandFor builds the process for a command line the sandbox has already
+// accepted: through sh when the sandbox runs a shell (unsafe mode, or
+// sandbox: {shell: true}), so pipes, redirects and && work; otherwise exec
+// directly, with no shell to interpret anything.
+func commandFor(ctx context.Context, j *Jail, cmdline string) *exec.Cmd {
+	if j.Unsafe || j.Shell {
+		return exec.CommandContext(ctx, "sh", "-c", cmdline)
+	}
+	argv, _ := tokenize(cmdline) // validated by CheckCommand
+	return exec.CommandContext(ctx, argv[0], argv[1:]...)
+}
+
+// exitInfo renders a failed command's exit for the model: the status number it
+// can reason about, or the signal that killed it.
+func exitInfo(err error) (int, string) {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return -1, "could not run: " + err.Error()
+	}
+	if st, ok := ee.Sys().(syscall.WaitStatus); ok && st.Signaled() {
+		return -1, fmt.Sprintf("killed by signal %d (%v)", int(st.Signal()), st.Signal())
+	}
+	return ee.ExitCode(), fmt.Sprintf("exit status %d", ee.ExitCode())
+}
+
+// execCheck runs a verifier command in the sandbox (allowlist + GPU policy,
+// no approval prompt: the verifier is the harness, not the model) and returns
+// its combined output and exit code. exit is -1 when it could not run or
+// timed out.
+func execCheck(parent context.Context, j *Jail, cmdline string, timeout time.Duration) (string, int) {
+	if err := j.CheckCommand(cmdline); err != nil {
+		return "sandbox: " + err.Error(), -1
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := commandFor(ctx, j, cmdline)
+	cmd.Dir = j.Root
+	inProcessGroup(cmd)
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	err := cmd.Run()
+	out := buf.String()
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		return out + fmt.Sprintf("\n(check timed out after %s)", timeout), -1
+	case err == nil:
+		return out, 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return out, ee.ExitCode()
+	}
+	return out + "\n" + err.Error(), -1
 }
 
 // prefixWriter writes each line of the command's live output behind a fixed

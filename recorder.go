@@ -6,6 +6,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,8 @@ import (
 //   - transcripts/<session>.json : the full running message transcript, rewritten
 //     after every turn so a crashed or killed session is still reviewable.
 type Recorder struct {
+	mu      sync.Mutex
+	dir     string
 	audit   *os.File
 	session string // path to this session's transcript file
 	id      string
@@ -28,15 +31,16 @@ type Recorder struct {
 }
 
 func NewRecorder(cfg Config) (*Recorder, error) {
-	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+	dir := cfg.stateDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	tdir := filepath.Join(cfg.Dir, "transcripts")
+	tdir := filepath.Join(dir, "transcripts")
 	if err := os.MkdirAll(tdir, 0o700); err != nil {
 		return nil, err
 	}
 
-	auditPath := filepath.Join(cfg.Dir, "audit.jsonl")
+	auditPath := filepath.Join(dir, "audit.jsonl")
 	f, err := os.OpenFile(auditPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
@@ -46,6 +50,7 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 	id := time.Now().Format("20060102-150405") + "-" + strconv.Itoa(pid)
 
 	r := &Recorder{
+		dir:     dir,
 		audit:   f,
 		session: filepath.Join(tdir, id+".json"),
 		id:      id,
@@ -78,7 +83,9 @@ func (r *Recorder) Event(kind string, fields map[string]any) {
 	if err != nil {
 		return
 	}
+	r.mu.Lock()
 	r.audit.Write(append(line, '\n'))
+	r.mu.Unlock()
 }
 
 // Transcript rewrites the session file with the current message list.
@@ -91,6 +98,22 @@ func (r *Recorder) Transcript(msgs []Message) {
 		return
 	}
 	os.WriteFile(r.session, data, 0o600)
+}
+
+// ChildTranscript writes a subagent session's transcript beside the main one
+// (transcripts/subagents/<session>-<task id>.json), so delegated work is as
+// reviewable as the primary conversation.
+func (r *Recorder) ChildTranscript(taskID string, msgs []Message) {
+	if r == nil {
+		return
+	}
+	data, err := json.MarshalIndent(msgs, "", "  ")
+	if err != nil {
+		return
+	}
+	p := childTranscriptPath(r.dir, r.id, taskID)
+	os.MkdirAll(filepath.Dir(p), 0o700)
+	os.WriteFile(p, data, 0o600)
 }
 
 func (r *Recorder) SessionPath() string { return r.session }

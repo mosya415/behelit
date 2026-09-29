@@ -1,0 +1,6 @@
+# lca eval examples/tasks
+prompt: |
+  Sum in sum.go returns the wrong result for negative numbers. Fix it.
+check_cmd: go test ./...
+repo: fixture
+timeout: 900

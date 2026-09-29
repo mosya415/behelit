@@ -1,0 +1,60 @@
+# Team definition for orchestration through the LLM gateway (berserk-gw).
+# Copy to .lca/roles.yaml (project) or ~/.lca/roles.yaml (user).
+# Point LCA_BASE_URL at the gateway, e.g. http://node:18080/v1.
+# Model names are exactly what the gateway lists at /v1/models — no hosts.
+
+entry: lead            # role of the REPL / one-shot session
+transport: native      # tool calling through the gateway: native | text
+                       # native needs the engines' tool-call parser enabled
+                       # (vLLM: --enable-auto-tool-choice --tool-call-parser <family>)
+
+# per-model settings — e.g. a model whose native tool parser is broken on the engine:
+# models:
+#   some-model: {transport: text}
+apply: verified        # delegate diffs reach your tree only when the check passed
+
+defaults:
+  context: 128000
+  steps: 50
+  verify_attempts: 2   # failing check output is fed back this many times in total
+  check_timeout: 900   # seconds
+
+sandbox:
+  # commands agents and verifiers may run. GPU work only via bsk.
+  allow: [go, gofmt, git, make, python3, pytest, ls, cat, head, tail, wc, grep, find, echo, bsk]
+  # shell: true      # let commands run through sh, so pipes, redirects and &&
+  #                  # work; every command in the line is still allowlisted
+
+roles:
+  lead:
+    description: Understands the task, splits it, delegates, integrates and reports.
+    models: [kimi-k2.6, glm-5.2]
+    effort: high
+    context: 200000
+    tools: [list_dir, glob, grep, read_file, todowrite, delegate, run_command]
+    prompt: |
+      You lead a software task. Read enough code to understand it, then split it
+      into self-contained changes and delegate each to the coder role with a
+      precise task and a narrow check_cmd that fails before and passes after.
+      Launch independent delegations in one reply. Integrate the results: a
+      passed diff is already applied; on failed, sharpen the task or split it.
+      Finish with a short report of what changed and what was verified.
+
+  coder:
+    description: Implements one well-specified change and makes its check pass.
+    models: [qwen3-coder-480b-a35b-instruct, deepseek-v4-pro]
+    effort: medium
+    context: 128000
+    tools: [list_dir, glob, grep, read_file, edit, write, run_command]
+    check_cmd: go test ./...
+    prompt: |
+      You implement exactly one change in an isolated worktree. Read the
+      relevant code first, make the smallest correct change, and run the check
+      command yourself until it passes. Don't refactor unrelated code.
+
+  cheap:
+    description: Summaries and compaction.
+    models: [qwen3-30b-a3b-instruct]
+    effort: off
+    context: 32000
+    tools: []

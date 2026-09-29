@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -41,14 +40,46 @@ var replCommands = []cmdInfo{
 }
 
 type LineEditor struct {
-	rd      *bufio.Reader
+	in      *Input
+	staged  string // a pasted block waiting to be sent (shown as a summary)
 	history []string
 	models  func() []string       // known model names, for /model completion
 	files   func(string) []string // jail files matching a fragment, for @-completion
 	status  func() string         // one-line status shown under the input (model · mode · dir)
 }
 
-func NewLineEditor(rd *bufio.Reader) *LineEditor { return &LineEditor{rd: rd} }
+func NewLineEditor(in *Input) *LineEditor { return &LineEditor{in: in} }
+
+// stage decides what to do with text that arrived at once (a paste, or what was
+// typed while the agent was working): a short single line is put in the input as
+// if typed; anything longer is held as one message, shown as a summary, and sent
+// when you press Enter.
+func (e *LineEditor) stage(text string, buf []rune, pos int) ([]rune, int) {
+	text = cleanPaste(text)
+	if text == "" {
+		return buf, pos
+	}
+	if !strings.Contains(text, "\n") && len(text) < 200 && e.staged == "" {
+		rs := []rune(text)
+		out, p, _ := insertRunes(buf, pos, rs, 0)
+		return out, p
+	}
+	if e.staged != "" {
+		e.staged += "\n" + text
+	} else {
+		e.staged = text
+	}
+	return buf, pos
+}
+
+// cleanPaste strips bracketed-paste markers and normalizes line endings.
+func cleanPaste(s string) string {
+	s = strings.ReplaceAll(s, "\x1b[200~", "")
+	s = strings.ReplaceAll(s, "\x1b[201~", "")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.TrimRight(s, "\n")
+}
 
 // suggestion is one menu entry: what to show, and the full line Tab completes to.
 type suggestion struct{ name, desc, complete string }
@@ -106,19 +137,25 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 	buf := []rune(initial)
 	pos := len(buf)
 	hist := len(e.history)
+	// Whatever was typed or pasted while the agent worked is waiting in the
+	// buffer: take it as one message rather than a series of lines.
+	e.in.Drain()
+	if pending := e.in.TakePending(); strings.TrimSpace(pending) != "" {
+		buf, pos = e.stage(pending, buf, pos)
+	}
 
 	// top fence of the input area
 	e.out(cFaint + strings.Repeat("─", termWidth()) + cReset + "\r\n")
 	e.render(prompt, buf, pos)
 	for {
-		b, err := e.rd.ReadByte()
+		b, err := e.in.ReadByte()
 		if err != nil {
 			return "", io.EOF
 		}
 		switch b {
 		case '\r', '\n':
 			e.submit(prompt, buf)
-			line := string(buf)
+			line := e.take(buf)
 			if s := strings.TrimSpace(line); s != "" && (len(e.history) == 0 || e.history[len(e.history)-1] != s) {
 				e.history = append(e.history, s)
 			}
@@ -140,8 +177,8 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 			pos = 0
 		case 5: // Ctrl-E
 			pos = len(buf)
-		case 21: // Ctrl-U — clear line
-			buf, pos = nil, 0
+		case 21: // Ctrl-U — clear the line (and any staged paste)
+			buf, pos, e.staged = nil, 0, ""
 		case 23: // Ctrl-W — delete previous word
 			buf, pos = deleteWord(buf, pos)
 		case 9: // Tab — complete a command / model name
@@ -162,12 +199,12 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 }
 
 func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
-	b1, err := e.rd.ReadByte()
+	b1, err := e.in.ReadByte()
 	if err != nil {
 		return buf, pos, hist
 	}
 	if b1 == 'O' { // application cursor keys: ESC O A/B/C/D
-		if b2, err := e.rd.ReadByte(); err == nil {
+		if b2, err := e.in.ReadByte(); err == nil {
 			return e.applyKey(string(b2), buf, pos, hist)
 		}
 		return buf, pos, hist
@@ -178,7 +215,7 @@ func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
 	// read the rest of the CSI sequence up to its final byte
 	var seq []byte
 	for {
-		c, err := e.rd.ReadByte()
+		c, err := e.in.ReadByte()
 		if err != nil {
 			return buf, pos, hist
 		}
@@ -188,9 +225,9 @@ func (e *LineEditor) escape(buf []rune, pos, hist int) ([]rune, int, int) {
 		}
 	}
 	switch string(seq) {
-	case "200~": // bracketed paste — insert the whole block verbatim
-		rs := []rune(e.readPaste())
-		return insertRunes(buf, pos, rs, hist)
+	case "200~": // bracketed paste: inline if short, else staged as one message
+		buf, pos = e.stage(e.readPaste(), buf, pos)
+		return buf, pos, hist
 	case "3~": // Delete
 		if pos < len(buf) {
 			buf = append(buf[:pos], buf[pos+1:]...)
@@ -241,7 +278,7 @@ func (e *LineEditor) readPaste() string {
 	var b []byte
 	end := []byte("\x1b[201~")
 	for {
-		c, err := e.rd.ReadByte()
+		c, err := e.in.ReadByte()
 		if err != nil {
 			break
 		}
@@ -297,7 +334,7 @@ func (e *LineEditor) readRune(first byte) rune {
 	bytes := make([]byte, 1, 4)
 	bytes[0] = first
 	for i := 0; i < n; i++ {
-		c, err := e.rd.ReadByte()
+		c, err := e.in.ReadByte()
 		if err != nil {
 			break
 		}
@@ -307,10 +344,30 @@ func (e *LineEditor) readRune(first byte) rune {
 	return r
 }
 
+// take is the message being sent: a staged paste plus anything typed after it.
+func (e *LineEditor) take(buf []rune) string {
+	typed := string(buf)
+	staged := e.staged
+	e.staged = ""
+	switch {
+	case staged == "":
+		return typed
+	case strings.TrimSpace(typed) == "":
+		return staged
+	}
+	return staged + "\n" + typed
+}
+
 // submit collapses the live input into the past-prompt presentation: the entered
 // text as a full-width gray-green band, closed by a hairline below (the top fence
 // was drawn when the prompt opened). An empty line just advances.
 func (e *LineEditor) submit(prompt string, buf []rune) {
+	if e.staged != "" {
+		w := termWidth()
+		band := cBandBg + padTo(stripANSI(prompt)+pasteSummary(e.staged)+"  "+displayRunes(buf), w, 0) + cReset
+		e.out("\r\033[J" + band + "\r\n" + cFaint + strings.Repeat("─", w) + cReset + "\r\n")
+		return
+	}
 	if len(buf) == 0 {
 		e.out("\r\033[J" + prompt + "\r\n")
 		return
@@ -326,7 +383,11 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 	menu := e.suggest(string(buf))
 	e.out("\r\033[J") // clear from line start down (input + any old menu / status)
-	e.out(prompt + displayRunes(buf))
+	if e.staged != "" {
+		e.out(prompt + cBold + "[" + pasteSummary(e.staged) + "]" + cReset + " " + displayRunes(buf))
+	} else {
+		e.out(prompt + displayRunes(buf))
+	}
 	below := 0
 	for _, m := range menu {
 		line := "\r\n  " + cFaint + fmt.Sprintf("%-11s", m.name) + cReset
@@ -347,7 +408,11 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 		e.out(fmt.Sprintf("\033[%dA", below)) // back up to the input line
 	}
 	e.out("\r")
-	if col := visibleWidth(prompt) + visibleWidth(displayRunes(buf[:pos])); col > 0 {
+	lead := 0
+	if e.staged != "" {
+		lead = visibleWidth("[" + pasteSummary(e.staged) + "] ")
+	}
+	if col := visibleWidth(prompt) + lead + visibleWidth(displayRunes(buf[:pos])); col > 0 {
 		e.out(fmt.Sprintf("\033[%dC", col))
 	}
 }
@@ -355,7 +420,7 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 // cooked is the fallback line read for non-terminal stdin.
 func (e *LineEditor) cooked(prompt string) (string, error) {
 	e.out(prompt)
-	line, err := e.rd.ReadString('\n')
+	line, err := e.in.ReadString('\n')
 	if err != nil {
 		return "", err
 	}

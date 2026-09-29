@@ -31,6 +31,12 @@ import (
 //	...new text...
 //	</replace>
 //	</edit>
+//	<glob pattern="**/*.go"/>  <skill name="x"/>  <webfetch url="…"/>
+//	<todowrite>[…json…]</todowrite>
+//	<task agent="explore" description="…">prompt</task>
+//
+// The tag set mirrors the tool registry (toolset.go): a tool with a Body param
+// is a block tag, one without is void.
 
 type Block struct {
 	Name    string
@@ -42,12 +48,13 @@ type Block struct {
 
 var (
 	blockNames = map[string]bool{
-		"read_file": true, "grep": true, "list_dir": true,
+		"read_file": true, "grep": true, "list_dir": true, "glob": true,
 		"run_command": true, "write": true, "edit": true,
+		"todowrite": true, "task": true, "delegate": true, "skill": true, "webfetch": true,
 	}
 	// voidTools have no body and are semantically self-closing; we accept them
 	// even when a model forgets the trailing "/" (a common dirty-output case).
-	voidTools = map[string]bool{"read_file": true, "grep": true, "list_dir": true}
+	voidTools = map[string]bool{"read_file": true, "grep": true, "list_dir": true, "glob": true, "skill": true, "webfetch": true}
 
 	// Matches an opening tag line: <name ...attrs...>  or self-closing <name .../>.
 	// Attribute values may be double- OR single-quoted, with optional spaces
@@ -63,7 +70,7 @@ var (
 
 	// A tool (or edit sub-) tag anywhere in the text — used only to re-separate
 	// tags that a model glued to surrounding text (it is NOT the block grammar).
-	toolTag      = `</?(?:read_file|grep|list_dir|run_command|write|edit|search|replace)(?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*/?>`
+	toolTag      = `</?(?:read_file|grep|list_dir|glob|run_command|write|edit|search|replace|todowrite|task|delegate|skill|webfetch)(?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*/?>`
 	reGlueBefore = regexp.MustCompile(`([^\n])(` + toolTag + `)`)
 	reGlueAfter  = regexp.MustCompile(`(` + toolTag + `)([^\n])`)
 )

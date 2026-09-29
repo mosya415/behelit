@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -211,7 +212,7 @@ func statusText(color, glyph, word string) string {
 // toolLine prints a dim activity marker for an auto-running tool: uppercase tool
 // name (chrome) with its verbatim argument (data).
 func toolLine(name, arg string) {
-	fmt.Printf(" %s%s %-9s%s %s\n", cFaint, gNone, strings.ToUpper(name), cReset, arg)
+	fmt.Printf(" %s%s %-8s%s %s\n", cFaint, gNone, toolVerb(name), cReset, arg)
 }
 
 // toolInfo prints a faint informational outcome under a tool marker (read-only
@@ -239,4 +240,153 @@ func shortDir(p string) string {
 		}
 	}
 	return p
+}
+
+// ── components ──────────────────────────────────────────────────────────────
+// Small building blocks every screen is made of, so the whole UI reads as one
+// system: a section header, label/value rows, aligned tables, hints, and
+// paths shortened the same way everywhere.
+
+// section prints a titled hairline: " ── TITLE  detail ───────────". The title
+// is chrome (upper-cased); the optional detail is data (paths, ids) and is
+// shown verbatim.
+func section(title string, detail ...string) {
+	t := strings.ToUpper(title)
+	if len(detail) > 0 && detail[0] != "" {
+		t += "  " + strings.Join(detail, " ")
+	}
+	// a fixed total width (or the terminal's, if narrower) so rules line up
+	w := min(termWidth(), 76) - visibleWidth(t) - 5
+	if w < 3 {
+		w = 3
+	}
+	fmt.Printf("\n %s── %s %s%s\n", cFaint, t, strings.Repeat("─", w), cReset)
+}
+
+// row prints a label/value line with the label column aligned.
+func row(label, value string) {
+	fmt.Printf("  %s%-9s%s %s\n", cFaint, label, cReset, value)
+}
+
+// hint prints a faint follow-up line: what to do next.
+func hint(format string, a ...any) {
+	fmt.Println("  " + cFaint + "↳ " + fmt.Sprintf(format, a...) + cReset)
+}
+
+// okLine / warnLine / errLine are standalone status lines with the shared glyphs.
+func okLine(format string, a ...any) {
+	fmt.Println("  " + cGreen + gUp + cReset + " " + fmt.Sprintf(format, a...))
+}
+func warnLine(format string, a ...any) {
+	fmt.Println("  " + cYellow + gPartial + cReset + " " + fmt.Sprintf(format, a...))
+}
+func errLine(format string, a ...any) {
+	fmt.Println("  " + cRed + gDown + cReset + " " + fmt.Sprintf(format, a...))
+}
+
+// table prints rows as aligned columns (ANSI-aware widths). The header row, if
+// any, is faint; the last column may be truncated to fit the terminal.
+func table(header []string, rows [][]string) {
+	cols := len(header)
+	for _, r := range rows {
+		cols = max(cols, len(r))
+	}
+	widths := make([]int, cols)
+	all := rows
+	if header != nil {
+		all = append([][]string{header}, rows...)
+	}
+	for _, r := range all {
+		for i, c := range r {
+			widths[i] = max(widths[i], visibleWidth(c))
+		}
+	}
+	printRow := func(r []string, faintRow bool) {
+		var b strings.Builder
+		b.WriteString("  ")
+		used := 2
+		for i, c := range r {
+			if i == len(r)-1 {
+				if room := termWidth() - used - 1; room > 8 && visibleWidth(c) > room {
+					c = ellipsize(stripANSI(c), room)
+				}
+				b.WriteString(c)
+				break
+			}
+			b.WriteString(padTo(c, widths[i], 0) + "  ")
+			used += widths[i] + 2
+		}
+		if faintRow {
+			fmt.Println(cFaint + stripANSI(b.String()) + cReset)
+		} else {
+			fmt.Println(b.String())
+		}
+	}
+	if header != nil {
+		printRow(header, true)
+	}
+	for _, r := range rows {
+		printRow(r, false)
+	}
+}
+
+// ellipsize cuts s to n visible runes, ending with "…".
+func ellipsize(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n || n < 2 {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
+// ellipsizeMiddle keeps both ends of long identifiers (paths, model ids).
+func ellipsizeMiddle(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n || n < 5 {
+		return s
+	}
+	head := (n - 1) / 2
+	return string(r[:head]) + "…" + string(r[len(r)-(n-1-head):])
+}
+
+// prettyPath shows a path relative to root when inside it, else ~-shortened,
+// middle-ellipsized to a sane width.
+func prettyPath(p, root string) string {
+	if root != "" {
+		if rel, err := filepath.Rel(root, p); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+			return ellipsizeMiddle(rel, 60)
+		}
+	}
+	return ellipsizeMiddle(shortDir(p), 60)
+}
+
+// hostOf renders a base URL as host:port — the part a person recognizes.
+func hostOf(u string) string {
+	s := strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
+// toolVerb is how a tool call reads on screen: a verb and its object, e.g.
+// "read  sum.go", "search  "func main" in pkg".
+func toolVerb(name string) string {
+	switch name {
+	case "read_file":
+		return "read"
+	case "list_dir":
+		return "list"
+	case "grep":
+		return "search"
+	case "glob":
+		return "find"
+	case "run_command":
+		return "run"
+	case "webfetch":
+		return "fetch"
+	case "todowrite":
+		return "todo"
+	}
+	return name
 }

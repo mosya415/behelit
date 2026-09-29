@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
 )
 
 // Session change tracking. Every applied edit/write snapshots the file's prior
@@ -18,7 +19,10 @@ type fileChange struct {
 	tool    string // "edit" | "write"
 }
 
-var changeLog []fileChange
+var (
+	changeMu  sync.Mutex // subagents apply changes concurrently
+	changeLog []fileChange
+)
 
 // snapshot reads a file's current bytes, reporting whether it existed — call it
 // BEFORE applying a change so recordChange can capture the prior state.
@@ -31,14 +35,22 @@ func snapshot(abs string) (before []byte, existed bool) {
 }
 
 func recordChange(name, abs, tool string, before []byte, existed bool) {
+	changeMu.Lock()
 	changeLog = append(changeLog, fileChange{name, abs, before, existed, tool})
+	changeMu.Unlock()
 }
 
-func resetChanges() { changeLog = nil }
+func resetChanges() {
+	changeMu.Lock()
+	changeLog = nil
+	changeMu.Unlock()
+}
 
 // undoLast reverts the most recent applied change: restores the prior bytes, or
 // deletes the file if the change had created it. Returns a description.
 func undoLast() (string, bool) {
+	changeMu.Lock()
+	defer changeMu.Unlock()
 	if len(changeLog) == 0 {
 		return "", false
 	}
@@ -59,6 +71,8 @@ func undoLast() (string, bool) {
 // sessionDiffs renders one diff per changed file, comparing the file's state at
 // its FIRST touch this session against its current contents on disk.
 func sessionDiffs() []string {
+	changeMu.Lock()
+	defer changeMu.Unlock()
 	type orig struct {
 		before  []byte
 		existed bool

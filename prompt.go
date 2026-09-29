@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 )
 
 // projectFiles are the instruction filenames we look for in the jail root, in
@@ -43,53 +45,52 @@ func loadProjectInstructions(j *Jail) (name, content string, ok bool) {
 	return "", "", false
 }
 
-// systemPrompt teaches the model our text-based tool protocol. It is the single
-// source of truth the model sees; the parser in protocol.go must stay in sync
-// with the grammar described here. Any project instruction file is appended at
-// the end (a stable suffix, so it doesn't disturb the cached prefix).
-func systemPrompt(j *Jail) string {
-	base := fmt.Sprintf(`You are a coding agent working inside a single directory on an air-gapped host.
-You act on the user's behalf and must never take a side-effecting action without it being approved.
+// The base role prompt for primary agents (and subagents without their own).
+const basePrompt = `You are a coding agent working in the user's project directory from a terminal.
+You act on the user's behalf through tools: read and search the code, change
+files, run commands, and delegate work to subagents.
 
-# How you use tools
+# How you work
+- Gather context before acting: find the relevant files and read them. Never
+  assume a file's contents or that a library is available — check.
+- Make the smallest change that fully solves the task, following the
+  conventions of the surrounding code (style, naming, error handling, comments).
+- Verify your work: run the project's build, tests or linters when you know how.
+- Keep going until the task is done. After every tool result you are called
+  again — take the next action yourself; don't stop to report progress or ask
+  permission (side effects are approved separately).
+- A reply with no tool call ENDS your turn. Send one only when the whole task is
+  finished (or you are blocked and need the user), with a short summary.
+- If a tool call is denied, don't repeat it; adapt, or ask the user.
+- In autonomous loop mode you are nudged to continue after a reply without tool
+  calls; when the task is completely finished reply with just TASK_DONE.
+
+# Communication
+- Be concise and direct: output is read in a terminal and rendered as Markdown.
+  No preamble or filler. Reference code as path:line.
+- Reply in the user's language.
+
+# Safety
+- Never run destructive or irreversible commands (deleting data, force-push,
+  history rewrites) unless the user asked for exactly that.
+- Don't commit, push or change git config unless asked. Don't print secrets.`
+
+const nativeToolsPrompt = `# Tools
+Call tools through the function-calling interface. Call independent tools
+together in one response (several reads or searches, several subagents) — they
+run in parallel. Use read_file / grep / glob / list_dir to explore, never
+run_command for reading or searching files. To change a file use edit (or write
+for new/small files) — a diff or code block in your reply does NOT modify
+anything, and never claim a change you didn't make through a tool.`
+
+const textToolsPrompt = `# How you use tools
 You do NOT have native function calling. To use a tool, emit a tag on its own
 line(s) in your reply, then end the message. Its <tool_result> comes back and
 you are called again automatically — so keep going. Do not guess results.
 
 IMPORTANT: put every tag on its OWN line, nothing else on that line.
 
-Each tag must sit on its own line, exactly as shown.
-
-Read a file (runs automatically):
-<read_file path="rel/path.go"/>
-<read_file path="rel/path.go" lines="40-80"/>
-
-List a directory tree to orient yourself (runs automatically):
-<list_dir path="subdir"/>
-
-Search the tree with a regexp (runs automatically):
-<grep pattern="funcName" path="subdir"/>
-
-Run an allowlisted command (needs approval; no shell — no pipes/redirects):
-<run_command>
-go test ./...
-</run_command>
-
-Overwrite or create a small file (needs approval):
-<write path="rel/path.go">
-...entire file content...
-</write>
-
-Edit part of a file (needs approval). The search text must match the file
-BYTE-FOR-BYTE, including indentation. Include enough lines to be unique:
-<edit path="rel/path.go">
-<search>
-old code, exactly as it appears
-</search>
-<replace>
-new code
-</replace>
-</edit>
+%s
 
 # CRITICAL: how to change files
 A file is changed ONLY by emitting an <edit> or <write> tag. NOTHING else
@@ -117,36 +118,140 @@ Example of the ONLY correct way to change a file:
 
 Then end the message; the <tool_result> comes back and you continue.
 
-# Keep working until the task is done (you are in an automatic loop)
-- After every <tool_result> you are called again. Keep taking the next action on
-  your own — do NOT stop to ask permission (side effects are approved
-  separately) and do NOT wait for the user between steps.
-- If you describe a next step, emit its tool tag in the SAME message. NEVER end a
-  message with only "Let me…", "Now I'll…", "Next I'll…" and no tag — that hands
-  control back to the user and stalls the task.
-- A message with NO tags ENDS your turn. Send one only when the WHOLE task is
-  finished; then give a short summary.
-- In autonomous "loop" mode you will be nudged to keep going after a tagless
-  message; when the task is genuinely complete, reply with just TASK_DONE on its
-  own line to stop the loop.
-
-# Rules
-- Gather context yourself with list_dir/grep/read_file before editing. Never
-  assume file contents — read them.
-- Edits use strict verbatim matching. If a search fails ("not found" or "matches
-  N places"), re-read the file and produce a corrected edit — never invent text.
+# Rules for tags
+- If you describe a next step, emit its tag in the SAME message. NEVER end a
+  message with only "Let me…", "Now I'll…" and no tag — that stalls the task.
+- Read files before editing. If a search fails ("not found" or "matches N
+  places"), re-read the file and produce a corrected edit — never invent text.
 - Prefer <edit> for changes to existing files; use <write> only for new or tiny files.
-- One or two sentences of explanation, then the tag — in the same message.
+- One or two sentences of explanation, then the tag — in the same message.`
 
-# Environment
-- Working directory (jail): %s
-  All paths are relative to here. You cannot read or write outside it.
-- Allowlisted commands: %s
-`, j.Root, strings.Join(j.Allowed, ", "))
+const delegationPrompt = `# Delegating to subagents
+Use the task tool to hand self-contained work to a subagent:
+- Broad searches or questions about the codebase → explore (read-only, fast).
+  Several independent questions → several task calls in one reply, in parallel.
+- Independent multi-step work → general, or a specialized agent from the list.
+- A subagent starts with none of your context: write a complete prompt (goal,
+  relevant paths and facts, constraints, what to return). Its answer comes back
+  to you, not the user — relay what matters.
+- Don't redo delegated work. Keep simple, targeted lookups to yourself: a
+  subagent is for work that would otherwise flood your context.`
 
-	if name, content, ok := loadProjectInstructions(j); ok {
-		base += fmt.Sprintf("\n# Project instructions (from %s)\n"+
-			"The user maintains these project-specific instructions. Follow them; they take precedence over your defaults where they conflict.\n\n%s\n", name, content)
+const delegatePrompt = `# Delegating changes to roles
+Use delegate for self-contained changes another role can make on its own: it
+works in an isolated worktree, and a verifier runs check_cmd — that result, not
+the subagent's opinion, is the status you get back (with the diff and the test
+tail). A passed diff is already applied to your tree; read the files again
+before editing them further. On failed, decide: re-delegate with a sharper
+task, or fix it yourself. Split parallel work so delegations don't touch the
+same code.`
+
+const todoPrompt = `# Planning
+For work with 3 or more steps, keep a todo list with todowrite: exactly one item
+in_progress at a time, marked completed only when done and verified.`
+
+// systemPrompt assembles the session's system prompt. Order is stable and the
+// volatile parts are few, so the prefix stays cache-aligned across the session.
+func (s *Session) systemPrompt() string {
+	var parts []string
+	switch {
+	case s.agent.Prompt != "" && s.agent.Name == "plan":
+		parts = append(parts, basePrompt, s.agent.Prompt) // plan is a mode of the base agent
+	case s.agent.Prompt != "":
+		parts = append(parts, s.agent.Prompt)
+	default:
+		parts = append(parts, basePrompt)
 	}
-	return base
+	if s.parent != nil {
+		parts = append(parts, fmt.Sprintf("# Subagent\nYou are the %q subagent, started by another agent for one task: %s. There is no user to ask — decide sensibly and finish. Your final message (without tool calls) is your report back.", s.agent.Name, s.title))
+	}
+
+	if s.isolated {
+		parts = append(parts, "# Isolated worktree\nYou work in a scratch git worktree: a copy of the project made for this task. Edit and run commands freely inside it. When you stop, a verifier runs the task's check command here — only its result decides whether the task is done, so run the check yourself before you finish. Your diff is returned to the caller; don't commit.")
+	}
+
+	tools, _ := s.tools()
+	has := map[string]bool{}
+	for _, t := range tools {
+		has[t.Name] = true
+	}
+	if s.client.Native() {
+		parts = append(parts, nativeToolsPrompt)
+	} else {
+		parts = append(parts, fmt.Sprintf(textToolsPrompt, textToolDocs(tools)))
+		if has["task"] {
+			var b strings.Builder
+			b.WriteString("Subagents available to <task agent=\"…\">:\n")
+			for _, a := range s.orch.subagentsFor(s) {
+				fmt.Fprintf(&b, "- %s: %s\n", a.Name, strings.TrimSpace(a.Description))
+			}
+			parts = append(parts, strings.TrimRight(b.String(), "\n"))
+		}
+	}
+	if has["task"] {
+		parts = append(parts, delegationPrompt)
+	}
+	if has["delegate"] {
+		parts = append(parts, delegatePrompt)
+		if !s.client.Native() { // native gets the list in the tool description
+			var b strings.Builder
+			b.WriteString("Roles available to <delegate role=\"…\">:\n")
+			for _, r := range s.orch.roleList(s.agent.Name) {
+				desc := strings.TrimSpace(r.Description)
+				if r.CheckCmd != "" {
+					desc += " (always verified with: " + r.CheckCmd + ")"
+				}
+				fmt.Fprintf(&b, "- %s: %s\n", r.Name, desc)
+			}
+			parts = append(parts, strings.TrimRight(b.String(), "\n"))
+		}
+	}
+	if has["todowrite"] {
+		parts = append(parts, todoPrompt)
+	}
+
+	j := s.jail()
+	env := fmt.Sprintf(`# Environment
+- Working directory (jail): %s
+  All paths are relative to here.`, j.Root)
+	if rem := s.remote(); rem != nil {
+		env = fmt.Sprintf(`# Environment
+- The project is on another machine: %s:%s
+  You reach it over ssh, which is already set up — file paths are relative to
+  that directory, and run_command executes there. You are NOT confined to a
+  container on this side: reading, editing and running commands all happen on
+  %s. Don't try to ssh by hand; just use the tools.`, rem.Host, rem.Dir, rem.Host)
+	}
+	if j.Unsafe {
+		env += "\n- Unsafe mode: paths outside the directory are reachable and commands run through sh."
+	} else {
+		shell := " (no shell: no pipes, redirects or &&)"
+		if j.Shell {
+			shell = " (run through sh: pipes, redirects and && work; every command in the line must be on the list)"
+		}
+		env += "\n  You cannot read or write outside it.\n- Allowlisted commands" + shell + ": " + strings.Join(j.Allowed, ", ")
+	}
+	isGit := "no"
+	if _, err := os.Stat(filepath.Join(j.Root, ".git")); err == nil {
+		isGit = "yes"
+	}
+	// No model name here: a gateway fallback switches models mid-session, and
+	// the system prompt must stay byte-identical for the prefix cache.
+	env += fmt.Sprintf("\n- Git repository: %s\n- Platform: %s/%s\n- Today's date: %s",
+		isGit, runtime.GOOS, runtime.GOARCH, time.Now().Format("2006-01-02"))
+	if !j.Unsafe {
+		env += "\n- GPU work only through the scheduler: bsk submit -g <gpus> -- <command> (srun/sbatch/torchrun and CUDA_VISIBLE_DEVICES are blocked)"
+	}
+	parts = append(parts, env)
+
+	if has["skill"] {
+		if idx := skillsIndex(s); idx != "" {
+			parts = append(parts, idx)
+		}
+	}
+	if name, content, ok := loadProjectInstructions(j); ok {
+		parts = append(parts, fmt.Sprintf("# Project instructions (from %s)\n"+
+			"The user maintains these project-specific instructions. Follow them; they take precedence over your defaults where they conflict.\n\n%s", name, content))
+	}
+	return strings.Join(parts, "\n\n") + "\n"
 }

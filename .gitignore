@@ -5,6 +5,11 @@
 /linux/
 /windows/
 *.exe
+*.zip
 
-# local session data (audit log + transcripts), if LCA_DIR points here
+# stray artifacts / local session data
+Pasted image.png
 .lca/
+.DS_Store
+gw.log
+.claude/

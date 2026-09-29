@@ -32,7 +32,11 @@ var reToolHdr = regexp.MustCompile(`^<tool_result name="([^"]*)" path="([^"]*)">
 func estimateTokens(msgs []Message) int {
 	total := 0
 	for _, m := range msgs {
-		total += (len(m.Content) + len(m.Role) + 4) / 4
+		n := len(m.Content) + len(m.Role) + len(m.Reasoning) + 4
+		for _, tc := range m.ToolCalls {
+			n += len(tc.Function.Name) + len(tc.Function.Arguments) + 16
+		}
+		total += n / 4
 	}
 	return total
 }
@@ -93,6 +97,9 @@ func dedupeReads(out []Message) int {
 }
 
 func toolResultKey(m Message) (name, path string, ok bool) {
+	if m.Role == "tool" {
+		return m.Tool, m.Path, true
+	}
 	if m.Role != "user" {
 		return "", "", false
 	}
@@ -106,5 +113,5 @@ func toolResultKey(m Message) (name, path string, ok bool) {
 func isStub(s string) bool { return s == trimStub || s == supersededStub }
 
 func isToolResult(m Message) bool {
-	return m.Role == "user" && strings.HasPrefix(m.Content, "<tool_result")
+	return m.Role == "tool" || m.Role == "user" && strings.HasPrefix(m.Content, "<tool_result")
 }

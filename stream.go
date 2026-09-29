@@ -41,13 +41,16 @@ type proseWriter struct {
 	reasonLog    []string        // all reasoning lines this step (for /think last)
 	markerActive bool            // the "thinking" marker is on the current line
 	markerPrefix string          // gutter prefix used to redraw the marker in place
+	markerLabel  string          // what the marker says: "thinking", or "calling <tool>"
 	anim         bool            // animate on a real terminal (not when piped)
 	spinning     bool            // the timer-driven spinner goroutine is running
 	spinStop     chan struct{}   // signals the spinner to exit
 	spinDone     chan struct{}   // closed when the spinner goroutine has exited
 
-	genStart time.Time // when the first delta of this response arrived
-	tok      int64     // approx tokens streamed this response (atomic; ~1 per delta)
+	waiting     bool      // the request is out, nothing has come back yet
+	markerStart time.Time // when the current marker line appeared
+	genStart    time.Time // when the first delta of this response arrived
+	tok         int64     // approx tokens streamed this response (atomic; ~1 per delta)
 }
 
 func newProseWriter(raw, showThink bool) *proseWriter {
@@ -63,11 +66,16 @@ func (p *proseWriter) noteTok() {
 	atomic.AddInt64(&p.tok, 1)
 }
 
-// thinkStat renders the live "elapsed · tokens" suffix for the thinking line.
+// thinkStat renders the live "elapsed · tokens" suffix for the marker line
+// (while waiting for the first token there are no tokens to count yet).
 func (p *proseWriter) thinkStat() string {
+	base := p.genStart
+	if base.IsZero() {
+		base = p.markerStart
+	}
 	el := time.Duration(0)
-	if !p.genStart.IsZero() {
-		el = time.Since(p.genStart)
+	if !base.IsZero() {
+		el = time.Since(base)
 	}
 	s := int(el.Seconds())
 	var d string
@@ -75,6 +83,9 @@ func (p *proseWriter) thinkStat() string {
 		d = fmt.Sprintf("%ds", s)
 	} else {
 		d = fmt.Sprintf("%dm%02ds", s/60, s%60)
+	}
+	if p.waiting {
+		return d
 	}
 	return fmt.Sprintf("%s · %d tok", d, atomic.LoadInt64(&p.tok))
 }
@@ -93,17 +104,34 @@ func (p *proseWriter) leadMarker() {
 // beginReasoning shows the collapsed-reasoning marker once. On a terminal it
 // starts a timer-driven braille spinner (smooth, independent of token speed);
 // piped, it prints a single static marker with no escape codes.
+// begin shows a live "waiting for <model>" line the moment the request goes
+// out: a slow prefill or a cold model must not look like a freeze. It is
+// replaced in place by the reasoning/answer as soon as anything arrives.
+func (p *proseWriter) begin(model string) {
+	if p.raw || p.markerActive {
+		return
+	}
+	p.waiting = true
+	p.markerLabel = "waiting for " + model
+	p.beginReasoning()
+}
+
 func (p *proseWriter) beginReasoning() {
 	if p.markerActive {
 		return
 	}
+	p.markerStart = time.Now()
 	p.leadMarker()
 	p.markerActive = true
+	if p.markerLabel == "" {
+		p.markerLabel = "thinking"
+	}
+	label := p.markerLabel
 	if !p.anim {
-		p.out(cFaint + "thinking…" + cReset)
+		p.out(cFaint + label + "…" + cReset)
 		return
 	}
-	p.out(cFaint + "⠋ thinking · " + p.thinkStat() + cReset)
+	p.out(cFaint + "⠋ " + label + " · " + p.thinkStat() + cReset)
 	p.spinning = true
 	p.spinStop = make(chan struct{})
 	p.spinDone = make(chan struct{})
@@ -119,7 +147,7 @@ func (p *proseWriter) beginReasoning() {
 			case <-p.spinStop:
 				return
 			case <-tk.C:
-				p.out("\r\033[K" + prefix + cFaint + string(frames[i%len(frames)]) + " thinking · " + p.thinkStat() + cReset)
+				p.out("\r\033[K" + prefix + cFaint + string(frames[i%len(frames)]) + " " + label + " · " + p.thinkStat() + cReset)
 				i++
 			}
 		}
@@ -133,19 +161,76 @@ func (p *proseWriter) closeMarker() {
 	if !p.markerActive {
 		return
 	}
+	// The waiting line leaves no trace: whatever arrives takes its place.
+	if p.waiting {
+		if p.spinning {
+			close(p.spinStop)
+			<-p.spinDone
+			p.spinning = false
+		}
+		p.out("\r\033[K")
+		p.waiting, p.markerActive, p.markerLabel = false, false, ""
+		p.started, p.pendingNewline = false, false
+		return
+	}
 	if p.spinning {
 		close(p.spinStop)
 		<-p.spinDone
 		p.spinning = false
-		p.out("\r\033[K" + p.markerPrefix + cFaint + "thought " + p.thinkStat() + cReset)
+		done := "thought"
+		if p.markerLabel != "thinking" {
+			done = p.markerLabel
+		}
+		p.out("\r\033[K" + p.markerPrefix + cFaint + done + " · " + p.thinkStat() + cReset)
 	}
 	p.markerActive = false
+	p.markerLabel = ""
 	p.pendingNewline = true
 }
 
-func (p *proseWriter) out(s string) { fmt.Print(s) }
+func (p *proseWriter) out(s string) {
+	outMu.Lock()
+	fmt.Print(s)
+	outMu.Unlock()
+}
+
+// discard ends the display of a reply that was cut off and will be repeated:
+// flush what's pending, mark it void, and start the repeat on a fresh line.
+func (p *proseWriter) discard() {
+	p.end()
+	p.out(" " + faint("%s (cut off — repeating)", gNone) + "\n")
+	p.started, p.pendingNewline, p.reasonLog = false, false, nil
+}
+
+// feedToolArgs notes a native tool call's arguments streaming in (a large
+// write can take a while) with the same live marker as reasoning.
+func (p *proseWriter) feedToolArgs(name string) {
+	if p.raw {
+		return
+	}
+	if p.waiting {
+		p.closeMarker()
+	}
+	p.noteTok()
+	p.flushReason()
+	if p.line.Len() > 0 {
+		p.flushLine(p.line.String())
+		p.line.Reset()
+	}
+	label := "calling " + name
+	if p.markerActive && p.markerLabel != label {
+		p.closeMarker()
+	}
+	if !p.markerActive {
+		p.markerLabel = label
+		p.beginReasoning()
+	}
+}
 
 func (p *proseWriter) feed(s string) {
+	if p.waiting {
+		p.closeMarker()
+	}
 	if p.raw {
 		if !p.started {
 			p.out("\n " + cBold + gUp + cReset + " ")
@@ -169,6 +254,9 @@ func (p *proseWriter) feed(s string) {
 // feedReasoning consumes reasoning_content deltas (the separate field some
 // reasoning models stream) and renders them dimmed, line by line.
 func (p *proseWriter) feedReasoning(s string) {
+	if p.waiting {
+		p.closeMarker()
+	}
 	if p.raw {
 		if !p.started {
 			p.out("\n " + cBold + gUp + cReset + " ")
@@ -186,6 +274,9 @@ func (p *proseWriter) feedReasoning(s string) {
 		}
 	}
 	if !p.showThink {
+		if p.markerActive && p.markerLabel != "thinking" {
+			p.closeMarker()
+		}
 		p.beginReasoning() // marker + spinner (started once)
 	}
 }

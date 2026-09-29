@@ -7,9 +7,10 @@ import (
 	"strings"
 )
 
-// Config holds runtime configuration. Everything is resolved from flags/env at
-// startup; there is deliberately no config file and no auth layer — identity
-// comes from the process (uid/gid of whoever ran the binary).
+// Config holds runtime configuration, resolved from env at startup. The
+// optional JSON config file (fileconfig.go) adds providers, agents and
+// permission rules on top; there is no auth layer — identity comes from the
+// process (uid/gid of whoever ran the binary).
 type Config struct {
 	Root         string   // realpath jail root; nothing may be touched outside it
 	BaseURL      string   // current OpenAI-compatible endpoint, e.g. http://localhost:8000/v1
@@ -22,7 +23,8 @@ type Config struct {
 	CmdTimeout   int      // run_command timeout in seconds (LCA_CMD_TIMEOUT)
 	CtxTokens    int      // approximate token budget for the transcript sent to the model
 	Allowed      []string // command allowlist (matched against basename of argv[0])
-	Dir          string   // where the audit log and session transcripts are written
+	Dir          string   // config (config.json, roles.yaml, agents…) and, by default, state
+	StateDir     string   // audit log, transcripts, traces, worktrees; "" = Dir
 	Raw          bool     // stream raw model text (show tool tags) — for protocol debugging
 	Discover     bool     // query /models to adopt/validate the model (off = trust configured name)
 	Reservation  string   // Slurm reservation to scope /discover (LCA_RESERVATION)
@@ -32,6 +34,12 @@ type Config struct {
 	Loop         bool     // autonomous loop mode: keep going until TASK_DONE (LCA_LOOP)
 	Unsafe       bool     // disable the jail + command allowlist (LCA_UNSAFE / -unsafe)
 	KeepSessions int      // max transcript files to retain (LCA_KEEP_SESSIONS)
+	Tools        string   // tool transport override: native | text | auto (LCA_TOOLS)
+	Thinking     string   // reasoning mode: on | off | low | medium | high | max (LCA_THINKING)
+	Agent        string   // primary agent to start with (LCA_AGENT)
+	SubagentMax  int      // max subagent nesting depth (LCA_SUBAGENT_DEPTH)
+
+	TransportOverride string // force a tool transport for the whole run (eval -transport)
 }
 
 func env(key, def string) string {
@@ -56,8 +64,8 @@ func loadConfig() Config {
 		BaseURL:      strings.TrimRight(env("LCA_BASE_URL", "http://localhost:8000/v1"), "/"),
 		Model:        env("LCA_MODEL", "local"),
 		APIKey:       env("LCA_API_KEY", "sk-noauth"),
-		Temperature:  0.2,
-		MaxSteps:     25,
+		Temperature:  -1, // unset: send no temperature unless a profile, role or LCA_TEMPERATURE says so
+		MaxSteps:     atoiDefault(os.Getenv("LCA_MAX_STEPS"), 50),
 		CtxTokens:    atoiDefault(os.Getenv("LCA_CTX_TOKENS"), 0), // 0 = auto: derive from the model's window
 		MaxTokens:    atoiDefault(os.Getenv("LCA_MAX_TOKENS"), 0),
 		CmdTimeout:   atoiDefault(os.Getenv("LCA_CMD_TIMEOUT"), 120),
@@ -70,10 +78,22 @@ func loadConfig() Config {
 		Loop:         os.Getenv("LCA_LOOP") != "",
 		Unsafe:       os.Getenv("LCA_UNSAFE") != "",
 		KeepSessions: atoiDefault(os.Getenv("LCA_KEEP_SESSIONS"), 200),
+		Tools:        strings.ToLower(os.Getenv("LCA_TOOLS")),
+		Thinking:     os.Getenv("LCA_THINKING"),
+		Agent:        env("LCA_AGENT", "build"),
+		SubagentMax:  atoiDefault(os.Getenv("LCA_SUBAGENT_DEPTH"), 1),
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",
+			// reaching another machine is an outbound connection, no ports opened;
+			// what they carry is still checked (jail.go: GPU policy inside ssh)
+			"ssh", "scp", "rsync", "bsk",
 		},
+	}
+	if v := os.Getenv("LCA_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			cfg.Temperature = f
+		}
 	}
 	if v := os.Getenv("LCA_ALLOW"); v != "" {
 		cfg.Allowed = splitFields(v)
@@ -116,4 +136,12 @@ func splitFields(s string) []string {
 		}
 	}
 	return out
+}
+
+// stateDir is where run artifacts go (eval separates it from the config dir).
+func (c Config) stateDir() string {
+	if c.StateDir != "" {
+		return c.StateDir
+	}
+	return c.Dir
 }

@@ -1,19 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"os/user"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,1300 +15,215 @@ func main() {
 	if cfg.CmdTimeout > 0 {
 		cmdTimeout = time.Duration(cfg.CmdTimeout) * time.Second
 	}
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "eval":
+			os.Exit(runEval(cfg, os.Args[2:]))
+		case "init":
+			os.Exit(runInit(cfg, os.Args[2:]))
+		case "doctor":
+			os.Exit(runDoctor(cfg, os.Args[2:]))
+		case "help", "--help":
+			usage()
+			return
+		}
+	}
 
-	yes := flag.Bool("y", false, "auto-approve side-effecting actions (for one-shot / non-interactive use)")
-	yesLong := flag.Bool("yes", false, "alias for -y")
-	unsafe := flag.Bool("unsafe", false, "disable the jail + command allowlist (any path, any command)")
-	resume := flag.Bool("resume", false, "resume the most recent previous session")
+	yes := flag.Bool("y", false, "")
+	yesLong := flag.Bool("yes", false, "")
+	unsafe := flag.Bool("unsafe", false, "")
+	resume := flag.Bool("resume", false, "")
+	agentFlag := flag.String("agent", "", "")
+	roleFlag := flag.String("role", "", "")
+	modelFlag := flag.String("model", "", "")
+	checkFlag := flag.String("check", "", "")
 	flag.Usage = usage
 	flag.Parse()
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
 
-	jail, err := NewJail(cfg.Root, cfg.Allowed, cfg.Unsafe || *unsafe)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "jail init failed:", err)
-		os.Exit(1)
-	}
-	rec, err := NewRecorder(cfg)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "recorder init failed:", err)
-		os.Exit(1)
-	}
-	defer rec.Close()
-
-	client := NewClient(cfg)
-	in := bufio.NewReader(os.Stdin)
+	cfg.Unsafe = cfg.Unsafe || *unsafe
+	in := NewInput(os.Stdin)
 	ap := NewApprover(in)
 	if *yes || *yesLong {
 		ap.TrustAll()
 	}
+	orch, err := setupOrchestrator(cfg, ap, os.Getenv("LCA_TRACE"))
+	if err != nil {
+		fatal(err)
+	}
+	defer orch.rec.Close()
+	defer orch.tracer.Close()
+	local := orch.providers.local
+
+	// Model: -model > LCA_MODEL when it names a provider > config "model" > the
+	// role's chain / the endpoint's LCA_MODEL.
+	ref := *modelFlag
+	if _, _, ok := orch.providers.Split(cfg.Model); ok {
+		local.SetModel("local")
+		ref = firstNonEmpty(ref, cfg.Model)
+	}
+	if ref == "" && os.Getenv("LCA_MODEL") == "" && orch.fc.Model != "" {
+		ref = orch.fc.Model
+	}
+	agentName := firstNonEmpty(*roleFlag, *agentFlag, os.Getenv("LCA_AGENT"))
+	if agentName == "" && orch.roles != nil {
+		agentName = orch.roles.Entry
+	}
+	agentName = firstNonEmpty(agentName, cfg.Agent)
+	sess, err := orch.NewPrimary(agentName, ref, nil)
+	if err != nil {
+		fatal(err)
+	}
+	sess.view = newTermView(sess)
+	sess.Loop, sess.ShowThink, sess.Raw = cfg.Loop, cfg.ShowThinking, cfg.Raw
 
 	var notes []string
-	if cfg.Discover {
-		notes = reconcileModel(client, rec)
+	if cfg.Discover && sess.client == local {
+		notes = reconcileModel(local, orch.rec)
 	}
-	rec.Event("session_start", map[string]any{
-		"root": jail.Root, "model": client.Model(), "endpoint": cfg.BaseURL,
+	orch.rec.Event("session_start", map[string]any{
+		"root": orch.jl.Root, "model": sess.client.Ref(), "endpoint": sess.client.Endpoint(), "agent": sess.agent.Name,
 	})
-	defer rec.Event("session_end", nil)
-	pruneTranscripts(filepath.Join(cfg.Dir, "transcripts"), cfg.KeepSessions)
+	defer orch.rec.Event("session_end", nil)
+	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions)
 
-	msgs := []Message{{Role: "system", Content: systemPrompt(jail)}}
-
-	// One-shot mode: a prompt on the command line runs a single turn and exits.
-	// Model-reconciliation notes go to stderr so stdout carries only the answer.
 	if prompt != "" {
-		for _, n := range notes {
-			fmt.Fprintln(os.Stderr, n)
-		}
-		rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
-		msgs = append(msgs, Message{Role: "user", Content: prompt})
-		var reason string
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, cfg.ShowThinking, cfg.Loop, false, &reason)
-		rec.Transcript(msgs)
-		return
+		os.Exit(oneShot(orch, sess, prompt, *checkFlag, append(notes, orch.warnings...)))
 	}
 
+	r := &Repl{cfg: cfg, orch: orch, sess: sess, local: local, in: in, notes: notes}
 	if os.Getenv("LCA_NO_CLEAR") == "" {
 		clearScreen()
 	}
-	banner(cfg, jail, rec, ap, client, notes)
-
+	r.Banner()
 	if *resume {
-		if ss := listSessions(filepath.Join(cfg.Dir, "transcripts"), rec.SessionPath()); len(ss) > 0 {
-			if n, err := resumeInto(&msgs, ss[0]); err == nil {
-				rec.Event("resume", map[string]any{"from": ss[0].id, "messages": n})
-				fmt.Println("  " + faint("%s resumed %s · %d messages", gNone, sessionWhen(ss[0].id), n))
-			}
-		} else {
-			fmt.Println("  " + faint("-resume: no previous session found"))
-		}
+		r.cmdResume("")
 	}
-
-	ed := NewLineEditor(in)
-	ed.models = client.KnownModels
-	ed.files = func(frag string) []string { return jailFiles(jail, frag) }
-	showThink := cfg.ShowThinking
-	loop := cfg.Loop
-	editPrefill := "" // set by /edit to pre-fill the next prompt with the last message
-	var lastReason string
-	// Persistent status line under the input: current model, working mode, dir.
-	ed.status = func() string {
-		parts := []string{client.Model(), "approve:" + ap.ModeShort()}
-		if loop {
-			parts = append(parts, "loop")
-		}
-		if jail.Unsafe {
-			parts = append(parts, cBlood+"unsafe"+cFaint)
-		}
-		parts = append(parts, shortDir(jail.Root))
-		return strings.Join(parts, "  ·  ")
-	}
-	for {
-		fmt.Print("\n")
-		prefill := ""
-		if editPrefill != "" {
-			prefill, editPrefill = editPrefill, ""
-		}
-		line, err := ed.ReadLine(" "+cFaint+"›"+cReset+" ", prefill)
-		if err == errLineCancel {
-			continue
-		}
-		if err != nil { // EOF (Ctrl-D / stream end)
-			return
-		}
-		// Backslash line-continuation: a line ending in \ keeps reading, so a
-		// long prompt can be typed across several lines.
-		for strings.HasSuffix(line, "\\") {
-			cont, err := ed.ReadLine("   "+cFaint+"…"+cReset+" ", "")
-			if err != nil {
-				break
-			}
-			line = line[:len(line)-1] + "\n" + cont
-		}
-		line = strings.TrimSpace(line)
-		switch line {
-		case "":
-			continue
-		case "/exit", "/quit":
-			return
-		case "/reset":
-			msgs = msgs[:1]
-			resetChanges()
-			rec.Event("reset", nil)
-			fmt.Println(" " + faint("%s TRANSCRIPT CLEARED", gNone))
-			continue
-		case "/retry":
-			// Drop the last exchange and re-run the last user turn (e.g. after a
-			// /model switch, or to just regenerate).
-			idx := lastUserTurn(msgs)
-			if idx < 0 {
-				fmt.Println("  " + faint("nothing to retry"))
-				continue
-			}
-			msgs = msgs[:idx+1]
-			rec.Event("retry", nil)
-			runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, showThink, loop, true, &lastReason)
-			rec.Transcript(msgs)
-			continue
-		case "/edit":
-			// Pull the last user message back into the prompt to amend and resend.
-			idx := lastUserTurn(msgs)
-			if idx < 0 {
-				fmt.Println("  " + faint("nothing to edit"))
-				continue
-			}
-			orig := msgs[idx].Content
-			if i := strings.Index(orig, "\n<file "); i >= 0 {
-				orig = orig[:i] // shed any @-attached file blocks; keep the typed text
-			}
-			editPrefill = orig
-			msgs = msgs[:idx]
-			continue
-		}
-		if handleApproveCmd(line, ap, rec) {
-			continue
-		}
-		if handleModelCmd(line, client, rec, cfg.Discover) {
-			continue
-		}
-		if handleEndpointCmd(line, client, rec, cfg.Discover) {
-			continue
-		}
-		if handleDiscoverCmd(line, client, rec, cfg) {
-			continue
-		}
-		if handleThinkCmd(line, &showThink, lastReason, rec) {
-			continue
-		}
-		if handleLoopCmd(line, &loop, rec) {
-			continue
-		}
-		if handleUnsafeCmd(line, jail, rec) {
-			continue
-		}
-		if handleContextCmd(line, msgs, ctxBudget(cfg.CtxTokens, client.CtxLen())) {
-			continue
-		}
-		if handleDiffCmd(line) {
-			continue
-		}
-		if handleUndoCmd(line, rec) {
-			continue
-		}
-		if handleCompactCmd(line, client, rec, &msgs) {
-			continue
-		}
-		if handleResumeCmd(line, cfg, rec, &msgs) {
-			continue
-		}
-		if handleHelpCmd(line) {
-			continue
-		}
-
-		content := line
-		blocks, names := expandMentions(jail, line)
-		if len(names) > 0 {
-			content += blocks
-			fmt.Println(" " + faint("%s attached @%s", gNone, strings.Join(names, " @")))
-		}
-		msgs = append(msgs, Message{Role: "user", Content: content})
-		rec.Event("user", map[string]any{"text": line, "attached": names})
-		runTurn(client, jail, ap, rec, &msgs, cfg.MaxSteps, ctxBudget(cfg.CtxTokens, client.CtxLen()), cfg.Raw, showThink, loop, true, &lastReason)
-		rec.Transcript(msgs)
-	}
+	r.Loop()
 }
 
-// reconcileModel discovers what the endpoint actually serves and reconciles it
-// with the configured model name. If the configured name isn't served but the
-// endpoint offers exactly one model, we adopt it (the common vLLM/SGLang case:
-// one model per endpoint, whose id rarely matches a hand-typed guess). Returns
-// pre-colored display lines for the banner; never fatal.
-func reconcileModel(client *Client, rec *Recorder) []string {
-	models, err := client.ListModels()
-	if err != nil {
-		return []string{warn("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
+// oneShot runs a single task and returns the exit code. stdout carries only
+// the answer; notes and the verdict go to stderr. With -check the verifier,
+// not the model, decides success.
+func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []string) int {
+	for _, n := range notes {
+		fmt.Fprintln(os.Stderr, n)
 	}
-	if len(models) == 0 {
-		return []string{warn("endpoint advertises no models — using configured name as-is")}
-	}
-	if info, ok := findModel(models, client.Model()); ok {
-		client.SetCtxLen(info.MaxLen)
-		return []string{readyLine(info)}
-	}
-	if len(models) == 1 {
-		prev := client.Model()
-		client.SetModel(models[0].ID)
-		client.SetCtxLen(models[0].MaxLen)
-		rec.Event("model_adopt", map[string]any{"from": prev, "to": models[0].ID})
-		return []string{
-			readyLine(models[0]),
-			faint("adopted (configured %q not served)", prev),
-		}
-	}
-	lines := []string{warn("configured %q not served; choose one with /model:", client.Model())}
-	return append(lines, modelTable(models, client.Model())...)
-}
-
-// handleModelCmd processes the /model REPL command. "/model <name>" sets the
-// model for subsequent turns (no validation — we trust the name). "/model" shows
-// the current model; only when discovery is enabled does it probe /models and
-// list what the router serves.
-func handleModelCmd(line string, client *Client, rec *Recorder, discover bool) bool {
-	arg, ok := commandArg(line, "/model")
-	if !ok {
-		return false
-	}
-
-	if arg == "" {
-		eyebrow("models")
-		kv("current", client.Model()+"  "+faint("@ %s", client.Endpoint()))
-		if !discover {
-			fmt.Println("  " + faint("set with /model <name>  ·  discovery off (LCA_DISCOVER=1 to probe)"))
-			return true
-		}
-		models, err := client.ListModels()
-		switch {
-		case err != nil:
-			fmt.Println("  " + warn("discovery unavailable: %v", err))
-		case len(models) == 0:
-			fmt.Println("  " + faint("endpoint advertises no models"))
-		default:
-			for _, l := range modelTable(models, client.Model()) {
-				fmt.Println(l)
-			}
-		}
-		return true
-	}
-
-	prev := client.Model()
-	client.SetModel(arg)
-	rec.Event("model_change", map[string]any{"from": prev, "to": arg})
-	fmt.Printf("  %sMODEL%s %s → %s\n", cFaint, cReset, prev, arg)
-
-	// If discovery knows which endpoint serves this model, route there too — so
-	// picking a model also points the session at where it actually runs (the
-	// default endpoint is usually the unreachable localhost placeholder).
-	if ep := client.EndpointForModel(arg); ep != "" && ep != client.Endpoint() {
-		client.SetEndpoint(ep)
-		rec.Event("endpoint_change", map[string]any{"from": client.Endpoint(), "to": ep, "via": "model"})
-		fmt.Printf("  %sENDPOINT%s → %s\n", cFaint, cReset, client.Endpoint())
-	}
-
-	if discover {
-		if models, err := client.ListModels(); err == nil && len(models) > 0 {
-			if _, ok := findModel(models, arg); !ok {
-				fmt.Println("  " + warn("warning: %q is not in the endpoint's served list", arg))
-			}
-		}
-	}
-	return true
-}
-
-// handleEndpointCmd processes the /endpoint (alias /ep) REPL command.
-// "/endpoint" lists known endpoints with a reachability check (current marked);
-// "/endpoint <n|url>" switches — by list index, or to any URL (handy when a
-// SLURM allocation hands out a fresh host:port). Re-discovery on switch only
-// happens when discovery is enabled.
-func handleEndpointCmd(line string, client *Client, rec *Recorder, discover bool) bool {
-	arg, ok := commandArg(line, "/endpoint", "/ep")
-	if !ok {
-		return false
-	}
-	eps := client.Endpoints()
-
-	if arg == "" {
-		eyebrow("endpoints")
-		probes := probeEndpoints(client, eps)
-		for i, e := range eps {
-			mark := " "
-			if e == client.Endpoint() {
-				mark = cBold + "→" + cReset
-			}
-			fmt.Printf("  %s %d  %s %s  %s\n",
-				mark, i+1, probes[i].glyph(), e, probes[i].detail(e == client.Endpoint(), client.Model()))
-		}
-		fmt.Println("  " + faint("switch: /endpoint <n|url>"))
-		return true
-	}
-
-	target := arg
-	if n, err := strconv.Atoi(arg); err == nil {
-		if n < 1 || n > len(eps) {
-			fmt.Println("  " + warn("no endpoint #%d (have %d)", n, len(eps)))
-			return true
-		}
-		target = eps[n-1]
-	}
-
-	prev := client.Endpoint()
-	client.SetEndpoint(target)
-	rec.Event("endpoint_change", map[string]any{"from": prev, "to": client.Endpoint()})
-	fmt.Printf("  %sENDPOINT%s %s → %s\n", cFaint, cReset, prev, client.Endpoint())
-
-	// If discovery learned which model this endpoint serves, select it too.
-	if m := client.EndpointModel(client.Endpoint()); m != "" && m != client.Model() {
-		client.SetModel(m)
-		rec.Event("model_change", map[string]any{"from": prev, "to": m, "via": "endpoint"})
-		fmt.Printf("  %sMODEL%s → %s\n", cFaint, cReset, m)
-	}
-
-	if discover {
-		for _, n := range reconcileModel(client, rec) {
-			fmt.Println("  " + n)
-		}
-	}
-	return true
-}
-
-// handleDiscoverCmd runs native Slurm discovery (squeue → scontrol → job log /
-// startup script → HTTP probe), refreshes the endpoint list from the result, and
-// prints a picker. Addresses go stale on requeue/preemption, so it is re-run on
-// demand and never cached.
-func handleDiscoverCmd(line string, client *Client, rec *Recorder, cfg Config) bool {
-	if _, ok := commandArg(line, "/discover", "/disc"); !ok {
-		return false
-	}
-
-	fmt.Println(" " + faint("%s DISCOVER  squeue → scontrol → logs → probe…", gNone))
-	res, err := discoverSlurm(cfg.Reservation, cfg.DiscoverUser, cfg.Scheme)
-	if err != nil {
-		fmt.Println("  " + warn("%v", err))
-		rec.Event("discover", map[string]any{"error": err.Error()})
-		return true
-	}
-
-	// Refresh endpoints (only ones with a resolved port) and remember the model
-	// each serves. Kept in discovery order so the picker index matches /endpoint.
-	var urls []string
-	for _, m := range res.Models {
-		if m.Endpoint() == "" {
-			continue
-		}
-		u := m.baseURL(cfg.Scheme)
-		urls = append(urls, u)
-		client.SetEndpointModel(u, m.modelName())
-	}
-	client.SetEndpoints(urls)
-	rec.Event("discover", map[string]any{"count": len(res.Models), "usable": len(urls), "reservation": cfg.Reservation})
-
-	eyebrow("discovered")
-	for _, w := range res.Warnings {
-		fmt.Println("  " + faint("! %s", w))
-	}
-	idx := 0
-	for _, m := range res.Models {
-		if m.Port == 0 {
-			continue // a running job with no inference server — not a model
-		}
-		idx++
-		detail := m.display()
-		if m.Engine != "" {
-			detail += "  " + faint("%s", m.Engine)
-		}
-		if m.MaxModelLen > 0 {
-			detail += "  " + faint("ctx %d", m.MaxModelLen)
-		}
-		if m.GpuCount > 0 {
-			detail += "  " + faint("%d gpu", m.GpuCount)
-		}
-		fmt.Printf("  %s %2d  %s:%d  %s\n", healthGlyph(m.Health), idx, m.Node, m.Port, detail)
-	}
-	if idx == 0 {
-		fmt.Println("  " + faint("no models found"))
-	} else {
-		fmt.Println("  " + faint("switch: /endpoint <n>  (endpoint + model applied together)"))
-	}
-	return true
-}
-
-// endpointProbe is the reachability result for one endpoint.
-type endpointProbe struct {
-	up     bool
-	models []ModelInfo // present only if /models answered 200
-}
-
-func (p endpointProbe) glyph() string {
-	if !p.up {
-		return cRed + gDown + cReset // ✕ down
-	}
-	return cGreen + gUp + cReset // ● up
-}
-
-// detail renders the right-hand description. For the current endpoint it names
-// the selected model; otherwise it shows any models the probe happened to see.
-func (p endpointProbe) detail(isCurrent bool, currentModel string) string {
-	if !p.up {
-		return faint("down")
-	}
-	switch {
-	case isCurrent:
-		return faint("%s", currentModel)
-	case len(p.models) == 1:
-		d := p.models[0].ID
-		if extra := describeModel(p.models[0]); extra != "" {
-			d += "  " + faint("%s", extra)
-		}
-		return d
-	case len(p.models) > 1:
-		return faint("%d models", len(p.models))
-	default:
-		return faint("up")
-	}
-}
-
-// probeEndpoints reachability-checks every endpoint concurrently (bounded by the
-// per-request timeout in ProbeHealth), preserving input order.
-func probeEndpoints(client *Client, eps []string) []endpointProbe {
-	out := make([]endpointProbe, len(eps))
-	var wg sync.WaitGroup
-	for i, e := range eps {
-		wg.Add(1)
-		go func(i int, e string) {
-			defer wg.Done()
-			up, m := client.ProbeHealth(e)
-			out[i] = endpointProbe{up: up, models: m}
-		}(i, e)
-	}
-	wg.Wait()
-	return out
-}
-
-// commandArg matches a slash command (or its aliases) and returns its trimmed
-// argument. It requires either an exact match or a space-separated argument, so
-// "/endpoints" does not match "/endpoint".
-func commandArg(line string, names ...string) (string, bool) {
-	for _, name := range names {
-		if line == name {
-			return "", true
-		}
-		if strings.HasPrefix(line, name+" ") {
-			return strings.TrimSpace(line[len(name):]), true
-		}
-	}
-	return "", false
-}
-
-func findModel(ms []ModelInfo, id string) (ModelInfo, bool) {
-	for _, m := range ms {
-		if m.ID == id {
-			return m, true
-		}
-	}
-	return ModelInfo{}, false
-}
-
-// describeModel renders the status detail of a served model (context window,
-// backend). Empty when the server exposes neither.
-func describeModel(m ModelInfo) string {
-	var bits []string
-	if m.MaxLen > 0 {
-		bits = append(bits, fmt.Sprintf("ctx %d", m.MaxLen))
-	}
-	if m.OwnedBy != "" {
-		bits = append(bits, m.OwnedBy)
-	}
-	return strings.Join(bits, ", ")
-}
-
-// modelTable renders one status line per served model: a green ● means served/
-// ready, a bold → marks the current selection, followed by its detail.
-func modelTable(ms []ModelInfo, current string) []string {
-	lines := make([]string, 0, len(ms))
-	for _, m := range ms {
-		mark := " "
-		if m.ID == current {
-			mark = cBold + "→" + cReset
-		}
-		line := fmt.Sprintf("  %s%s%s %s %s", cGreen, gUp, cReset, mark, m.ID)
-		if d := describeModel(m); d != "" {
-			line += "  " + faint("%s", d)
-		}
-		lines = append(lines, line)
-	}
-	return lines
-}
-
-// readyLine is the banner status for the active model.
-func readyLine(m ModelInfo) string {
-	s := statusText(cGreen, gUp, "ready")
-	if d := describeModel(m); d != "" {
-		s += " " + faint("— %s", d)
-	}
-	return s
-}
-
-// handleThinkCmd toggles whether model reasoning is expanded or collapsed to a
-// compact marker. /think toggles; /think on|off sets it explicitly.
-func handleThinkCmd(line string, show *bool, lastReason string, rec *Recorder) bool {
-	arg, ok := commandArg(line, "/think")
-	if !ok {
-		return false
-	}
-	if arg == "last" {
-		if strings.TrimSpace(lastReason) == "" {
-			fmt.Println("  " + faint("no reasoning captured for the last answer"))
-			return true
-		}
-		eyebrow("reasoning · last answer")
-		for _, ln := range strings.Split(lastReason, "\n") {
-			fmt.Println("  " + faint("%s", ln))
-		}
-		return true
-	}
-	switch arg {
-	case "on", "show", "expand":
-		*show = true
-	case "off", "hide", "collapse":
-		*show = false
-	case "", "toggle":
-		*show = !*show
-	default:
-		fmt.Println("  " + faint("usage: /think [on|off]"))
-		return true
-	}
-	state := "collapsed"
-	if *show {
-		state = "expanded"
-	}
-	rec.Event("think_mode", map[string]any{"show": *show})
-	kv("reasoning", strings.ToUpper(state))
-	return true
-}
-
-// handleUnsafeCmd toggles unsafe mode: the realpath jail and command allowlist
-// are turned off (any path, any command via a shell). Loudly warned + audited.
-func handleUnsafeCmd(line string, jail *Jail, rec *Recorder) bool {
-	arg, ok := commandArg(line, "/unsafe")
-	if !ok {
-		return false
-	}
-	switch arg {
-	case "on":
-		jail.Unsafe = true
-	case "off":
-		jail.Unsafe = false
-	case "", "toggle":
-		jail.Unsafe = !jail.Unsafe
-	default:
-		fmt.Println("  " + faint("usage: /unsafe [on|off]"))
-		return true
-	}
-	rec.Event("unsafe_mode", map[string]any{"on": jail.Unsafe})
-	if jail.Unsafe {
-		fmt.Println("  " + cBlood + "⚠ UNSAFE ON" + cReset + faint(" — jail + allowlist OFF: any path, any command"))
-	} else {
-		kv("unsafe", "OFF")
-	}
-	return true
-}
-
-// handleContextCmd prints what the transcript costs and whether the prefix is
-// currently cache-aligned, plus the biggest tool outputs eating the budget.
-func handleContextCmd(line string, msgs []Message, ctxTokens int) bool {
-	if _, ok := commandArg(line, "/context"); !ok {
-		return false
-	}
-	tok := estimateTokens(msgs)
-	eyebrow("context")
-	kv("messages", strconv.Itoa(len(msgs)))
-	pct := 0
-	if ctxTokens > 0 {
-		pct = tok * 100 / ctxTokens
-	}
-	kv("tokens", fmt.Sprintf("~%s of ~%s budget (%d%%)", kfmt(tok), kfmt(ctxTokens), pct))
-	if ctxTokens <= 0 || tok <= ctxTokens {
-		kv("cache", statusText(cGreen, gUp, "aligned")+faint(" prefix sent byte-identical — KV cache stays warm"))
-	} else {
-		kv("cache", statusText(cYellow, gPartial, "compressing")+faint(" over budget — prefix rewritten to fit"))
-	}
-
-	// The biggest tool outputs still carried in full.
-	type item struct {
-		label string
-		bytes int
-	}
-	var items []item
-	for _, m := range msgs {
-		if name, path, ok := toolResultKey(m); ok && !isStub(m.Content) {
-			lbl := name
-			if path != "" {
-				lbl += " " + path
-			}
-			items = append(items, item{lbl, len(m.Content)})
-		}
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].bytes > items[j].bytes })
-	if len(items) > 0 {
-		fmt.Println("  " + faint("largest tool outputs:"))
-		for i, it := range items {
-			if i == 5 {
-				break
-			}
-			contValue(faint("%-7s %s", byteCount(it.bytes), it.label))
-		}
-	}
-	return true
-}
-
-const compactInstruction = "Summarize the conversation below into a compact, factual brief that preserves: " +
-	"the user's goal and constraints; key decisions and why; files created/edited and how; " +
-	"commands run and their outcomes; and any open tasks or next steps. " +
-	"Write it so work can continue from the brief alone. Be concise. Output only the brief."
-
-// handleCompactCmd replaces the transcript with an LLM-generated summary,
-// reclaiming context on a long session while keeping the thread of work. The
-// system prompt is preserved; file backups (/undo) are untouched.
-func handleCompactCmd(line string, client *Client, rec *Recorder, msgs *[]Message) bool {
-	if _, ok := commandArg(line, "/compact"); !ok {
-		return false
-	}
-	if len(*msgs) <= 2 {
-		fmt.Println("  " + faint("nothing to compact yet"))
-		return true
-	}
-	before := estimateTokens(*msgs)
-	fmt.Println(" " + faint("%s compacting conversation…", gNone))
-
-	var b strings.Builder
-	for _, m := range (*msgs)[1:] { // skip the system prompt
-		b.WriteString(strings.ToUpper(m.Role) + ": " + m.Content + "\n\n")
-	}
-	summary, err := client.Complete([]Message{
-		{Role: "system", Content: "You compress coding-assistant conversations into a compact, factual brief."},
-		{Role: "user", Content: compactInstruction + "\n\n---\n" + b.String()},
-	})
-	if summary = strings.TrimSpace(summary); err != nil || summary == "" {
+	orch.rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
+	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: prompt})
+	if check == "" {
+		err := sess.Run(context.Background())
+		sess.saveTranscript()
 		if err != nil {
-			toolErr("compact failed: " + err.Error())
-		} else {
-			toolErr("compact produced no summary")
+			return 1
 		}
-		return true
+		return 0
 	}
-	*msgs = []Message{
-		(*msgs)[0],
-		{Role: "user", Content: "[Earlier conversation compacted to save context]\n\n" + summary},
+	start := time.Now()
+	v := sess.RunVerified(context.Background(), check, orch.verifyAttempts())
+	sess.traceTask(prompt, v, check, 0, 0, false, start)
+	sess.saveTranscript()
+	fmt.Fprintf(os.Stderr, "\n%s  %s\n", statusWord(v.Status), faint("%s · %s", check, plural(v.Attempts, "attempt", "attempts")))
+	if v.Status != "passed" {
+		if v.Tail != "" {
+			fmt.Fprintln(os.Stderr, v.Tail)
+		}
+		return 1
 	}
-	after := estimateTokens(*msgs)
-	rec.Event("compact", map[string]any{"before_tokens": before, "after_tokens": after})
-	rec.Transcript(*msgs)
-	kv("compact", fmt.Sprintf("~%s → ~%s tokens", kfmt(before), kfmt(after)))
-	return true
+	return 0
 }
 
-// handleHelpCmd prints a grouped cheat sheet of every command and key binding.
-func handleHelpCmd(line string) bool {
-	if _, ok := commandArg(line, "/help"); !ok {
-		if strings.TrimSpace(line) != "/?" {
-			return false
-		}
+func fatal(err error) {
+	fmt.Fprintln(os.Stderr, cRed+gDown+cReset+" "+err.Error())
+	if h := errorHint(err); h != "" {
+		fmt.Fprintln(os.Stderr, cFaint+"↳ "+h+cReset)
 	}
-	type item struct{ syntax, desc string }
-	groups := []struct {
-		title string
-		items []item
-	}{
-		{"session", []item{
-			{"/resume [list|<n>]", "continue a previous session"},
-			{"/compact", "summarize the thread to reclaim context"},
-			{"/reset", "clear the transcript (and change log)"},
-			{"/exit", "quit"},
-		}},
-		{"model & endpoint", []item{
-			{"/model [<name>]", "show / set the model"},
-			{"/endpoint [<n>|url]", "list / switch endpoints"},
-			{"/discover", "find live models on the cluster"},
-		}},
-		{"turn", []item{
-			{"/retry", "regenerate the last turn"},
-			{"/edit", "amend & resend the last message"},
-		}},
-		{"context & review", []item{
-			{"/context", "size, cache-alignment, biggest outputs"},
-			{"/diff", "review files the agent changed"},
-			{"/undo", "revert the agent's last change"},
-		}},
-		{"modes", []item{
-			{"/approve [on|off|run|edit]", "approval gate"},
-			{"/think [on|off|last]", "model reasoning display"},
-			{"/loop [on|off]", "autonomous: run until TASK_DONE"},
-			{"/unsafe [on|off]", "disable jail + allowlist (danger)"},
-		}},
-	}
-	eyebrow("commands")
-	for _, g := range groups {
-		fmt.Printf("  %s%s%s\n", cFaint, g.title, cReset)
-		for _, it := range g.items {
-			fmt.Printf("    %-26s %s\n", it.syntax, faint("%s", it.desc))
-		}
-	}
-	fmt.Println("  " + faint("input") + "  @path attaches a file · Enter submits · \\ newline · ↑/↓ history")
-	fmt.Println("         " + faint("Ctrl-C interrupts the model · type ahead while it streams"))
-	return true
+	os.Exit(1)
 }
 
-// handleResumeCmd reloads a previous session's transcript. "/resume" resumes the
-// most recent one; "/resume list" shows a picker; "/resume <n>" picks the nth.
-func handleResumeCmd(line string, cfg Config, rec *Recorder, msgs *[]Message) bool {
-	arg, ok := commandArg(line, "/resume")
-	if !ok {
-		return false
-	}
-	sessions := listSessions(filepath.Join(cfg.Dir, "transcripts"), rec.SessionPath())
-	if len(sessions) == 0 {
-		fmt.Println("  " + faint("no previous sessions found"))
-		return true
-	}
-	if arg == "list" || arg == "ls" {
-		eyebrow("previous sessions")
-		for _, l := range sessionLines(sessions) {
-			fmt.Println(l)
-		}
-		fmt.Println("  " + faint("resume with /resume <n>  (default = most recent)"))
-		return true
-	}
-	idx := 0
-	if arg != "" {
-		n, err := strconv.Atoi(arg)
-		if err != nil || n < 1 || n > len(sessions) {
-			fmt.Println("  " + faint("usage: /resume [list|<n>]"))
-			return true
-		}
-		idx = n - 1
-	}
-	restored, err := resumeInto(msgs, sessions[idx])
+// setupOrchestrator builds everything a run needs from cfg: jail (with the
+// roles.yaml sandbox allowlist), file config, roles (validated against the
+// gateway's /v1/models), recorder and trace. tracePath "" = the default
+// $LCA_DIR/traces/<session>.jsonl.
+func setupOrchestrator(cfg Config, ap *Approver, tracePath string) (*Orchestrator, error) {
+	roles, err := loadRoles(cfg)
 	if err != nil {
-		toolErr("resume failed: " + err.Error())
-		return true
+		return nil, fmt.Errorf("roles: %w", err)
 	}
-	rec.Event("resume", map[string]any{"from": sessions[idx].id, "messages": restored})
-	rec.Transcript(*msgs)
-	kv("resumed", fmt.Sprintf("%s  ·  %d messages", sessionWhen(sessions[idx].id), restored))
-	return true
-}
-
-// handleDiffCmd shows a per-file diff of everything the agent changed this
-// session (first-touch state → current on disk).
-func handleDiffCmd(line string) bool {
-	if _, ok := commandArg(line, "/diff"); !ok {
-		return false
+	if len(roles.Roles) == 0 {
+		roles = nil
 	}
-	diffs := sessionDiffs()
-	if len(diffs) == 0 {
-		fmt.Println("  " + faint("no file changes this session"))
-		return true
+	allowed := cfg.Allowed
+	if roles != nil && len(roles.Allow) > 0 {
+		allowed = roles.Allow
 	}
-	eyebrow("changes this session")
-	for _, l := range diffs {
-		fmt.Println(l)
-	}
-	return true
-}
-
-// handleUndoCmd reverts the most recent applied edit/write.
-func handleUndoCmd(line string, rec *Recorder) bool {
-	if _, ok := commandArg(line, "/undo"); !ok {
-		return false
-	}
-	msg, ok := undoLast()
-	if !ok {
-		fmt.Println("  " + faint("nothing to undo"))
-		return true
-	}
-	rec.Event("undo", map[string]any{"result": msg})
-	if strings.HasPrefix(msg, "error") {
-		toolErr(msg)
-	} else {
-		toolOK(msg)
-	}
-	return true
-}
-
-// handleLoopCmd toggles autonomous loop mode. /loop toggles; /loop on|off sets.
-func handleLoopCmd(line string, loop *bool, rec *Recorder) bool {
-	arg, ok := commandArg(line, "/loop")
-	if !ok {
-		return false
-	}
-	switch arg {
-	case "on":
-		*loop = true
-	case "off":
-		*loop = false
-	case "", "toggle":
-		*loop = !*loop
-	default:
-		fmt.Println("  " + faint("usage: /loop [on|off]"))
-		return true
-	}
-	state := "OFF"
-	if *loop {
-		state = "ON — agent runs until TASK_DONE"
-	}
-	rec.Event("loop_mode", map[string]any{"on": *loop})
-	kv("loop", state)
-	return true
-}
-
-// handleApproveCmd processes the /approve REPL command (on|off|status). Returns
-// true if the line was such a command and has been handled.
-func handleApproveCmd(line string, ap *Approver, rec *Recorder) bool {
-	if !strings.HasPrefix(line, "/approve") {
-		return false
-	}
-	arg := strings.TrimSpace(strings.TrimPrefix(line, "/approve"))
-	switch arg {
-	case "on", "all":
-		ap.TrustAll()
-	case "off":
-		ap.Clear()
-	case "run":
-		ap.Trust("run")
-	case "edit", "write":
-		ap.Trust("edit")
-	case "", "status":
-		kv("approve", strings.ToUpper(ap.Mode()))
-		return true
-	default:
-		fmt.Println("  " + faint("usage: /approve [on|off|run|edit|status]"))
-		return true
-	}
-	rec.Event("approve_mode", map[string]any{"trusted": ap.TrustedClasses()})
-	kv("approve", strings.ToUpper(ap.Mode()))
-	return true
-}
-
-// runTurn drives the agentic loop for one user message: stream the model, execute
-// any tool blocks, feed results back, repeat until the model stops emitting
-// tools (a final answer) or we hit the step cap.
-// looksLikeStrayEdit reports whether a reply describes a file change in a format
-// that does NOT apply — a diff fence, unified diff, or SEARCH/REPLACE markers —
-// rather than an <edit>/<write> tool call. Kept to strong signals to avoid
-// nudging a legitimate "show me a diff" answer.
-func looksLikeStrayEdit(s string) bool {
-	switch {
-	case strings.Contains(s, "```diff"):
-		return true
-	case strings.Contains(s, "<<<<<<< SEARCH"), strings.Contains(s, ">>>>>>> REPLACE"):
-		return true
-	case strings.Contains(s, "\n@@ ") && (strings.Contains(s, "\n--- ") || strings.Contains(s, "\n+++ ")):
-		return true
-	}
-	return false
-}
-
-// looksStalled reports whether a no-tool reply seems to have announced a next
-// step without doing it — its last non-empty line trails off on a colon or an
-// ellipsis. Used only to auto-continue a stalled turn (bounded).
-func looksStalled(s string) bool {
-	lines := strings.Split(s, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if t := strings.TrimSpace(lines[i]); t != "" {
-			return strings.HasSuffix(t, ":") || strings.HasSuffix(t, "…") || strings.HasSuffix(t, "...")
-		}
-	}
-	return false
-}
-
-const doneMarker = "TASK_DONE"
-
-// lastUserTurn is the index of the most recent real user message (not a synthetic
-// tool_result), or -1 if there is none — the anchor for /retry and /edit.
-func lastUserTurn(msgs []Message) int {
-	for i := len(msgs) - 1; i >= 1; i-- {
-		if msgs[i].Role == "user" && !strings.HasPrefix(msgs[i].Content, "<tool_result") {
-			return i
-		}
-	}
-	return -1
-}
-
-// ctxBudget resolves the trim budget in tokens. An explicit LCA_CTX_TOKENS wins;
-// otherwise we derive it from the model's real context window (reserving ~25%
-// for the reply), so we only compress near the true limit and keep the KV cache
-// warm as long as possible. Falls back to 24k when the window is unknown.
-func ctxBudget(explicit, modelCtxLen int) int {
-	if explicit > 0 {
-		return explicit
-	}
-	if modelCtxLen > 0 {
-		return modelCtxLen * 3 / 4
-	}
-	return 24000
-}
-
-// printPerf prints a dim one-line performance summary after a streamed step:
-// prompt tokens and how many hit the server's KV prefix cache (the payoff of
-// keeping the prefix byte-stable), completion tokens, decode throughput, and
-// time-to-first-token. Silent when the server reports no usage.
-func printPerf(u Usage) {
-	if u.PromptTokens == 0 && u.CompletionTokens == 0 {
-		return
-	}
-	var parts []string
-	if u.PromptTokens > 0 {
-		s := kfmt(u.PromptTokens) + "↑"
-		if u.CachedTokens > 0 {
-			s += fmt.Sprintf(" %d%% cached", u.CacheHitPct())
-		}
-		parts = append(parts, s)
-	}
-	if u.CompletionTokens > 0 {
-		parts = append(parts, kfmt(u.CompletionTokens)+"↓")
-	}
-	if tps := u.TokPerSec(); tps > 0 {
-		parts = append(parts, fmt.Sprintf("%d tok/s", tps))
-	}
-	if u.TTFT > 0 {
-		parts = append(parts, "ttft "+fmtDurShort(u.TTFT))
-	}
-	fmt.Println(" " + faint("%s %s", gNone, strings.Join(parts, "  ·  ")))
-}
-
-// kfmt formats a token count compactly: 873, 12.3k, 128k.
-func kfmt(n int) string {
-	switch {
-	case n < 1000:
-		return strconv.Itoa(n)
-	case n < 10000:
-		return fmt.Sprintf("%.1fk", float64(n)/1000)
-	default:
-		return strconv.Itoa(n/1000) + "k"
-	}
-}
-
-func fmtDurShort(d time.Duration) string {
-	if d < time.Second {
-		return fmt.Sprintf("%dms", d.Milliseconds())
-	}
-	return fmt.Sprintf("%.1fs", d.Seconds())
-}
-
-func runTurn(client *Client, jail *Jail, ap *Approver, rec *Recorder, msgs *[]Message, maxSteps, ctxTokens int, raw, showThink, loop, interactive bool, lastReason *string) {
-	*lastReason = ""    // reasoning captured this turn, for /think last
-	continuing := false // the previous step was cut off by length; continue it
-	nudges := 0         // times we asked the model to redo a stray diff as a tool call
-	for step := 0; step < maxSteps; step++ {
-		pw := newProseWriter(raw, showThink)
-
-		send, trimmed := trimForContext(*msgs, ctxTokens)
-		if trimmed > 0 {
-			fmt.Println(" " + faint("%s CONTEXT  trimmed %d old tool outputs (~%dk budget)", gNone, trimmed, ctxTokens/1000))
-			rec.Event("context_trim", map[string]any{"collapsed": trimmed, "budget_tokens": ctxTokens})
-		}
-		// A cancelable context + a scoped SIGINT handler let Ctrl-C abort a runaway
-		// generation or loop mid-flight (the terminal is in cooked mode between
-		// prompts, so Ctrl-C arrives as a signal). No terminal redraws involved.
-		ctx, cancel := context.WithCancel(context.Background())
-		var interrupted atomic.Bool
-		var sigch chan os.Signal
-		if interactive {
-			sigch = make(chan os.Signal, 1)
-			signal.Notify(sigch, os.Interrupt)
-			go func() {
-				select {
-				case <-sigch:
-					interrupted.Store(true)
-					cancel()
-				case <-ctx.Done():
-				}
-			}()
-		}
-		reply, finish, usage, err := client.CompleteStream(ctx, send, pw.feed, pw.feedReasoning, continuing)
-		if sigch != nil {
-			signal.Stop(sigch)
-		}
-		cancel() // ends the watcher goroutine
-		pw.end()
-		printPerf(usage)
-		if usage.PromptTokens > 0 {
-			rec.Event("usage", map[string]any{
-				"prompt": usage.PromptTokens, "cached": usage.CachedTokens,
-				"completion": usage.CompletionTokens, "tok_s": usage.TokPerSec(),
-			})
-		}
-		if len(pw.reasonLog) > 0 {
-			if *lastReason != "" {
-				*lastReason += "\n"
-			}
-			*lastReason += strings.Join(pw.reasonLog, "\n")
-		}
-
-		// On a continuation, append verbatim to the same assistant message so a
-		// tool block that was split by the length limit reassembles; otherwise
-		// start a new assistant message. (Keep the partial reply on interrupt too,
-		// so the transcript alternates cleanly.)
-		if continuing {
-			(*msgs)[len(*msgs)-1].Content += reply
-		} else if reply != "" || !interrupted.Load() {
-			*msgs = append(*msgs, Message{Role: "assistant", Content: reply})
-		}
-		continuing = false
-
-		if interrupted.Load() {
-			fmt.Println(" " + faint("%s interrupted", gNone))
-			rec.Event("interrupt", map[string]any{"partial_bytes": len(reply)})
-			rec.Transcript(*msgs)
-			return
-		}
-		if err != nil {
-			fmt.Println(" " + cRed + gDown + " ENDPOINT ERROR" + cReset + " " + err.Error())
-			rec.Event("error", map[string]any{"err": err.Error()})
-			return
-		}
-		full := (*msgs)[len(*msgs)-1].Content
-
-		blocks := ParseBlocks(full)
-		if len(blocks) == 0 {
-			// Cut off by the length limit mid-thought with no usable tool call —
-			// continue the same message automatically instead of ending the turn
-			// and making the user type "continue".
-			if finish == "length" {
-				fmt.Println(" " + faint("%s response truncated — continuing…", gNone))
-				rec.Event("auto_continue", map[string]any{"finish": finish})
-				continuing = true
-				continue
-			}
-			// Loop mode: keep working autonomously until the model signals it is
-			// finished with TASK_DONE (or we hit the step cap). Not bounded by the
-			// heuristic nudge counter — this is an explicit, opt-in mode.
-			if loop && !strings.Contains(full, doneMarker) {
-				fmt.Println(" " + faint("%s loop — continuing…", gNone))
-				rec.Event("loop_continue", nil)
-				*msgs = append(*msgs, Message{Role: "user", Content: "Keep going — take the next action and emit its tool tag. When the ENTIRE task is truly finished, reply with just " + doneMarker + " on its own line."})
-				rec.Transcript(*msgs)
-				continue
-			}
-			// The model described a change as a diff / code block instead of an
-			// <edit>/<write> tag, so nothing was applied — ask it to redo it as a
-			// real tool call (bounded, so a genuine "show me a diff" answer ends).
-			if nudges < 2 && looksLikeStrayEdit(full) {
-				nudges++
-				fmt.Println(" " + faint("%s that was a diff, not an edit — asking for a tool call…", gNone))
-				rec.Event("nudge_edit", nil)
-				*msgs = append(*msgs, Message{Role: "user", Content: "That change was shown as a diff / code block, which does NOT modify any file. Redo it now as an <edit> or <write> tool call exactly per the protocol, then stop."})
-				rec.Transcript(*msgs)
-				continue
-			}
-			// The model announced a next step but didn't emit a tool call (its
-			// message trails off) — nudge it to actually act (bounded).
-			if nudges < 2 && looksStalled(full) {
-				nudges++
-				fmt.Println(" " + faint("%s continuing…", gNone))
-				rec.Event("nudge_continue", nil)
-				*msgs = append(*msgs, Message{Role: "user", Content: "Continue with the next step now — emit the tool tag for it. Do not stop until the task is done."})
-				rec.Transcript(*msgs)
-				continue
-			}
-			return // final answer
-		}
-
-		results := executeBlocks(jail, ap, rec, blocks)
-		*msgs = append(*msgs, Message{Role: "user", Content: results})
-		rec.Transcript(*msgs)
-	}
-	fmt.Println(" " + warn("%s STOPPED — hit %d-step cap", gPartial, maxSteps))
-	rec.Event("step_cap", map[string]any{"steps": maxSteps})
-}
-
-func executeBlocks(jail *Jail, ap *Approver, rec *Recorder, blocks []Block) string {
-	var out strings.Builder
-	for _, b := range blocks {
-		var res string
-		switch b.Name {
-		case "read_file":
-			toolLine("read_file", b.Attr["path"])
-			res = readFile(jail, b.Attr["path"], b.Attr["lines"])
-			rec.Event("read_file", map[string]any{"path": b.Attr["path"], "result": summarize(res)})
-		case "grep":
-			toolLine("grep", fmt.Sprintf("%q %s", b.Attr["pattern"], b.Attr["path"]))
-			res = grepTree(jail, b.Attr["pattern"], b.Attr["path"])
-			rec.Event("grep", map[string]any{"pattern": b.Attr["pattern"], "path": b.Attr["path"], "result": summarize(res)})
-		case "list_dir":
-			toolLine("list_dir", b.Attr["path"])
-			res = listDir(jail, b.Attr["path"])
-			rec.Event("list_dir", map[string]any{"path": b.Attr["path"]})
-		case "edit":
-			res = gatedEdit(jail, ap, rec, b)
-		case "write":
-			res = gatedWrite(jail, ap, rec, b)
-		case "run_command":
-			res = gatedRun(jail, ap, rec, b)
-		default:
-			res = "error: unknown tool " + b.Name
-		}
-		printOutcome(b.Name, res)
-		fmt.Fprintf(&out, "<tool_result name=\"%s\" path=\"%s\">\n%s\n</tool_result>\n",
-			b.Name, b.Attr["path"], res)
-	}
-	return out.String()
-}
-
-// printOutcome shows a one-line result under a tool's marker: counts for the
-// read-only tools, a status glyph for the side-effecting ones.
-func printOutcome(name, res string) {
-	if strings.HasPrefix(res, "error:") {
-		toolErr(strings.TrimSpace(strings.TrimPrefix(res, "error:")))
-		return
-	}
-	switch name {
-	case "read_file":
-		n := lineCount(res) - 1 // minus the "path:" header line
-		if n < 0 {
-			n = 0
-		}
-		toolInfo(plural(n, "line", "lines"))
-	case "grep":
-		if res == "no matches" {
-			toolInfo("no matches")
-		} else {
-			toolInfo(plural(lineCount(res), "match", "matches"))
-		}
-	case "list_dir":
-		n := lineCount(res) - 1 // minus the header line
-		if n < 0 {
-			n = 0
-		}
-		toolInfo(plural(n, "entry", "entries"))
-	default: // edit / write / run_command
-		switch {
-		case strings.HasPrefix(res, "user denied"):
-			toolInfo("denied")
-		case name == "run_command":
-			// output + exit status were already streamed live by runCommand
-		default:
-			toolOK(summarize(res))
-		}
-	}
-}
-
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return "1 " + one
-	}
-	return fmt.Sprintf("%d %s", n, many)
-}
-
-// lineCount counts non-empty lines in a tool result (an at-a-glance hint).
-func lineCount(s string) int {
-	n := 0
-	for _, ln := range strings.Split(s, "\n") {
-		if strings.TrimSpace(ln) != "" {
-			n++
-		}
-	}
-	return n
-}
-
-func gatedEdit(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
-	abs, err := jail.Resolve(b.Attr["path"])
+	jail, err := NewJail(cfg.Root, allowed, cfg.Unsafe)
 	if err != nil {
-		rec.Event("edit", map[string]any{"path": b.Attr["path"], "error": err.Error()})
-		return "error: " + err.Error()
+		return nil, fmt.Errorf("jail init failed: %w", err)
 	}
-	approved, auto := ap.Confirm("edit", "EDIT "+b.Attr["path"], unifiedPreview(b.Search, b.Replace))
-	if !approved {
-		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": false})
-		return "user denied this edit"
+	if roles != nil && roles.Shell {
+		jail.Shell = true
 	}
-	before, existed := snapshot(abs)
-	res, err := applyEdit(abs, b.Attr["path"], b.Search, b.Replace)
+	fc, err := loadFileConfig(cfg)
 	if err != nil {
-		rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
-		return "error: " + err.Error()
+		return nil, fmt.Errorf("config: %w", err)
 	}
-	recordChange(b.Attr["path"], abs, "edit", before, existed)
-	rec.Event("edit", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "result": res})
-	return res
-}
-
-func gatedWrite(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
-	abs, err := jail.Resolve(b.Attr["path"])
+	rec, err := NewRecorder(cfg)
 	if err != nil {
-		rec.Event("write", map[string]any{"path": b.Attr["path"], "error": err.Error()})
-		return "error: " + err.Error()
+		return nil, fmt.Errorf("recorder init failed: %w", err)
 	}
-	action := "overwrite"
-	if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
-		action = "create"
+	if tracePath == "" {
+		tracePath = filepath.Join(cfg.stateDir(), "traces", rec.id+".jsonl")
 	}
-	preview := fmt.Sprintf("  %s %s (%d bytes)", action, b.Attr["path"], len(b.Body))
-	approved, auto := ap.Confirm("write", strings.ToUpper(action)+" "+b.Attr["path"], preview)
-	if !approved {
-		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": false})
-		return "user denied this write"
-	}
-	before, existed := snapshot(abs)
-	res, err := writeWholeFile(abs, b.Attr["path"], b.Body)
+	tracer, err := NewTracer(tracePath)
 	if err != nil {
-		rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "error": err.Error()})
-		return "error: " + err.Error()
+		rec.Close()
+		return nil, fmt.Errorf("trace: %w", err)
 	}
-	recordChange(b.Attr["path"], abs, "write", before, existed)
-	rec.Event("write", map[string]any{"path": b.Attr["path"], "approved": true, "auto": auto, "bytes": len(b.Body)})
-	return res
-}
-
-func gatedRun(jail *Jail, ap *Approver, rec *Recorder, b Block) string {
-	cmd := strings.TrimSpace(b.Body)
-	approved, auto := ap.Confirm("run_command", "RUN", "  $ "+cmd)
-	if !approved {
-		rec.Event("run_command", map[string]any{"cmd": cmd, "approved": false})
-		return "user denied this command"
+	local := NewClient(cfg)
+	var warns []string
+	gwModels := -1
+	if roles != nil {
+		warns, gwModels = validateRoleModels(roles, local)
 	}
-	res := runCommand(jail, cmd)
-	rec.Event("run_command", map[string]any{"cmd": cmd, "approved": true, "auto": auto, "result": summarize(res)})
-	return res
+	orch := NewOrchestrator(cfg, fc, jail, ap, rec, local, roles, tracer)
+	orch.gatewayModels = gwModels
+	if roles != nil {
+		warns = append(warns, roles.Warnings...)
+	}
+	orch.warnings = append(warns, orch.warnings...)
+	return orch, nil
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `BEHELIT — approval-first CLI coding agent for local LLM endpoints.
-
-usage:
-  lca                 start interactive REPL
-  lca [-y] "<prompt>" run a single turn and exit (one-shot)
-
-flags:
-  -y, -yes            auto-approve side-effecting actions (edit/write/run_command)
-  -unsafe             disable the jail + command allowlist (any path, any command)
-  -resume             resume the most recent previous session
-
-config is via environment (see README): LCA_BASE_URL, LCA_MODEL, LCA_ROOT,
-LCA_ALLOW, LCA_DIR, LCA_CTX_TOKENS.
-`)
-}
-
-func banner(cfg Config, jail *Jail, rec *Recorder, ap *Approver, client *Client, notes []string) {
-	who := "?"
-	if u, err := user.Current(); err == nil {
-		who = fmt.Sprintf("%s · uid %s", u.Username, u.Uid)
+	b := func(s string) string { return cBold + s + cReset }
+	f := func(s string) string { return cFaint + s + cReset }
+	lines := []string{
+		"",
+		" " + b("BEHELIT") + f(" — coding agent and orchestrator for open models"),
+		"",
+		" " + f("USAGE"),
+		"   lca                          interactive session",
+		"   lca \"<task>\"                 run one task and exit",
+		"   lca -check \"<cmd>\" \"<task>\"  run one task; succeed only if <cmd> passes",
+		"   lca init                     create .lca/roles.yaml from the gateway's models",
+		"   lca doctor                   check gateway, roles, tool calling, sandbox",
+		"   lca eval tasks/              run evaluation tasks (see README)",
+		"",
+		" " + f("FLAGS"),
+		"   -role <name>                 role (roles.yaml) or agent to run as",
+		"   -model <name>                model override: gateway name or provider/model",
+		"   -y                           approve edits, commands and fetches without asking",
+		"   -resume                      continue the most recent session",
+		"   -unsafe                      lift the sandbox (any path, any command)",
+		"",
+		" " + f("SETUP"),
+		"   LCA_BASE_URL                 the gateway or endpoint, e.g. http://node:18080/v1",
+		"   .lca/roles.yaml              the team: roles, model chains, tools (lca init writes one)",
+		"   DEEPSEEK_API_KEY, …          keys for hosted presets, when not using a gateway",
+		"",
+		" " + f("All settings: README.md. In a session, /help lists the commands."),
+		"",
 	}
-
-	fmt.Println()
-	printBehelit()
-	fmt.Println()
-
-	kv("user", who)
-	kv("jail", jail.Root)
-	if name, _, ok := loadProjectInstructions(jail); ok {
-		kv("project", name+faint("  (instructions loaded)"))
-	}
-	endpointNote := ""
-	if len(client.Endpoints()) > 1 {
-		endpointNote = faint("  (+%d more — /endpoint)", len(client.Endpoints())-1)
-	}
-	kv("model", client.Model()+"  "+faint("@ %s", client.Endpoint())+endpointNote)
-	for _, n := range notes {
-		contValue(n)
-	}
-	kv("approve", strings.ToUpper(ap.Mode()))
-	if cfg.Loop {
-		kv("loop", "ON — agent runs until TASK_DONE")
-	}
-	if jail.Unsafe {
-		fmt.Println("  " + cFaint + "UNSAFE   " + cReset + cBlood + "⚠ jail + allowlist OFF: any path, any command" + cReset)
-	}
-	fmt.Println()
-	fmt.Println(" " + faint("Enter submit · \\ newline · /discover · /model · /think · /loop · Ctrl-C · /exit"))
+	fmt.Fprintln(os.Stderr, strings.Join(lines, "\n"))
 }
