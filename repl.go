@@ -889,12 +889,31 @@ func (r *Repl) cmdModel(arg string) bool {
 			}
 			row("tier", tier)
 		}
-		if p := s.client.Profile(); p.Family != "" {
-			row("profile", faint("%s · context %s · max output %s", p.Family, kfmt(p.Context), kfmt(min(p.Output, outputTokenMax))))
+		// Provenance, not anonymous integers: a window from the running deployment
+		// and one guessed from a sibling version look identical until they are
+		// labelled, and only one of them is worth trusting.
+		p := s.client.Profile()
+		if p.Family != "" {
+			row("profile", faint("%s · matched %q", p.Family, p.Key))
+		} else {
+			row("profile", faint("no profile for %q (normalised %q) — nothing is overridden", s.client.Model(), normalizeModelID(s.client.Model())))
+		}
+		row("context", faint("%s · budget %s", srcNum(s.client.CtxLen(), s.client.CtxSrc()), kfmt(s.budget())))
+		// What this client will actually put in max_tokens, with the reason: the
+		// window clamp can rewrite a configured budget, and a number that is
+		// rewritten has to name its source like every other number here.
+		if n, why := s.client.replyCeiling(0); n > 0 {
+			row("output", faint("max %s · this client sends %s — %s", srcNum(p.Output, p.Src.Output), kfmt(n), why))
+		} else {
+			row("output", faint("max %s · %s", srcNum(p.Output, p.Src.Output), why))
 		}
 		temp, topP, effort := s.sampling()
-		row("sampling", faint("temperature %s · top_p %s · effort %s", temp, topP, effort))
-		replay := s.client.Profile().Replay
+		row("sampling", faint("temperature %s · top_p %s · top_k %s · effort %s",
+			temp, topP, srcNum(p.TopK, p.Src.TopK), effort))
+		if p.Note != "" {
+			row("caveat", faint("%s", p.Note))
+		}
+		replay := p.Replay
 		switch replay {
 		case "all":
 			row("reasoning", faint("replayed to the model on every step (interleaved thinking)"))
@@ -933,6 +952,11 @@ func (r *Repl) cmdModel(arg string) bool {
 			local.SetEndpoint(ep)
 			r.orch.rec.Event("endpoint_change", map[string]any{"to": ep, "via": "model"})
 		}
+		// SetModel/SetEndpoint just forgot the previous model's max_model_len, so
+		// ask this one's endpoint for the new one — unconditionally, not only
+		// under -discover: without it the window falls back to the table and the
+		// budget silently changes under the operator.
+		relearnCtxLen(local)
 	}
 	s.RefreshSystem()
 	r.orch.rec.Event("model_change", map[string]any{"from": prev, "to": arg})
@@ -995,11 +1019,28 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 		row("model", m)
 	}
 	if r.cfg.Discover {
-		for _, n := range reconcileModel(client, r.orch.rec) {
+		for _, n := range reconcileModel(r.orch.providers, client, r.orch.rec) {
 			fmt.Println("  " + n)
 		}
+	} else {
+		// The new endpoint may serve the same model id with a different
+		// --max-model-len; the old window was dropped with the old baseURL.
+		relearnCtxLen(client)
 	}
 	return false
+}
+
+// relearnCtxLen asks the current endpoint what window it serves the current model
+// at, and is silent when it cannot say. The table is the fallback, never the
+// override: the running deployment is the truth about the running deployment.
+func relearnCtxLen(c *Client) {
+	models, err := c.ListModels()
+	if err != nil {
+		return
+	}
+	if info, ok := findModel(models, c.Model()); ok {
+		c.SetCtxLen(info.MaxLen)
+	}
 }
 
 func (r *Repl) cmdDiscover(string) bool {

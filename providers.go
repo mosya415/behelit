@@ -111,11 +111,15 @@ type Providers struct {
 	mu      sync.Mutex
 	clients map[string]*Client
 	shared  *http.Client
+	// What each endpoint answered on /v1/models: endpoint → normalised model id →
+	// max_model_len. An endpoint that could not answer is stored as an empty map,
+	// so "asked already" and "serves nothing" are the same fast answer.
+	windows map[string]map[string]int
 }
 
 func NewProviders(cfg Config, fc *FileConfig, local *Client) *Providers {
 	ps := &Providers{cfg: cfg, local: local, byID: map[string]*Provider{}, clients: map[string]*Client{},
-		shared: &http.Client{Timeout: 30 * time.Minute}}
+		windows: map[string]map[string]int{}, shared: &http.Client{Timeout: 30 * time.Minute}}
 	for _, p := range presetProviders() {
 		ps.add(p)
 	}
@@ -157,6 +161,51 @@ func (ps *Providers) Split(ref string) (p *Provider, model string, ok bool) {
 	return nil, ref, false
 }
 
+// LearnWindows records what an endpoint answered on /v1/models, so every client
+// built for it afterwards budgets from the running deployment rather than from a
+// model card. Learned once per endpoint and reused: the window has to reach a
+// role chain's client too, and that client is a copy of local with the model
+// swapped — a path that never went through reconcileModel, which left "the
+// server's max_model_len outranks the card" inert exactly where this binary
+// spends its time. An endpoint that cannot answer is recorded as answering
+// nothing, so a failover does not pay a round-trip per retry.
+func (ps *Providers) LearnWindows(endpoint string, ms []ModelInfo) {
+	w := map[string]int{}
+	for _, m := range ms {
+		if m.MaxLen > 0 {
+			w[normalizeModelID(m.ID)] = m.MaxLen
+		}
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.windows[strings.TrimRight(endpoint, "/")] = w
+}
+
+// Learn points a client at the window its own endpoint reports for its own
+// model, asking the endpoint at most once. Silent when it cannot say: the table
+// is the fallback, never the override, and a model served without max_model_len
+// must not clobber a window we already have (SetCtxLen guards both).
+func (ps *Providers) Learn(c *Client) {
+	if c == nil || c.provider == nil || !c.provider.Local {
+		return // only a local deployment publishes max_model_len at all
+	}
+	ep := strings.TrimRight(c.Endpoint(), "/")
+	ps.mu.Lock()
+	w, asked := ps.windows[ep]
+	ps.mu.Unlock()
+	if !asked {
+		ms, err := c.ProbeModels(ep)
+		if err != nil {
+			ms = nil
+		}
+		ps.LearnWindows(ep, ms)
+		ps.mu.Lock()
+		w = ps.windows[ep]
+		ps.mu.Unlock()
+	}
+	c.SetCtxLen(w[normalizeModelID(c.Model())])
+}
+
 // Client returns the client for a model ref. "" means the local client as
 // currently configured. A local ref ("local/x" or a bare name) returns a copy
 // of the local client with that model, so a subagent can't disturb the REPL's.
@@ -174,7 +223,11 @@ func (ps *Providers) Client(ref string) (*Client, error) {
 		}
 		c := *ps.local
 		c.model = model
-		c.ctxLen = 0
+		c.ctxLen, c.ctxSrc = 0, OriginUnset
+		// A subagent, a delegate or an `lca run` step on another served model is
+		// a new model on the SAME deployment, so its window is knowable — and
+		// nothing else on this path would ever ask.
+		ps.Learn(&c)
 		return &c, nil
 	}
 	ps.mu.Lock()

@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -335,16 +334,22 @@ func runDoctor(cfg Config, args []string) int {
 	gw := NewClient(cfg)
 	row("url", gw.Endpoint())
 	models, err := gw.ListModels()
-	served := map[string]bool{}
+	// The whole ModelInfo, not just a bool: MaxLen is what makes a server/profile
+	// comparison possible at all, and throwing it away is why doctor could not see
+	// a five-times-too-small window.
+	served := map[string]ModelInfo{}
 	switch {
 	case err != nil:
 		fail("unreachable: %v", err)
 		hint("%s", firstNonEmpty(errorHint(err), "is the gateway up? LCA_BASE_URL must point at it (…/v1)"))
 	default:
 		for _, m := range models {
-			served[m.ID] = true
+			served[m.ID] = m
 		}
 		okLine("up · %s listed", plural(len(models), "model", "models"))
+	}
+	if len(served) > 0 {
+		reportProfiles(cfg, served)
 	}
 
 	section("roles")
@@ -369,55 +374,99 @@ func runDoctor(cfg Config, args []string) int {
 		if roles.Tier != "" {
 			row("tier", roles.Tier+faint(" (active for every role that declares one)"))
 		}
+		// A models: key that matches nothing served is sampling an operator wrote
+		// down and nobody reads — and the likeliest reason is a spelling the
+		// gateway does not use.
+		for _, k := range sortedKeys(roles.ModelOpts) {
+			if len(served) == 0 {
+				break
+			}
+			hit := false
+			for m := range served {
+				if m == k || normalizeModelID(m) == normalizeModelID(k) {
+					hit = true
+				}
+			}
+			if !hit {
+				warnLine("models.%s in roles.yaml matches no served model — its sampling is never used", k)
+				hint("use one of: %s", strings.Join(sortedKeys(served), ", "))
+			}
+		}
 		var rows [][]string
 		for _, r := range roles.Roles {
-			prof := lookupProfile(firstNonEmpty(r.Models[0], ""))
-			budget := r.Context
-			if budget == 0 {
-				budget = prof.Context
+			model := firstNonEmpty(r.Models[0], "")
+			prof := lookupProfile(model)
+			opts := roles.modelOpts(model)
+			// The window in force, in the order the runtime resolves it: the
+			// deployment's own max_model_len, then the role, then the table.
+			window, wsrc := prof.Context, prof.Src.Context
+			if info, ok := served[model]; ok && info.MaxLen > 0 {
+				window, wsrc = info.MaxLen, OriginServer
 			}
-			if prof.Context > 0 && r.Context > prof.Context {
-				warnLine("role %s: context %s is larger than %s's known window %s — requests will be refused",
-					r.Name, kfmt(r.Context), r.Models[0], kfmt(prof.Context))
+			budget, bsrc := r.Context, "role"
+			switch {
+			case budget == 0:
+				budget, bsrc = window, wsrc.String()
+			case window > 0 && budget > window:
+				// Session.budget caps the role at the deployment's window, so the
+				// table has to print what is in force and not what the file says.
+				budget, bsrc = window, wsrc.String()+", capped from the role's "+kfmt(r.Context)
 			}
-			if prof.Family == "" && r.Context == 0 {
-				warnLine("role %s: %s is not a family we have numbers for — set context: in roles.yaml (the model card's window)", r.Name, r.Models[0])
+			guessed := budget == 0
+			// Compared against the SERVER's window when there is one: comparing
+			// only against the table let a role configured above the running
+			// deployment pass doctor and fail on the first request.
+			if window > 0 && r.Context > window {
+				warnLine("role %s: context %s is larger than %s's window %s (%s) — requests will be refused",
+					r.Name, kfmt(r.Context), model, ctxfmt(window), wsrc)
+			}
+			if guessed {
+				// Say the placeholder out loud: a fallback that prints as a number
+				// is indistinguishable from a real window, which is how a role ends
+				// up quietly running on 24k.
+				budget, bsrc = ctxBudgetFallback, "fallback"
+				warnLine("role %s: no window known for %s — the budget falls back to %d tokens, a placeholder and not a real window",
+					r.Name, model, ctxBudgetFallback)
+				hint("set context: on the role (the model card's window), or add %s to models.go", model)
+			}
+			// Only where the vendor has actually said what the model accepts: a
+			// warning about a model nobody recorded a vocabulary for would fire on
+			// every legacy id and teach the operator to skip the section.
+			if eff := firstNonEmpty(r.Thinking, optEffort(opts)); eff != "" && eff != "off" && eff != "on" {
+				switch {
+				case prof.EffortNone && prof.Switch.Kwarg != "":
+					warnLine("role %s: %s documents no reasoning_effort at all, so the level %q is not sent — only its %s switch is",
+						r.Name, model, eff, prof.Switch.Kwarg)
+				case prof.EffortNone:
+					warnLine("role %s: %s documents no reasoning_effort at all, so effort %q is not sent", r.Name, model, eff)
+				case len(prof.Efforts) > 0 && prof.effortForLocal(eff) == "":
+					// The gateway is the self-hosted path, so the list quoted is the
+					// one the template accepts, not the hosted API's wider aliases.
+					warnLine("role %s: effort %q is not accepted by %s (%s) — lca sends no effort for it",
+						r.Name, eff, model, strings.Join(prof.effortVocab(true), "|"))
+				}
 			}
 			var chain []string
 			for _, m := range r.Models {
 				switch {
 				case len(served) == 0:
 					chain = append(chain, m)
-				case served[m]:
-					chain = append(chain, cGreen+m+cReset)
 				default:
-					chain = append(chain, cRed+m+cReset)
-					failed = true
+					if _, ok := served[m]; ok {
+						chain = append(chain, cGreen+m+cReset)
+					} else {
+						chain = append(chain, cRed+m+cReset)
+						failed = true
+					}
 				}
 			}
-			temp, topP := "model default", "model default"
-			if r.Temperature != nil {
-				temp = strconv.FormatFloat(*r.Temperature, 'f', -1, 64)
-			} else if o := roles.ModelOpts[r.Models[0]]; o != nil && o.Temperature != nil {
-				temp = strconv.FormatFloat(*o.Temperature, 'f', -1, 64)
-			} else if prof.Temperature != nil {
-				temp = strconv.FormatFloat(*prof.Temperature, 'f', -1, 64)
-			}
-			if r.TopP != nil {
-				topP = strconv.FormatFloat(*r.TopP, 'f', -1, 64)
-			} else if o := roles.ModelOpts[r.Models[0]]; o != nil && o.TopP != nil {
-				topP = strconv.FormatFloat(*o.TopP, 'f', -1, 64)
-			} else if prof.TopP != nil {
-				topP = strconv.FormatFloat(*prof.TopP, 'f', -1, 64)
-			}
-			effort := firstNonEmpty(r.Thinking, func() string {
-				if o := roles.ModelOpts[r.Models[0]]; o != nil {
-					return o.Effort
-				}
-				return ""
-			}(), "provider default")
-			replay := map[string]string{"all": "every step", "turn": "this turn", "": "not replayed"}[prof.Replay]
-			rows = append(rows, []string{r.Name, orDash(r.Tier), strings.Join(chain, faint(" → ")), temp, topP, effort, kfmt(budget), replay})
+			// Every column carries where its value came from, so "1.0 (card)" is
+			// distinguishable from "1.0 (role)" and from a number nobody sourced.
+			temp := sampleSrc(r.Temperature, optTemp(opts), prof.Temperature, prof.Src.Temperature)
+			topP := sampleSrc(r.TopP, optTopP(opts), prof.TopP, prof.Src.TopP)
+			effort := firstNonEmpty(r.Thinking, optEffort(opts), "provider default")
+			rows = append(rows, []string{r.Name, orDash(r.Tier), strings.Join(chain, faint(" → ")),
+				temp, topP, effort, ctxfmt(budget) + faint(" (%s)", bsrc), replayName(prof.Replay)})
 		}
 		table([]string{"role", "tier", "models", "temp", "top_p", "effort", "context", "reasoning"}, rows)
 		if failed && len(served) > 0 {
@@ -454,7 +503,7 @@ func runDoctor(cfg Config, args []string) int {
 		seen := map[string]bool{}
 		for _, r := range roles.Roles {
 			for i, m := range r.Models {
-				if (i > 0 && !*all) || seen[m] || !served[m] {
+				if _, up := served[m]; (i > 0 && !*all) || seen[m] || !up {
 					continue
 				}
 				seen[m] = true
@@ -674,6 +723,15 @@ func probeModel(cfg Config, gw *Client, roles *RolesConfig, role, model string) 
 	c := *gw
 	c.model = model
 	c.transport = roles.transportOf(model)
+	// The vendor documents an engine flag per model. Naming it turns "tool calling
+	// is broken" into a line an operator can paste into the launch command — but
+	// only when a probe actually failed: advice next to a green line is noise.
+	prof := lookupProfile(model)
+	toolFix := "vLLM: --enable-auto-tool-choice --tool-call-parser <family> · SGLang: --tool-call-parser <family>"
+	if prof.ToolParser != "" {
+		toolFix = "vLLM: --enable-auto-tool-choice --tool-call-parser " + prof.ToolParser +
+			faint(" (the flag %s's vendor documents)", prof.Key)
+	}
 	var effort string
 	for _, r := range roles.Roles {
 		if r.Name == role {
@@ -708,7 +766,7 @@ func probeModel(cfg Config, gw *Client, roles *RolesConfig, role, model string) 
 		}
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Status == 400 {
-			res.fix = "the engine rejected tools — enable its tool-call parser (vLLM: --enable-auto-tool-choice --tool-call-parser <family>; SGLang: --tool-call-parser <family>), or set models." + model + ".transport: text"
+			res.fix = "the engine rejected tools — enable its tool-call parser (" + toolFix + "), or set models." + model + ".transport: text"
 		} else if res.status == "fail" {
 			res.fix = errorHint(err)
 		}
@@ -735,7 +793,7 @@ func probeModel(cfg Config, gw *Client, roles *RolesConfig, role, model string) 
 		case strings.Contains(out.Content, "ping") && strings.Contains(out.Content, "{"):
 			res.status = "fail"
 			res.detail = "the call came back as text, not tool_calls — the engine's tool-call parser is off or wrong for this model"
-			res.fix = "vLLM: --enable-auto-tool-choice --tool-call-parser <family> · SGLang: --tool-call-parser <family> · or models." + model + ".transport: text"
+			res.fix = toolFix + " · or models." + model + ".transport: text"
 			return res
 		default:
 			res.status = "warn"
@@ -747,7 +805,19 @@ func probeModel(cfg Config, gw *Client, roles *RolesConfig, role, model string) 
 	case out.Reasoning != "":
 		parts = append(parts, "reasoning separate")
 	case reThinkBlock.MatchString(out.Content):
+		// Thinking arrived, but glued into content: the engine has no reasoning
+		// parser loaded, so the trace cannot be replayed as its own field.
 		parts = append(parts, "reasoning inline (<think>)")
+		if prof.ReasonParse != "" {
+			res.warns = append(res.warns, "the thinking came back inside content — vLLM: --reasoning-parser "+prof.ReasonParse+
+				faint(" (the flag %s's vendor documents)", prof.Key))
+		}
+	case prof.Reasoning && prof.ReasonParse != "" && thinkingExpected(prof, effort):
+		// Only when thinking was actually asked for, or cannot be turned off:
+		// self-hosted hy3 answers without thinking by design, and a parser warning
+		// there would be advice for a problem the operator does not have.
+		res.warns = append(res.warns, "this model thinks, but no reasoning came back at all — vLLM: --reasoning-parser "+prof.ReasonParse+
+			faint(" (the flag %s's vendor documents)", prof.Key))
 	}
 	if out.Usage.TTFT > 0 {
 		parts = append(parts, "first token "+fmtDurShort(out.Usage.TTFT))
@@ -883,4 +953,176 @@ func allowlistOf(cfg Config, roles *RolesConfig) []string {
 		return roles.Allow
 	}
 	return cfg.Allowed
+}
+
+// reportProfiles is the per-served-model provenance report: which table entry a
+// served id matched, what the client will therefore send, and where the running
+// deployment and the table disagree about the context window.
+//
+// Nothing here fails doctor. Sending nothing is a valid and safe configuration —
+// this codebase's whole rule is that it beats guessing — so a model nobody has
+// written numbers for is a warn, and doctor's exit code does not turn red because
+// a model is new. What it must never be is silent: a quiet "no numbers" is how
+// this class of bug hides.
+func reportProfiles(cfg Config, served map[string]ModelInfo) {
+	section("models", faint("what lca knows about each served model"))
+	for _, id := range sortedKeys(served) {
+		info, prof := served[id], lookupProfile(id)
+		norm := normalizeModelID(id)
+		label := id
+		if norm != strings.ToLower(id) {
+			label += faint(" (normalised %q)", norm)
+		}
+		if prof.Family == "" {
+			warnLine("%s matched no profile", label)
+			hint("lca will send: no temperature, no top_p, no top_k, no max_tokens, no thinking switch, and will not replay the model's reasoning — the server's own defaults apply")
+			hint("fix: add a profile in models.go, or set models.%s: {temperature, top_p, effort, reasoning_replay} in roles.yaml from the model card", id)
+			reportWindow(id, info, prof)
+			reportReplyBudget(cfg, id, info)
+			continue
+		}
+		okLine("%s %s", label, faint("· %s · matched %q", prof.Family, prof.Key))
+		row("sends", faint("temperature %s · top_p %s · top_k %s · max output %s",
+			srcFloat(prof.Temperature, prof.Src.Temperature), srcFloat(prof.TopP, prof.Src.TopP),
+			srcNum(prof.TopK, prof.Src.TopK), srcNum(prof.Output, prof.Src.Output)+" capped at "+kfmt(outputTokenMax)))
+		effort := "nothing recorded — no level is sent"
+		switch {
+		case prof.EffortNone:
+			effort = "none — the vendor documents no reasoning_effort for it, so only its switch is sent"
+		case len(prof.EffortsLocal) > 0:
+			// The gateway is self-hosted, so quote the list the template accepts:
+			// the wider one is the hosted API resolving its own aliases.
+			effort = strings.Join(prof.EffortsLocal, "|") + " · default " + prof.EffortOn +
+				faint(" (self-hosted vocabulary; the hosted API also resolves %s)", strings.Join(prof.Efforts, "|"))
+		case len(prof.Efforts) > 0:
+			effort = strings.Join(prof.Efforts, "|") + " · default " + prof.EffortOn
+		}
+		row("thinking", faint("%s · replay %s · effort %s", reasoningSwitchName(prof), replayName(prof.Replay), effort))
+		if prof.Note != "" {
+			row("caveat", faint("%s", prof.Note))
+		}
+		reportWindow(id, info, prof)
+		reportReplyBudget(cfg, id, info)
+	}
+}
+
+// reportWindow is the three-way comparison between the deployment and the table.
+// Which one wins is not in question — Client.CtxLen prefers max_model_len, and
+// that precedence is right — but the difference has to be visible rather than
+// silently reconciled.
+func reportWindow(id string, info ModelInfo, prof ModelProfile) {
+	switch {
+	case info.MaxLen > 0 && prof.Context > 0 && info.MaxLen < prof.Context:
+		warnLine("%s: the deployment serves %s; the table says %s (%s)", id, ctxfmt(info.MaxLen), ctxfmt(prof.Context), prof.Src.Context)
+		hint("lca budgets from %s (the server is the truth of the running deployment) — a role whose context: is above it will be refused", ctxfmt(info.MaxLen))
+		hint("fix: raise --max-model-len on the gateway, or lower the role's context:")
+	case info.MaxLen > 0 && prof.Context > 0 && info.MaxLen > prof.Context:
+		warnLine("%s: the deployment serves %s; the profile says %s (matched rule %q)", id, ctxfmt(info.MaxLen), ctxfmt(prof.Context), prof.Key)
+		hint("lca already budgets from the server, so nothing is broken right now")
+		hint("fix: the profile is stale or matched the wrong entry — check lookupProfile in models.go")
+	case info.MaxLen > 0:
+		row("context", faint("%s — the deployment's own max_model_len", srcNum(info.MaxLen, OriginServer)))
+	case prof.Context > 0:
+		row("context", faint("%s — the endpoint does not report max_model_len; verify it matches the server's --max-model-len / --context-length", srcNum(prof.Context, prof.Src.Context)))
+	default:
+		warnLine("%s: neither the endpoint nor the table knows this model's window", id)
+		hint("the context budget falls back to %d tokens, which is a placeholder and not a real window — set context: on the role, or add the model's window to models.go", ctxBudgetFallback)
+	}
+}
+
+// reportReplyBudget says when a configured max_tokens will not be sent as
+// configured. body() clamps the reply budget to a quarter of the window the
+// deployment reports, because vLLM refuses a larger one outright with an error
+// the overflow retry does not recognise — but an operator's own number being
+// rewritten to a different one was the last silent reconciliation on this path,
+// and this file's rule is that a number names where it came from.
+func reportReplyBudget(cfg Config, id string, info ModelInfo) {
+	if cfg.MaxTokens <= 0 || info.MaxLen <= 0 || cfg.MaxTokens <= info.MaxLen/4 {
+		return
+	}
+	warnLine("%s: the configured max_tokens %s is more than a quarter of the deployment's %s window — lca sends %s instead",
+		id, kfmt(cfg.MaxTokens), ctxfmt(info.MaxLen), kfmt(info.MaxLen/4))
+	hint("the clamp is deliberate (the engine refuses a reply budget it cannot honour); lower LCA_MAX_TOKENS or raise --max-model-len to make the two agree")
+}
+
+// reasoningSwitchName names the switch this model's own chat template reads, so
+// an operator can see that the four served models the vLLM dialect used to send
+// enable_thinking to are now sent what they actually read.
+func reasoningSwitchName(prof ModelProfile) string {
+	sw := prof.Switch
+	switch {
+	case sw.Kwarg != "" && sw.Effort != "":
+		return "chat_template_kwargs." + sw.Kwarg + " + ." + sw.Effort
+	case sw.Kwarg != "":
+		return "chat_template_kwargs." + sw.Kwarg
+	case sw.Effort != "" && sw.TopLevel:
+		return "top-level " + sw.Effort + " (no on/off switch)"
+	case sw.Effort != "":
+		return "chat_template_kwargs." + sw.Effort
+	case prof.Reasoning:
+		return "no documented switch — the server's default applies"
+	}
+	return "not a thinking model"
+}
+
+func replayName(replay string) string {
+	switch replay {
+	case "all":
+		return "every step"
+	case "turn":
+		return "this turn"
+	}
+	return "not replayed"
+}
+
+// optTemp / optTopP / optEffort read a roles.yaml models: block that may not be
+// there, so the callers above stay one expression per column.
+func optTemp(o *ModelOpts) *float64 {
+	if o == nil {
+		return nil
+	}
+	return o.Temperature
+}
+
+func optTopP(o *ModelOpts) *float64 {
+	if o == nil {
+		return nil
+	}
+	return o.TopP
+}
+
+func optEffort(o *ModelOpts) string {
+	if o == nil {
+		return ""
+	}
+	return o.Effort
+}
+
+// thinkingExpected reports whether a reply with no reasoning in it is a symptom.
+// It is one when the role asked for thinking, and also when the model documents
+// no way to switch thinking off (Kimi-K3, GLM-5.3) — those two always think, so
+// silence means the engine is not surfacing the trace.
+//
+// It has to ask about the effort the CLIENT SENT, not the one the role wrote: a
+// level outside the model's vocabulary is dropped before the request is built
+// (models.go effortFor), and on a model whose only switch IS reasoning_effort
+// that leaves the probe asking for nothing at all. Asking the role's question
+// made doctor print "--reasoning-parser hy_v3" for a model it had just told the
+// server not to make think, two lines under its own warning that the level was
+// not sent.
+func thinkingExpected(prof ModelProfile, effort string) bool {
+	e := strings.ToLower(strings.TrimSpace(effort))
+	if e != "" && e != "on" && e != "off" && e != "none" && prof.effortForLocal(e) == "" && prof.Switch.Kwarg == "" {
+		e = "" // dropped, and no switch went in its place: nothing was asked
+	}
+	switch {
+	case e == "":
+		// Nothing asked: only the models that cannot stop thinking are expected to.
+		return prof.Switch.Kwarg == "" && prof.EffortOff == ""
+	case e == "off" || e == "none":
+		return false
+	case prof.EffortOff != "" && e == prof.EffortOff:
+		return false // hy3's no_think
+	}
+	return true
 }

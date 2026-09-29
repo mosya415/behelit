@@ -85,7 +85,13 @@ func main() {
 
 	var notes []string
 	if cfg.Discover && sess.client == local {
-		notes = reconcileModel(local, orch.rec)
+		notes = reconcileModel(orch.providers, local, orch.rec)
+	} else {
+		// One cached /v1/models for the whole process: the window the deployment
+		// reports outranks the card everywhere else, and startup was the one
+		// place that never asked. A role chain has already warmed the cache in
+		// NewPrimary, so this costs nothing there.
+		orch.providers.Learn(sess.client)
 	}
 	orch.rec.Event("session_start", map[string]any{
 		"root": orch.jl.Root, "model": sess.client.Ref(), "endpoint": sess.client.Endpoint(), "agent": sess.agent.Name,

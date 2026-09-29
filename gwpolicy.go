@@ -267,10 +267,18 @@ func (s *Session) useModel(i int) {
 	s.modelIdx = i
 	c := *s.orch.providers.local
 	c.model = s.models[i]
-	c.ctxLen = 0
+	c.ctxLen, c.ctxSrc = 0, OriginUnset
+	// …and then learn this model's window from the deployment that serves it.
+	// Without this a chain client keeps ctxLen 0 forever — main.go reconciles
+	// only when the session IS the local client, which a chain session never is,
+	// and relearnCtxLen is reachable only from /model and /endpoint — so a role
+	// with `models:` budgeted a 1M card window against a 131k deployment: the
+	// silent overflow models.go's header exists to prevent. Cached per endpoint,
+	// so a failover does not add a round-trip per retry.
+	s.orch.providers.Learn(&c)
 	c.transport = s.transport
 	if s.orch.roles != nil {
-		if o := s.orch.roles.ModelOpts[c.model]; o != nil {
+		if o := s.orch.roles.modelOpts(c.model); o != nil {
 			c.noReplay = o.NoReplay
 		}
 	}

@@ -271,6 +271,15 @@ func agentFromMeta(name string, meta *yNode, body, source string, ps *Providers,
 			if len(items) == 0 && t.Value != "" {
 				items = strings.Split(t.Value, ",")
 			}
+			// An explicit empty list is "no tools at all", the same as in
+			// roles.yaml — a plain conversational agent. Splitting "[]" on commas
+			// used to yield one tool literally named "[]", which denied nothing and
+			// left the agent asking for approval to run commands.
+			if v := strings.TrimSpace(t.Value); v == "[]" || (len(items) == 0 && v == "") {
+				a.Rules = append(a.Rules, Rule{"*", "*", Deny})
+				a.Tools, a.ToolsSet = nil, true
+				break
+			}
 			if len(items) > 0 {
 				a.Rules = append(a.Rules, Rule{"*", "*", Deny})
 				for _, it := range items {

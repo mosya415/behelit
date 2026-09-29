@@ -27,6 +27,7 @@ type Client struct {
 	noReplay  bool     // never send reasoning_content back (server rejects it)
 	maxTokens int
 	ctxLen    int    // active model's context window (max_model_len), 0 if unknown
+	ctxSrc    Origin // where ctxLen came from; only ever OriginServer or unset
 	transport string // per-session override of the provider's transport ("" = provider's)
 }
 
@@ -118,6 +119,9 @@ func (c *Client) SetEndpoint(u string) {
 		u += "/v1"
 	}
 	c.baseURL = u
+	// A window learned from another machine says nothing about this one, and the
+	// same model id can be served with a different --max-model-len on each.
+	c.ctxLen, c.ctxSrc = 0, OriginUnset
 	for _, e := range c.endpoints {
 		if e == u {
 			return
@@ -126,18 +130,92 @@ func (c *Client) SetEndpoint(u string) {
 	c.endpoints = append(c.endpoints, u)
 }
 
-func (c *Client) Model() string     { return c.model }
-func (c *Client) SetModel(m string) { c.model = m }
-func (c *Client) Endpoint() string  { return c.baseURL }
-func (c *Client) SetCtxLen(n int)   { c.ctxLen = n }
+func (c *Client) Model() string    { return c.model }
+func (c *Client) Endpoint() string { return c.baseURL }
 
-// CtxLen is the model's context window: what discovery reported, else the
-// built-in profile for the model family, else 0 (unknown).
+// SetModel points the client at another served model and forgets the window it
+// learned for the previous one. Without the reset, /model glm5.3 would keep the
+// model-before-last's max_model_len and report it as glm5.3's — between the six
+// served models that is a swing from 262,144 to 1,048,576, i.e. the agent either
+// compacts four times too early or builds prompts the server refuses.
+func (c *Client) SetModel(m string) {
+	c.model = m
+	c.ctxLen, c.ctxSrc = 0, OriginUnset
+}
+
+// SetCtxLen records the window the running deployment reports. Two guards, both
+// load-bearing: a server that omits max_model_len sends 0 and must not clobber a
+// window we already know (SGLang frequently omits it), and only a local endpoint
+// can speak for a deployment — a hosted /v1/models has no max_model_len, so a
+// hosted client's window must keep reading card/api and never "server".
+func (c *Client) SetCtxLen(n int) {
+	if n <= 0 || c.provider == nil || !c.provider.Local {
+		return
+	}
+	c.ctxLen, c.ctxSrc = n, OriginServer
+}
+
+// CtxLen is the model's context window: what the deployment reported, else the
+// built-in profile for the model, else 0 (unknown).
+//
+// The server outranking the card is deliberate and asymmetric. An operator may
+// serve K3 at --max-model-len 131072 on the hardware they have, and the card's
+// 1,048,576 is then a lie that makes the client build prompts the server will
+// refuse; a server serving MORE than the card claims (YaRN) is equally the
+// server's truth. The card is the default for when the deployment declines to
+// say. Full precedence: server max_model_len > role context: > profile > 24000.
 func (c *Client) CtxLen() int {
 	if c.ctxLen > 0 {
 		return c.ctxLen
 	}
 	return c.Profile().Context
+}
+
+// ServerCtxLen is the window the running deployment reported, or 0 when it has
+// not said. Separate from CtxLen because one caller needs to know that the
+// number is the deployment's: a budget may sit above the table's guess, but not
+// above what the server will actually accept.
+func (c *Client) ServerCtxLen() int { return c.ctxLen }
+
+// CtxSrc is where CtxLen came from, for /model and doctor.
+func (c *Client) CtxSrc() Origin {
+	if c.ctxLen > 0 {
+		return c.ctxSrc
+	}
+	return c.Profile().Src.Context
+}
+
+// replyCeiling is the max_tokens this client will actually send, and where that
+// number came from. Four steps, in the order body() applies them: the request's
+// own budget, then the configured one, then the family's published ceiling capped
+// by outputTokenMax — and nothing at all on a local endpoint, where the
+// deployment's own default beats a number of ours — and finally a clamp to a
+// quarter of the window the deployment reports.
+//
+// The clamp is load-bearing: a reply budget larger than the window is refused
+// outright, with an error the overflow retry does not recognise as overflow. But
+// it can rewrite a number the operator configured, and in a client whose rule is
+// that every number names where it came from, a silent rewrite was the one hole
+// left — so the reason travels with the number and /model and doctor print it.
+func (c *Client) replyCeiling(want int) (int, string) {
+	n, why := want, "asked for by this request"
+	switch {
+	case n > 0:
+	case c.maxTokens > 0:
+		n, why = c.maxTokens, "configured (LCA_MAX_TOKENS / max_tokens)"
+	case c.provider != nil && c.provider.Local:
+		return 0, "unset — no max_tokens is sent, so the deployment's own default applies"
+	default:
+		out := c.Profile().Output
+		if out == 0 {
+			return 0, "unset — nothing is published for this model, so the server's default applies"
+		}
+		n, why = min(out, outputTokenMax), "the profile's ceiling, capped at "+kfmt(outputTokenMax)+" by this client"
+	}
+	if c.ctxLen > 0 && n > c.ctxLen/4 {
+		return c.ctxLen / 4, why + ", clamped to a quarter of the " + ctxfmt(c.ctxLen) + " window the server reports"
+	}
+	return n, why
 }
 
 // Ref is the provider-qualified model name shown in the UI ("deepseek/deepseek-v4-pro").
@@ -151,6 +229,21 @@ func (c *Client) Ref() string {
 
 // Profile is the per-family tuning for the current model (models.go).
 func (c *Client) Profile() ModelProfile { return lookupProfile(c.model) }
+
+// EffortFor / EffortVocab resolve a reasoning level the way this client's own
+// request will: the self-hosted vocabulary against a vLLM/SGLang endpoint, the
+// hosted API's everywhere else. /model and doctor must quote the list the
+// request actually checks against, or they promise a level the server drops.
+func (c *Client) EffortFor(level string) string {
+	if c.localDialect() {
+		return c.Profile().effortForLocal(level)
+	}
+	return c.Profile().effortFor(level)
+}
+
+func (c *Client) EffortVocab() []string { return c.Profile().effortVocab(c.localDialect()) }
+
+func (c *Client) localDialect() bool { return c.provider != nil && c.provider.Dialect == "vllm" }
 
 // Native reports whether this client uses the API's native function calling
 // (true) or the line-anchored text tag protocol (false).

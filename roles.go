@@ -111,9 +111,30 @@ type ModelOpts struct {
 	Effort      string
 }
 
+// modelOpts is roles.yaml's block for a served model. The exact key is tried
+// first — an operator can always pin the literal served id, whatever spelling the
+// gateway uses — and then the normalised one, so a file written as
+// "models: {glm-5.3: …}" still reaches a model served as "glm5.3". lca doctor
+// warns about a models: key that matches nothing served.
+func (rc *RolesConfig) modelOpts(model string) *ModelOpts {
+	if rc == nil {
+		return nil
+	}
+	if o := rc.ModelOpts[model]; o != nil {
+		return o
+	}
+	norm := normalizeModelID(model)
+	for k, o := range rc.ModelOpts {
+		if normalizeModelID(k) == norm {
+			return o
+		}
+	}
+	return nil
+}
+
 // transportOf is the configured transport for a model ("" = the default).
 func (rc *RolesConfig) transportOf(model string) string {
-	if o := rc.ModelOpts[model]; o != nil && o.Transport != "" {
+	if o := rc.modelOpts(model); o != nil && o.Transport != "" {
 		return o.Transport
 	}
 	return rc.Transport

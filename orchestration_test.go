@@ -549,7 +549,10 @@ func TestRequestBodyPerProvider(t *testing.T) {
 		{"zai", "glm-4.7", "", []string{`"clear_thinking":false`, `"temperature":1`}, nil},
 		{"dashscope", "qwen3.7-plus", "", []string{`"enable_thinking":true`}, []string{`"temperature"`}},
 		{"minimax", "MiniMax-M3", "", []string{`"temperature":1`, `"top_p":0.95`}, []string{`"top_k"`}},
-		{"tencent", "hy3", "medium", []string{`"reasoning_effort":"medium"`}, nil},
+		// hy3 accepts no_think|low|high and nothing else: vLLM passes "medium"
+		// through and the chat template then raises, so it must be dropped here.
+		{"tencent", "hy3", "high", []string{`"reasoning_effort":"high"`, `"temperature":0.9`}, nil},
+		{"tencent", "hy3", "medium", nil, []string{`"reasoning_effort"`}},
 	}
 	ps := NewProviders(Config{}, nil, &Client{provider: &Provider{ID: "local", Local: true}})
 	for _, c := range cases {
@@ -746,18 +749,30 @@ func TestExpandTemplate(t *testing.T) {
 
 func TestProfilesForFamilies(t *testing.T) {
 	for id, fam := range map[string]string{
-		"deepseek-v4-pro": "deepseek", "kimi-k2.6": "kimi", "glm-5.2": "glm", "Qwen/Qwen3-Coder-480B-A35B-Instruct": "qwen",
+		"kimi-k2.6": "kimi", "glm-5.2": "glm", "Qwen/Qwen3-Coder-480B-A35B-Instruct": "qwen",
 		"MiniMax-M3": "minimax", "hy3": "hunyuan", "hunyuan-t1-latest": "hunyuan", "accounts/fireworks/models/kimi-k2p6": "kimi",
 	} {
 		if p := lookupProfile(id); p.Family != fam || p.Context == 0 {
 			t.Errorf("%s: got %+v, want family %s", id, p, fam)
 		}
 	}
+	// deepseek-v4-pro is the exception that proves the rule: hosted-only, no open
+	// weights, so no card and deliberately no window. It used to carry
+	// V4.1-Flash's 1M as "card" on the strength of a routing DeepSeek reversed.
+	if p := lookupProfile("deepseek-v4-pro"); p.Family != "deepseek" || p.Context != 0 {
+		t.Errorf("deepseek-v4-pro must keep its family and no window: %+v", p)
+	}
 	if p := lookupProfile("kimi-k2.6"); p.Replay != "all" {
 		t.Error("kimi thinking must replay reasoning")
 	}
-	if p := lookupProfile("deepseek-v4-flash"); p.Replay != "turn" {
-		t.Error("deepseek must replay reasoning within the turn")
+	// V4.1-Flash replays EVERY turn, not just the current one: with tools in the
+	// request the API returns 400 when an earlier turn's reasoning_content is
+	// missing. The older V3.x reasoners are the ones that only need the turn.
+	if p := lookupProfile("deepseek-v4-flash"); p.Replay != "all" {
+		t.Error("deepseek-v4.1-flash must replay reasoning on every step")
+	}
+	if p := lookupProfile("deepseek-v3.2"); p.Replay != "turn" {
+		t.Error("deepseek-v3.2 must replay reasoning within the turn")
 	}
 }
 
@@ -1185,5 +1200,28 @@ func TestShellSegmentSplitRespectsQuotes(t *testing.T) {
 	}
 	if err := j.CheckCommand(`echo x | torchrun train.py`); err == nil {
 		t.Error("an unquoted GPU launcher after a pipe must be caught")
+	}
+}
+
+// `tools: []` in an agent file means no tools at all, as it does in roles.yaml:
+// a plain conversational agent. It used to split "[]" on commas into one tool
+// named "[]", so nothing was denied and the agent still asked to run commands.
+func TestAgentWithEmptyToolListHasNoTools(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	dir := filepath.Join(root, ".lca", "agents")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "chat.md"),
+		[]byte("---\ndescription: plain conversation\nmode: primary\ntools: []\n---\nJust talk.\n"), 0o644)
+	ps := NewProviders(Config{}, nil, &Client{provider: &Provider{ID: "local", Local: true}})
+	agents, _ := loadAgents(root, filepath.Join(root, "nodir"), nil, ps)
+	chat := agents["chat"]
+	if chat == nil {
+		t.Fatal("chat agent not loaded")
+	}
+	for _, name := range []string{"run_command", "edit", "write", "read_file"} {
+		if !Disabled(permissionOf(name), chat.Rules) {
+			t.Errorf("%s is still available to a tools: [] agent", name)
+		}
 	}
 }

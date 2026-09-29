@@ -15,11 +15,15 @@ import (
 // endpoint offers exactly one model, we adopt it (the common vLLM/SGLang case:
 // one model per endpoint, whose id rarely matches a hand-typed guess). Returns
 // pre-colored display lines for the banner; never fatal.
-func reconcileModel(client *Client, rec *Recorder) []string {
+func reconcileModel(ps *Providers, client *Client, rec *Recorder) []string {
 	models, err := client.ListModels()
 	if err != nil {
+		ps.LearnWindows(client.Endpoint(), nil)
 		return []string{warn("model discovery unavailable (%v) — using %q as-is", err, client.Model())}
 	}
+	// The answer is the whole endpoint's, not just this model's: a role chain
+	// switching models later must not have to ask again.
+	ps.LearnWindows(client.Endpoint(), models)
 	if len(models) == 0 {
 		return []string{warn("endpoint advertises no models — using configured name as-is")}
 	}
@@ -208,8 +212,13 @@ func ctxBudget(explicit, modelCtxLen int) int {
 	if modelCtxLen > 0 {
 		return modelCtxLen * 3 / 4
 	}
-	return 24000
+	return ctxBudgetFallback
 }
+
+// ctxBudgetFallback is what the budget becomes when neither the deployment nor
+// the table knows the window. It is a placeholder, not a window, so doctor names
+// the number out loud — otherwise it passes for a real one.
+const ctxBudgetFallback = 24000
 
 // printPerf prints a dim one-line performance summary after a streamed step:
 // prompt tokens and how many hit the server's KV prefix cache (the payoff of
@@ -313,4 +322,14 @@ func lineCount(s string) int {
 		}
 	}
 	return n
+}
+
+// ctxfmt is kfmt with a megatoken step. The served windows are now large enough
+// that "1048k" reads as noise next to "262k", and the difference between a 1M
+// and a 262k window is the difference between compacting once and four times.
+func ctxfmt(n int) string {
+	if n >= 1_000_000 {
+		return strconv.FormatFloat(float64(n)/1e6, 'f', 2, 64) + "M"
+	}
+	return kfmt(n)
 }

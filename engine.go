@@ -299,7 +299,7 @@ func (s *Session) applyModelOpts(req *ChatRequest) {
 	if s.orch.roles == nil {
 		return
 	}
-	o := s.orch.roles.ModelOpts[s.client.Model()]
+	o := s.orch.roles.modelOpts(s.client.Model())
 	if o == nil {
 		return
 	}
@@ -318,21 +318,53 @@ func (s *Session) applyModelOpts(req *ChatRequest) {
 	}
 }
 
-// sampling describes what this session actually sends, for /model and doctor.
+// sampling describes what this session actually sends, and where each value came
+// from, for /model and doctor. The precedence is body()'s: the role, then
+// roles.yaml models.<id>, then the profile, then nothing at all — and "unset" is
+// a real answer, not a missing one.
 func (s *Session) sampling() (temp, topP, effort string) {
-	req := ChatRequest{Temperature: s.agent.Temperature, TopP: s.agent.TopP, Thinking: s.thinking()}
-	s.applyModelOpts(&req)
 	prof := s.client.Profile()
-	show := func(v *float64, fallback *float64) string {
-		switch {
-		case v != nil:
-			return strconv.FormatFloat(*v, 'f', -1, 64)
-		case fallback != nil:
-			return strconv.FormatFloat(*fallback, 'f', -1, 64) + " (profile)"
-		}
-		return "model default"
+	var o *ModelOpts
+	if s.orch.roles != nil {
+		o = s.orch.roles.modelOpts(s.client.Model())
 	}
-	return show(req.Temperature, prof.Temperature), show(req.TopP, prof.TopP), firstNonEmpty(req.Thinking, "provider default")
+	var optTemp, optTopP *float64
+	optEffort := ""
+	if o != nil {
+		optTemp, optTopP, optEffort = o.Temperature, o.TopP, o.Effort
+	}
+	effort = firstNonEmpty(s.thinking(), optEffort)
+	switch {
+	case effort == "":
+		effort = "provider default"
+	case len(prof.Efforts) > 0 && s.client.EffortFor(effort) == "":
+		// Named but not accepted: chat.go drops it, so say so here rather than
+		// letting /model imply a level the model will never see. The vocabulary
+		// quoted is the one this endpoint checks against — a self-hosted template
+		// resolves fewer spellings than the vendor's API does.
+		effort += faint(" (not sent — %s accepts %s)", prof.Key, strings.Join(s.client.EffortVocab(), "|"))
+	case prof.EffortNone && prof.Switch.Kwarg != "":
+		// The LEVEL is dropped, but the card's own switch still goes: saying
+		// "not sent" here read as "thinking was not asked for", which is the
+		// opposite of what the request does.
+		effort += faint(" (level not sent — %s documents no effort field; thinking is switched on with %s)", prof.Key, prof.Switch.Kwarg)
+	case prof.EffortNone:
+		effort += faint(" (not sent — %s documents no effort field)", prof.Key)
+	}
+	return sampleSrc(s.agent.Temperature, optTemp, prof.Temperature, prof.Src.Temperature),
+		sampleSrc(s.agent.TopP, optTopP, prof.TopP, prof.Src.TopP), effort
+}
+
+// sampleSrc renders one sampling value with its provenance, so an operator can
+// tell "1.0 (card)" from "1.0 (role)" from a number nobody sourced.
+func sampleSrc(role, opt, prof *float64, src Origin) string {
+	switch {
+	case role != nil:
+		return strconv.FormatFloat(*role, 'f', -1, 64) + " (role)"
+	case opt != nil:
+		return strconv.FormatFloat(*opt, 'f', -1, 64) + " (roles.yaml)"
+	}
+	return srcFloat(prof, src)
 }
 
 // noteRead / checkStale are the "read it before you change it" guard, for a
@@ -516,6 +548,14 @@ func (s *Session) tier() string {
 // else LCA_CTX_TOKENS, else 75% of the model's window.
 func (s *Session) budget() int {
 	if s.agent.Context > 0 {
+		// The role's number, but never above what the deployment reports. The
+		// precedence is server max_model_len > role context: > profile, and a role
+		// written above the running window does not raise the window — it builds
+		// prompts the server refuses outright. doctor warns about the
+		// disagreement; this is what keeps the run honest until the file is fixed.
+		if n := s.client.ServerCtxLen(); n > 0 && n < s.agent.Context {
+			return n * 3 / 4
+		}
 		return s.agent.Context * 3 / 4
 	}
 	return ctxBudget(s.orch.cfg.CtxTokens, s.client.CtxLen())

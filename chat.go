@@ -201,10 +201,18 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 	// profile's vendor numbers > nothing at all, so the model's own defaults
 	// apply. A reasoning model at temperature 0 repeats itself, so we never
 	// invent a value.
+	//
+	// A profile's numbers can be the self-host's only (SampleLocalOnly): Moonshot
+	// fixes K3's temperature/top_p server-side and documents omitting them, and
+	// the card's agentic top_p is not even the value it fixes — so against a
+	// hosted API the card is not evidence about that deployment and the field is
+	// left out, exactly as top_k is. What the operator set still goes: that is
+	// their instruction, not our guess.
+	card := !prof.SampleLocalOnly || c.provider.Local
 	switch {
 	case req.Temperature != nil:
 		b["temperature"] = *req.Temperature
-	case prof.Temperature != nil:
+	case prof.Temperature != nil && card:
 		b["temperature"] = *prof.Temperature
 	case c.temp != nil:
 		b["temperature"] = *c.temp
@@ -212,7 +220,7 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 	switch {
 	case req.TopP != nil:
 		b["top_p"] = *req.TopP
-	case prof.TopP != nil:
+	case prof.TopP != nil && card:
 		b["top_p"] = *prof.TopP
 	}
 	switch {
@@ -222,14 +230,9 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 		b["top_k"] = prof.TopK // non-standard: vLLM/SGLang accept it, hosted APIs may not
 	}
 
-	maxTok := req.MaxTokens
-	if maxTok == 0 {
-		maxTok = c.maxTokens
-	}
-	if maxTok == 0 && !c.provider.Local && prof.Output > 0 {
-		maxTok = min(prof.Output, outputTokenMax)
-	}
-	if maxTok > 0 {
+	// One place decides the reply budget, and /model reads it back from there:
+	// a number this client rewrites has to be as reportable as one it copies.
+	if maxTok, _ := c.replyCeiling(req.MaxTokens); maxTok > 0 {
 		b["max_tokens"] = maxTok
 	}
 
@@ -240,7 +243,7 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 		b["continue_final_message"] = true
 		b["add_generation_prompt"] = false
 	}
-	for k, v := range thinkingParams(c.provider, c.model, prof, req.Thinking) {
+	for k, v := range thinkingParams(c.provider, c.model, prof, req.Thinking, replay) {
 		b[k] = v
 	}
 	for k, v := range c.provider.Extra {

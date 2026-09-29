@@ -11,6 +11,60 @@ transport: native      # tool calling through the gateway: native | text
 # per-model settings — e.g. a model whose native tool parser is broken on the engine:
 # models:
 #   some-model: {transport: text}
+
+# ── the fleet this build carries profiles for ────────────────────────────────
+# The six models the operator's gateway serves. lca already knows each one's
+# context window, sampling and thinking switch from its vendor card (see
+# models.go, and `lca doctor` prints the provenance of every number) — so the
+# models: entries below are only needed where you want to override the card.
+# Uncomment the block when the gateway serves these names; `lca doctor` reports
+# any that it does not.
+#
+# tiers:
+#   premium:  [kimi-k3, MiniMax-M3]          # the two 1M-window thinkers
+#   balanced: [glm5.3, deepseek-v4.1-flash]
+#   cheap:    [qwen3.6, hy3]                 # 262k windows, cheapest to run
+#
+# models:
+#   # Only what the card actually states. Anything absent here is absent from the
+#   # request too, and the server's own default applies — a guessed number is
+#   # worse than no number.
+#   kimi-k3:              {temperature: 1.0, top_p: 1.0,  effort: max}
+#   # ^ top_p 1.0 is the card's AGENTIC value (0.95 is its single-step value).
+#   deepseek-v4.1-flash:  {temperature: 1.0, top_p: 0.95, effort: high}
+#   glm5.3:               {temperature: 1.0, top_p: 0.95, effort: max}
+#   # ^ GLM-5.3 clamps temperature to [0,1]; an effort outside low|high|max
+#   #   is silently promoted to max, so name it.
+#   qwen3.6:              {temperature: 1.0, top_p: 0.95, top_k: 20}
+#   # ^ no effort: reasoning_effort is documented for Qwen3.8, not for 3.6.
+#   MiniMax-M3:           {temperature: 1.0, top_p: 0.95}
+#   # ^ no effort either: M3 ignores the field. top_k 40 is engine docs, not the
+#   #   card, so lca sends it only to a local server and it is not pinned here.
+#   hy3:                  {temperature: 0.9, top_p: 1.0,  effort: high}
+#   # ^ hy3 accepts no_think|low|high and NOTHING else — medium or max raise
+#   #   inside its chat template. Self-hosted hy3 does not think unless asked.
+#
+# roles:
+#   fleet-lead:
+#     description: Splits the task and delegates it.
+#     tier: premium        # tiered, so -tier cheap rehearses the whole pipeline
+#     effort: max          # kimi-k3 and MiniMax-M3 both accept it or ignore it
+#     prompt: |
+#       You lead a software task: split it and delegate each part.
+#   fleet-coder:
+#     description: Implements one change.
+#     models: [deepseek-v4.1-flash, qwen3.6]   # pinned: chosen for code, not price
+#     effort: high         # deepseek accepts it; qwen3.6 takes no effort field
+#     review: fleet-reviewer
+#     check_cmd: go test ./...
+#     prompt: |
+#       You implement exactly one change and make its check pass.
+#   fleet-reviewer:
+#     description: Judges the coder's diff — a different family on purpose.
+#     models: [glm5.3, kimi-k3]   # neither is DeepSeek or Qwen: no shared blind spot
+#     effort: max
+#     prompt: |
+#       You review one finished diff and name the failure mode you found.
 apply: verified        # delegate diffs reach your tree only when the check passed
 
 # named model chains, so price is one edit instead of one per role. A role points
