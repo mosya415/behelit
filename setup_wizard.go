@@ -107,6 +107,17 @@ func (p *setupPlan) head(detail ...string) {
 // The team /setup writes IS the team lca init writes: the same descriptions,
 // prompts and tool lists, lifted out of runInit's template so the two cannot
 // produce different teams from the same gateway.
+//
+// roleWhat is what the operator is actually choosing on each role screen: four
+// screens that differ only by a word in the header read as the same question
+// asked four times.
+var roleWhat = map[string]string{
+	"lead":     "plans, splits the work and delegates — it reads the most code",
+	"coder":    "writes the change in its own worktree until the check passes",
+	"reviewer": "second opinion on a passed diff; pick another family, not the coder's",
+	"cheap":    "summaries and compaction only — a small model is enough",
+}
+
 const (
 	leadDesc  = "Understands the task, splits it, delegates, integrates and reports."
 	coderDesc = "Implements one well-specified change and makes its check pass."
@@ -501,9 +512,13 @@ func (r *Repl) setupModels(p *setupPlan) error {
 			why[m] += "+" + role
 		}
 	}
+	var proposal []string
 	if len(pre) == 0 {
-		// No team yet: the default IS lca init's, from the same functions. Two per
-		// role, because a role's models: is a chain — the second is its fallback.
+		// No team yet. The proposal IS lca init's, from the same functions — two per
+		// role, because a role's models: is a chain and the second is its fallback —
+		// but it is NOT ticked: a screen that opens with ticks the operator did not
+		// make turns their first deliberate space into an untick of what they wanted.
+		// Enter with nothing ticked takes it.
 		for _, m := range pickModels(names, leadPref, 2) {
 			mark(m, "lead")
 		}
@@ -511,6 +526,12 @@ func (r *Repl) setupModels(p *setupPlan) error {
 			mark(m, "coder")
 		}
 		mark(pickCheap(names), "cheap")
+		for _, m := range names {
+			if pre[m] {
+				proposal = append(proposal, m)
+			}
+		}
+		pre = map[string]bool{}
 	}
 
 	for {
@@ -519,18 +540,32 @@ func (r *Repl) setupModels(p *setupPlan) error {
 			c := modelChoice(m, pre[m.ID])
 			c.seq = seq[m.ID]
 			if r := why[m.ID]; r != "" {
-				c.note += " · ticked as the default " + r
+				c.detail += faint("  ← proposed as %s", r)
+				c.note += " · proposed as " + r
 			}
 			cs = append(cs, c)
 		}
-		idx, err := pick(r.in, cs, pickOpts{multi: true, title: "setup",
-			detail: faint("%s · %d served at %s", p.stepLabel(), len(cs), hostOf(p.endpoint))})
+		opts := pickOpts{multi: true, title: "setup",
+			detail: faint("%s · %d served at %s", p.stepLabel(), len(cs), hostOf(p.endpoint))}
+		// Above the menu, not as its hint line: the hint line carries the navigation
+		// keys, and a cooked fallback (no raw mode) never prints it at all.
+		if len(proposal) > 0 {
+			hint("space ticks the models you want · enter with none ticked takes the proposal: %s",
+				strings.Join(proposal, ", "))
+		}
+		idx, err := pick(r.in, cs, opts)
 		if err != nil {
 			return err
 		}
 		if len(idx) == 0 {
-			errLine("nothing picked — a team needs at least one model")
-			continue
+			if len(proposal) == 0 {
+				errLine("nothing picked — a team needs at least one model")
+				continue
+			}
+			p.picked = append([]string(nil), proposal...)
+			okLine("%s (the proposal): %s", plural(len(p.picked), "model", "models"),
+				strings.Join(p.picked, faint(" · ")))
+			return nil
 		}
 		p.picked = nil
 		for _, i := range idx {
@@ -625,7 +660,8 @@ func (r *Repl) setupTeam(p *setupPlan) error {
 			}
 			cs = append(cs, c)
 		}
-		i, err := pickOne(r.in, cs, pickOpts{title: "setup", detail: faint("%s · %s", p.stepLabel(), role)})
+		i, err := pickOne(r.in, cs, pickOpts{title: "setup",
+			detail: faint("%s · %s — %s", p.stepLabel(), role, roleWhat[role])})
 		if err != nil {
 			return err
 		}

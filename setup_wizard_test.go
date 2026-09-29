@@ -897,3 +897,46 @@ func TestSetupStepNumbersMatchTheStepsThatRun(t *testing.T) {
 	}
 	check(t, hs)
 }
+
+// The models screen must open with NOTHING ticked and offer its proposal to
+// Enter. It used to open with three ticks the operator never made, so their first
+// deliberate space UNTICKED a model they wanted — and with the remaining picks
+// collapsing onto one model, lead, coder and reviewer all ended up on it, the
+// reviewer warning that it was reviewing itself.
+func TestSetupModelsScreenOpensUntickedAndOffersTheProposal(t *testing.T) {
+	fs := wizardServer(t)
+	r, orch := emptyRepl(t, fs, fullScript())
+	out := stripANSI(captureStdout(t, func() { r.cmdSetup("") }))
+
+	if strings.Contains(out, "space selects") {
+		t.Error(`the hint must say what space does to a tick ("ticks"), not "selects"`)
+	}
+	if !strings.Contains(out, "enter with none ticked takes the proposal") {
+		t.Errorf("the proposal is not offered to Enter:\n%s", out)
+	}
+	if !strings.Contains(out, "proposed as lead") {
+		t.Errorf("a proposed row must say what it is proposed for:\n%s", out)
+	}
+	if !strings.Contains(out, "(the proposal)") {
+		t.Errorf("Enter on an untouched screen takes the proposal:\n%s", out)
+	}
+	// and each role screen says what the role is for
+	for _, want := range []string{"plans, splits the work and delegates", "writes the change in its own worktree",
+		"second opinion on a passed diff", "summaries and compaction only"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a role screen does not say what the role does (%q missing)", want)
+		}
+	}
+	// the team that lands must not put the reviewer on the coder's own model
+	rc, err := loadRoles(Config{Root: orch.jl.Root, Dir: r.cfg.Dir})
+	if err != nil {
+		t.Fatalf("roles.yaml does not load: %v", err)
+	}
+	coder, rev := rc.role("coder"), rc.role("reviewer")
+	if coder == nil {
+		t.Fatal("no coder role")
+	}
+	if rev != nil && len(rev.Models) > 0 && len(coder.Models) > 0 && rev.Models[0] == coder.Models[0] {
+		t.Errorf("reviewer %v shares the coder's first model %v", rev.Models, coder.Models)
+	}
+}

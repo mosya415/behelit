@@ -360,7 +360,7 @@ func (p *pickState) legend() string {
 	}
 	parts = append(parts, "↑↓ move")
 	if p.multi {
-		parts = append(parts, fmt.Sprintf("space selects (%d)", len(p.result())), "^a all", "^n none")
+		parts = append(parts, fmt.Sprintf("space ticks · %d chosen", len(p.result())), "^a all", "^n none")
 	}
 	parts = append(parts, "type to filter", "enter confirms", "ctrl-c aborts")
 	return strings.Join(parts, " · ")
