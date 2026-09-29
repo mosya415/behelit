@@ -1,0 +1,48 @@
+description: The zero-token gate — build, vet, test. A model is paid only to read the wreckage.
+role: lead
+timeout: 1800          # default per-step bound, in seconds
+
+# Every run: line here is ONE command (no sandbox: {shell: true} in the example
+# team), so `a && b` is refused at load — that is what the separate steps are.
+vars:
+  tests: ./...         # has a default, so -var tests=./pkg/... is optional
+
+steps:
+  build:
+    run: go build ./...
+    on_fail: continue  # keep going: the point of this run is the whole picture,
+                       # and a later step can only see a failure if it says this
+
+  vet:
+    run: go vet ./...
+    on_fail: continue
+
+  test:
+    run: go test -count=1 ${vars.tests}
+    on_fail: continue
+    # A ${vars.*} is substituted verbatim (a step's output would be shell-quoted),
+    # so "-count=1 ./..." stays several words.
+
+  triage:
+    prompt: |
+      Three checks just ran on this repository. Say in at most five lines what is
+      broken and which files to open first. Do not propose a patch.
+
+      go build ./...   → ${steps.build.status}
+      ${steps.build.out}
+
+      go vet ./...     → ${steps.vet.status}
+      ${steps.vet.out}
+
+      go test          → ${steps.test.status}
+      ${steps.test.out}
+    role: cheap        # the smallest chain on the team: reading a failure is not
+                       # the job the strong models are there for
+    when: ${steps.build.status} == failed || ${steps.vet.status} == failed || ${steps.test.status} == failed
+    # No check: a prompt step is a text-producing node. Nothing is skipped above
+    # it, so every ${steps.*.out} it names exists — a skipped step has no output
+    # and referencing one is a failed step, not a silent blank.
+
+# Exit status is the gate's answer: 0 when all three were green (triage is then
+# skipped), 1 when any of them was red — including the run where triage itself
+# succeeded, because a step failed. run.log has the full output of all four.

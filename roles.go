@@ -185,10 +185,17 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", p, err)
 			}
+			if rem != nil && rem.Src == "" {
+				if rn != nil {
+					rem.Src = p // the remote: block in this file
+				} else {
+					rem.Src = "LCA_REMOTE"
+				}
+			}
 			rc.Remote = rem
 		}
 		if mn := doc.child("members"); mn != nil {
-			ms, order, err := parseMembers(mn)
+			ms, order, err := parseMembers(mn, p)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", p, err)
 			}

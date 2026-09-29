@@ -158,7 +158,7 @@ var memberKeys = []string{"host", "dir", "ssh", "allow", "shell"}
 //
 // The order slice is declaration order, which is what /members, doctor and
 // YAML() print.
-func parseMembers(n *yNode) (map[string]*Member, []string, error) {
+func parseMembers(n *yNode, src string) (map[string]*Member, []string, error) {
 	out := map[string]*Member{}
 	var order []string
 	for _, mn := range n.Children {
@@ -240,7 +240,7 @@ func parseMembers(n *yNode) (map[string]*Member, []string, error) {
 			if !strings.HasPrefix(dir, "/") {
 				return nil, nil, fmt.Errorf("members.%s: dir must be absolute, got %q", name, dir)
 			}
-			m.Rem = &Remote{Name: name, Host: host, Dir: dir, SSH: ssh}
+			m.Rem = &Remote{Name: name, Host: host, Dir: dir, SSH: ssh, Src: src}
 		}
 		if out[name] == nil {
 			order = append(order, name)

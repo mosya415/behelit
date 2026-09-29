@@ -1755,3 +1755,30 @@ func TestUnreachableAndTimedOutCommandsAreFailedCalls(t *testing.T) {
 		}
 	})
 }
+
+// A member failure must name the file that declared it. Three roles.yaml files
+// merge into one team, so a stale member in the project's own .lca/roles.yaml
+// silently becomes every role's default machine — and "member remote: /proj is
+// not there" leaves the operator grepping for the line to fix.
+func TestMemberFailureNamesItsSource(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, ".lca"), 0o755)
+	path := filepath.Join(root, ".lca", "roles.yaml")
+	os.WriteFile(path, []byte("members:\n  box:\n    host: nosuchhost.invalid\n    dir: /proj\n"+
+		"roles:\n  onbox:\n    member: box\n    models: [m1]\n"), 0o644)
+	rc, err := loadRoles(Config{Root: root, Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := rc.Members["box"]
+	if m == nil || m.Rem == nil {
+		t.Fatalf("member not parsed: %+v", rc.Members)
+	}
+	if m.Rem.Src != path {
+		t.Fatalf("member source = %q, want %q", m.Rem.Src, path)
+	}
+	// and the source reaches the message the operator actually reads
+	if got := m.Rem.declaredIn(); !strings.Contains(got, path) {
+		t.Fatalf("failure text does not name the file: %q", got)
+	}
+}

@@ -40,6 +40,7 @@ type Remote struct {
 	Host string
 	Dir  string
 	SSH  []string // extra flags for the default transport, or the whole transport argv
+	Src  string   // the roles.yaml that declared it, so a failure names the line to fix
 	up   *reach   // shared by withDir copies: it is one machine
 }
 
@@ -152,13 +153,24 @@ func (r *Remote) ensureUp(ctx context.Context) error {
 	case exit == 255 || exit == -1:
 		g.err = &memberDown{msg: fmt.Sprintf(
 			"member %s (%s) is unreachable: %s\nnothing ran there, and nothing runs on another machine instead — fix ssh (keys, ~/.ssh/config, VPN), or point this role or step at another member",
-			r.memberName(), r.Label(), probeFail(out))}
+			r.memberName(), r.Label(), probeFail(out)) + r.declaredIn()}
 	default:
 		g.err = &memberDown{dirGone: true, msg: fmt.Sprintf(
 			"member %s: ssh to %s works, but %s is not there: %s\nnothing ran there, and nothing runs on another machine instead — create or clone the project at that path, or point this member's dir: at it",
-			r.memberName(), r.Where(), r.Dir, probeFail(out))}
+			r.memberName(), r.Where(), r.Dir, probeFail(out)) + r.declaredIn()}
 	}
 	return g.err
+}
+
+// declaredIn names the file the member came from. Three roles.yaml files merge
+// into one team, so "which line do I fix" is not answerable from the member's
+// name alone — and a stale member in the project's own .lca/roles.yaml becomes
+// every role's default machine without ever being mentioned again.
+func (r *Remote) declaredIn() string {
+	if r == nil || r.Src == "" {
+		return ""
+	}
+	return "\ndeclared in " + r.Src
 }
 
 // forget drops a cached "ok" once the transport has failed mid-session: a

@@ -30,7 +30,7 @@ type Config struct {
 	Reservation  string   // Slurm reservation to scope /discover (LCA_RESERVATION)
 	DiscoverUser string   // Slurm user filter for /discover (LCA_USER; "$me" = you)
 	Scheme       string   // http|https for discovered endpoints (LCA_SCHEME)
-	ShowThinking bool     // expand model reasoning (LCA_HIDE_THINKING to start collapsed)
+	ShowThinking bool     // start with reasoning expanded (LCA_SHOW_THINKING; default collapsed)
 	Loop         bool     // autonomous loop mode: keep going until TASK_DONE (LCA_LOOP)
 	Unsafe       bool     // disable the jail + command allowlist (LCA_UNSAFE / -unsafe)
 	KeepSessions int      // max transcript files to retain (LCA_KEEP_SESSIONS)

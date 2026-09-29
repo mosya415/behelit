@@ -1,6 +1,11 @@
 description: Plan a change, build it in a worktree, review it across families, then commit.
 role: lead
 
+# Needs more than `lca init` writes: roles lead, coder and reviewer (the reviewer
+# needs `write` in its tools for step 5's review.md), `review: reviewer` on coder
+# for the cross-family review on the build step, and -var task=… on every run.
+# `lca doctor` binds this file against your team and names whatever is missing.
+
 # Every run:/check: line here is ONE command: without sandbox: {shell: true} the
 # line is exec'd as argv, so `a && b` would hand "&&" to a as an argument. bind
 # refuses that before anything runs — use two steps, as `build` does below.
@@ -33,7 +38,11 @@ steps:
     check: go build ./...
     retries: 1
     # Two independent checks must pass: the coder role's check_cmd (its tests) and
-    # this one. Only then is the diff applied to your tree.
+    # this one. Then the reviewer that role names (review: reviewer in roles.yaml —
+    # a different model family) judges the diff, and a "VERDICT: reject" blocks it;
+    # only then is the diff applied to your tree. `review: off` here would skip
+    # that. retries wrap the whole delegation while verify_attempts works inside
+    # it, so the budgets multiply: -dry-run prints the effective number.
 
   fmt:
     run: gofmt -w .
@@ -50,12 +59,20 @@ steps:
     role: reviewer
     check: grep -q '^VERDICT: ship' review.md
     retries: 0
+    # A second, WRITTEN review of the change as a whole, left in the repository and
+    # decided by a command — not the same thing as the built-in cross-family review
+    # on the build step above, which judges that one diff before it is applied and
+    # leaves nothing behind. Keep this step when you want the artifact; drop it when
+    # the reviewer role's verdict on the diff is enough.
     # retries: 0 on purpose — a retry re-prompts with "the check FAILED", which
     # pressures a model into flipping its verdict instead of reconsidering it.
 
   integrate:
     run: git commit -am "verified by the harden workflow"
     when: ${steps.build.status} == ok && ${steps.review.status} == ok
+    # A rejected diff already failed the build step, so these two are the whole
+    # guard; ${steps.build.review} (approve | reject | unreviewed | empty) is there
+    # when you want to tell "a reviewer approved it" from "nobody reviewed it".
     # The task is in the run's state.json, not in this message: a ${vars.*} goes in
     # verbatim (a step's output is quoted, a var is not), so a task containing a
     # quote or a " #" would rewrite the command.

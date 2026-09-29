@@ -25,6 +25,8 @@ func main() {
 			os.Exit(runInit(cfg, os.Args[2:]))
 		case "doctor":
 			os.Exit(runDoctor(cfg, os.Args[2:]))
+		case "report":
+			os.Exit(runReport(cfg, os.Args[2:]))
 		case "help", "--help":
 			usage()
 			return
@@ -212,8 +214,10 @@ func usage() {
 		"   lca \"<task>\"                 run one task and exit",
 		"   lca -check \"<cmd>\" \"<task>\"  run one task; succeed only if <cmd> passes",
 		"   lca init                     create .lca/roles.yaml from the gateway's models",
-		"   lca doctor                   check gateway, roles, tool calling, sandbox",
+		"   lca doctor                   check gateway, roles, tool calls, members, workflows",
+		"   lca run <name>               run a workflow (deterministic steps; -list, -dry-run)",
 		"   lca eval tasks/              run evaluation tasks (see README)",
+		"   lca report                   render the newest trace as one HTML file",
 		"",
 		" " + f("FLAGS"),
 		"   -role <name>                 role (roles.yaml) or agent to run as",

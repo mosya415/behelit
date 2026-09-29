@@ -13,11 +13,31 @@ transport: native      # tool calling through the gateway: native | text
 #   some-model: {transport: text}
 apply: verified        # delegate diffs reach your tree only when the check passed
 
+# named model chains, so price is one edit instead of one per role. A role points
+# at a chain with "tier: <name>"; -tier / LCA_TIER / `lca run -tier` /
+# `lca eval -tier cheap,premium` repoint every role that declares one for the run.
+# A role that names models: is pinned and no -tier moves it.
+tiers:
+  premium: [kimi-k2.6, glm-5.2]
+  cheap:   [qwen3-30b-a3b-instruct]
+
+# the machines this team works on. ssh is outbound only; nothing listens here.
+# Pin a role with "member: <name>", a workflow step with "member:" — otherwise
+# work happens on this machine (or on defaults.member, if you set one).
+# EDIT THE HOST AND DIR, or delete this block: lca doctor probes every member.
+members:
+  build-box:
+    host: build01                 # ssh target (a ~/.ssh/config alias is fine)
+    dir: /srv/work/llmbench       # the project over there — absolute, no ~
+    allow: [go, gofmt, git, make, ls, cat, grep]   # REPLACES sandbox.allow here
+
 defaults:
   context: 128000
   steps: 50
   verify_attempts: 2   # failing check output is fed back this many times in total
   check_timeout: 900   # seconds
+  # review: reviewer   # a team-wide second opinion; per-role review: wins
+  # member: build-box  # where roles that name no member: work
 
 sandbox:
   # commands agents and verifiers may run. GPU work only via bsk.
@@ -28,7 +48,7 @@ sandbox:
 roles:
   lead:
     description: Understands the task, splits it, delegates, integrates and reports.
-    models: [kimi-k2.6, glm-5.2]
+    tier: premium        # `lca run harden -tier cheap` rehearses the pipeline cheaply
     effort: high
     context: 200000
     tools: [list_dir, glob, grep, read_file, todowrite, delegate, run_command]
@@ -43,6 +63,11 @@ roles:
   coder:
     description: Implements one well-specified change and makes its check pass.
     models: [qwen3-coder-480b-a35b-instruct, deepseek-v4-pro]
+    # pinned on purpose: a coder chain is chosen for code, not for price.
+    # member: build-box  # its sessions (and their worktrees) live on that machine
+    review: reviewer     # after the check passes, reviewer judges the diff and can
+                         # block the apply with "VERDICT: reject" (review: none = off)
+    fork: true           # start from the files the lead already read, not blank
     effort: medium
     context: 128000
     tools: [list_dir, glob, grep, read_file, edit, write, run_command]
@@ -54,6 +79,8 @@ roles:
 
   reviewer:
     description: Reads a finished diff and judges it, on a different family than the coder.
+    # pinned, not tiered: a second opinion from the coder's own family shares the
+    # blind spots the review exists to find (the loader warns when it does).
     models: [glm-5.2, kimi-k2.6]
     effort: high
     context: 200000

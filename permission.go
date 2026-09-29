@@ -17,6 +17,8 @@ import (
 //	edit       edit / write                        → path
 //	run        run_command                         → the command line
 //	task       task                                → subagent name
+//	delegate   delegate                            → role name (a reviewer session
+//	                                                 gets delegate: deny)
 //	skill      skill                               → skill name
 //	todo       todowrite                           → *
 //	web        webfetch                            → url

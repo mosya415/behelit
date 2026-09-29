@@ -131,7 +131,8 @@ func runInit(cfg Config, args []string) int {
 	var b strings.Builder
 	fmt.Fprintf(&b, `# Team for %s — written by lca init from %s/models.
 # Model names are the gateway's; order = fallback chain. Edit freely;
-# lca doctor checks it (including a real tool call on each model).
+# lca doctor checks it (including a real tool call on the first model of each
+# role; lca doctor -all probes every model in every chain).
 
 entry: lead
 transport: native      # the models' own tool-call format (engines need their tool-call parser)
@@ -209,7 +210,7 @@ roles:
 		row("remote", *remote+faint(" · files and commands go there over ssh"))
 	}
 	fmt.Println()
-	hint("next: lca doctor — checks the gateway and a real tool call on every model")
+	hint("next: lca doctor — the gateway, the roles and one real tool call per role (-all: every model)")
 	return 0
 }
 
@@ -424,6 +425,28 @@ func runDoctor(cfg Config, args []string) int {
 		}
 	}
 
+	// The fleet as the runtime will resolve it, built once: the checks below all
+	// ask questions about a member, and two orchestrators could answer them
+	// differently.
+	orch := doctorOrchestrator(cfg, roles)
+
+	// A role's check_cmd meets the sandbox of the machine that role works on, not
+	// the team's: a verifier the allowlist refuses fails every delegation to that
+	// role, twenty minutes in and with a message about the sandbox rather than
+	// about the change. Silent otherwise, because the common case is fine.
+	if orch != nil && roles != nil {
+		for _, r := range roles.Roles {
+			if r.CheckCmd == "" {
+				continue
+			}
+			m := orch.memberFor(r)
+			if cerr := checkOn(orch.policyOf(m), m, r.CheckCmd); cerr != nil {
+				fail("role %s: check_cmd %q cannot run on member %s: %v", r.Name, r.CheckCmd, m.MemberName(), cerr)
+				hint("add it to sandbox.allow (or to members.%s allow:), or change the role's check_cmd", m.MemberName())
+			}
+		}
+	}
+
 	if !*noProbe && err == nil && rerr == nil && roles != nil && len(roles.Roles) > 0 {
 		section("tool calling")
 		type target struct{ role, model string }
@@ -440,7 +463,7 @@ func runDoctor(cfg Config, args []string) int {
 		}
 		results := make([]probeResult, len(targets))
 		var wg sync.WaitGroup
-		fmt.Println("  " + faint("asking each model for one tool call…"))
+		fmt.Println("  " + faint("asking each probed model for one tool call…"))
 		for i, t := range targets {
 			wg.Add(1)
 			go func(i int, t target) {
@@ -473,7 +496,7 @@ func runDoctor(cfg Config, args []string) int {
 	// present and the dir inside a repository, the worktree base writable, and
 	// THAT member's allowlist resolved there — an operator has to find all of this
 	// before a run does, not twenty minutes into one.
-	if orch := doctorOrchestrator(cfg, roles); orch != nil {
+	if orch != nil {
 		names := orch.memberNames()
 		if *memberFlag != "" {
 			if orch.member(*memberFlag) == nil {
@@ -564,6 +587,43 @@ func runDoctor(cfg Config, args []string) int {
 			if orch.legacyFleet() {
 				hint("delegate is off on the old remote: block (its worktree would be local) — move it into members: for cross-machine worktrees")
 			}
+		}
+	}
+
+	// Workflows. A file that does not parse, or whose steps name a role, a member,
+	// a tier or a command this team cannot honour, should be found by the command
+	// an operator already runs — not at step 9 of the pipeline that needed it.
+	// These are `lca run -dry-run`'s checks without the plan table: one line per
+	// workflow, because a fleet may hold a dozen and doctor is read at a glance.
+	if wfs, wfWarns := listWorkflows(cfg); len(wfs)+len(wfWarns) > 0 {
+		section("workflows", faint("%s", plural(len(wfs)+len(wfWarns), "file", "files")))
+		for _, w := range wfWarns {
+			fail("%s", w) // it did not parse: nothing could run it
+		}
+		lead := ""
+		if roles != nil {
+			lead = roles.Entry
+		}
+		lead = firstNonEmpty(lead, cfg.Agent)
+		for _, wf := range wfs {
+			steps := plural(len(wf.Steps), "step", "steps")
+			if orch == nil || roles == nil || len(roles.Roles) == 0 {
+				okLine("%s · %s%s", wf.Name, steps, faint(" (parsed; a prompt or delegate step needs a roles.yaml)"))
+				continue
+			}
+			// A declared variable with no value is supplied with -var at run time,
+			// so a stand-in keeps the contract from reading as a broken workflow.
+			vars := wf.effectiveVars(nil)
+			for k, v := range vars {
+				if strings.TrimSpace(v) == "" {
+					vars[k] = "doctor"
+				}
+			}
+			if err := wf.bind(orch, lead, vars); err != nil {
+				fail("%v", err)
+				continue
+			}
+			okLine("%s · %s", wf.Name, steps)
 		}
 	}
 
@@ -796,9 +856,14 @@ func memberAllowlist(cfg Config, roles *RolesConfig, m *Member) []string {
 // session: doctor must report the members that will actually be used (including
 // the one LCA_REMOTE alone defines), not just what roles.yaml spelled out.
 func doctorOrchestrator(cfg Config, roles *RolesConfig) *Orchestrator {
-	o := &Orchestrator{}
+	o := &Orchestrator{agents: map[string]*Agent{}}
 	if roles != nil {
 		o.roles = roles
+		// Only the roles, not the markdown agents: what a workflow's steps name is
+		// a role, and Workflow.bind resolves it through o.agents like the runner.
+		for _, r := range roles.Roles {
+			o.agents[r.Name] = r
+		}
 	}
 	o.setFleet(roles)
 	jl, err := NewJail(cfg.Root, allowlistOf(cfg, roles), cfg.Unsafe)
