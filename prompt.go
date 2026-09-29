@@ -193,17 +193,12 @@ func (s *Session) systemPrompt() string {
 	}
 	if has["delegate"] {
 		parts = append(parts, delegatePrompt)
-		if !s.client.Native() { // native gets the list in the tool description
-			var b strings.Builder
-			b.WriteString("Roles available to <delegate role=\"…\">:\n")
-			for _, r := range s.orch.roleList(s.agent.Name) {
-				desc := strings.TrimSpace(r.Description)
-				if r.CheckCmd != "" {
-					desc += " (always verified with: " + r.CheckCmd + ")"
-				}
-				fmt.Fprintf(&b, "- %s: %s\n", r.Name, desc)
-			}
-			parts = append(parts, strings.TrimRight(b.String(), "\n"))
+		if !s.client.Native() {
+			// A text-transport model has no tool schema to carry a description, so
+			// the one the native path puts there goes into the prompt instead —
+			// the same text, so the result contract, the statuses and the role
+			// list cannot drift between the two transports we ship at parity.
+			parts = append(parts, delegateDescription(s))
 		}
 	}
 	if has["todowrite"] {

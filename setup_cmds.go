@@ -255,9 +255,13 @@ func runDoctor(cfg Config, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	noProbe := fs.Bool("no-probe", false, "don't call the models (only list and configuration checks)")
 	all := fs.Bool("all", false, "probe every model in every chain, not just the first of each role")
+	tierFlag := fs.String("tier", "", "run every tier-declaring role on that chain (roles.yaml tiers:)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	// doctor is the subcommand whose job is showing the resolved team, so it has
+	// to be pointable at a tier like every other one.
+	cfg.Tier = firstNonEmpty(*tierFlag, cfg.Tier)
 	failed := false
 	fail := func(format string, a ...any) { failed = true; errLine(format, a...) }
 
@@ -295,6 +299,9 @@ func runDoctor(cfg Config, args []string) int {
 		}(), ", ")))
 		for _, w := range roles.Warnings {
 			warnLine("%s", w)
+		}
+		if roles.Tier != "" {
+			row("tier", roles.Tier+faint(" (active for every role that declares one)"))
 		}
 		var rows [][]string
 		for _, r := range roles.Roles {
@@ -344,9 +351,9 @@ func runDoctor(cfg Config, args []string) int {
 				return ""
 			}(), "provider default")
 			replay := map[string]string{"all": "every step", "turn": "this turn", "": "not replayed"}[prof.Replay]
-			rows = append(rows, []string{r.Name, strings.Join(chain, faint(" → ")), temp, topP, effort, kfmt(budget), replay})
+			rows = append(rows, []string{r.Name, orDash(r.Tier), strings.Join(chain, faint(" → ")), temp, topP, effort, kfmt(budget), replay})
 		}
-		table([]string{"role", "models", "temp", "top_p", "effort", "context", "reasoning"}, rows)
+		table([]string{"role", "tier", "models", "temp", "top_p", "effort", "context", "reasoning"}, rows)
 		if failed && len(served) > 0 {
 			hint("red models aren't listed by the gateway — use names from: %s", strings.Join(sortedKeys(served), ", "))
 		}

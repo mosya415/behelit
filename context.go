@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -25,6 +26,41 @@ const (
 )
 
 var reToolHdr = regexp.MustCompile(`^<tool_result name="([^"]*)" path="([^"]*)">`)
+
+// reToolResultBlock matches one whole text-transport result block, the shape
+// appendResults writes. A user message can carry several of them, so the header
+// alone is not enough to read a specific tool's output back out.
+var reToolResultBlock = regexp.MustCompile(`(?s)<tool_result name="([^"]*)" path="([^"]*)">\n(.*?)\n</tool_result>`)
+
+// reToolFraming matches the framing on a line of its own. A file's contents can
+// carry it, and then it is indistinguishable from the real thing.
+var reToolFraming = regexp.MustCompile(`(?m)^(?:</tool_result>|<tool_result name=")`)
+
+// toolResultText is the text transport's spelling of one tool result — the one
+// shape appendResults writes and parseToolResults reads back.
+func toolResultText(name, path, body string) string {
+	return fmt.Sprintf("<tool_result name=\"%s\" path=\"%s\">\n%s\n</tool_result>\n", name, path, body)
+}
+
+// toolResult is one recovered text-transport result.
+type toolResult struct{ name, path, body string }
+
+// parseToolResults reads the results back out of a text-transport message. The
+// framing is plain text, so a file whose own contents carry a bare
+// </tool_result> line would truncate its block and turn the rest of itself into
+// a result for a path that was never read. There is no way to tell the two apart
+// after the fact, so the parse counts only when re-rendering it reproduces the
+// message byte for byte; anything else is reported as unreadable and used for
+// nothing.
+func parseToolResults(content string) ([]toolResult, bool) {
+	var out []toolResult
+	var b strings.Builder
+	for _, m := range reToolResultBlock.FindAllStringSubmatch(content, -1) {
+		out = append(out, toolResult{m[1], m[2], m[3]})
+		b.WriteString(toolResultText(m[1], m[2], m[3]))
+	}
+	return out, b.String() == content
+}
 
 // estimateTokens is a tokenizer-free approximation (~4 chars/token). Good enough
 // to drive trimming without pulling in a model-specific tokenizer on an

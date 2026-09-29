@@ -62,6 +62,9 @@ type Agent struct {
 	ToolsSet bool
 	Context  int    // context limit in tokens
 	CheckCmd string // default verifier command for tasks given to this role
+	Review   string // roles.yaml `review:` — the role that reviews this role's diffs
+	Fork     bool   // roles.yaml `fork:` — delegations to this role start from the caller's reads
+	Tier     string // roles.yaml `tier:` — the chain this role names instead of models:
 }
 
 func (a *Agent) isPrimary() bool  { return a.Mode == "primary" || a.Mode == "all" || a.Mode == "" }

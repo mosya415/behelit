@@ -39,11 +39,13 @@ func main() {
 	roleFlag := flag.String("role", "", "")
 	modelFlag := flag.String("model", "", "")
 	checkFlag := flag.String("check", "", "")
+	tierFlag := flag.String("tier", "", "")
 	flag.Usage = usage
 	flag.Parse()
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
 
 	cfg.Unsafe = cfg.Unsafe || *unsafe
+	cfg.Tier = firstNonEmpty(*tierFlag, cfg.Tier)
 	in := NewInput(os.Stdin)
 	ap := NewApprover(in)
 	if *yes || *yesLong {
@@ -85,6 +87,7 @@ func main() {
 	}
 	orch.rec.Event("session_start", map[string]any{
 		"root": orch.jl.Root, "model": sess.client.Ref(), "endpoint": sess.client.Endpoint(), "agent": sess.agent.Name,
+		"tier": orch.activeTier(),
 	})
 	defer orch.rec.Event("session_end", nil)
 	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions)
@@ -123,7 +126,7 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []st
 	}
 	start := time.Now()
 	v := sess.RunVerified(context.Background(), check, orch.verifyAttempts())
-	sess.traceTask(prompt, v, check, 0, 0, false, start)
+	sess.traceTask(prompt, v, check, 0, 0, false, nil, start)
 	sess.saveTranscript()
 	fmt.Fprintf(os.Stderr, "\n%s  %s\n", statusWord(v.Status), faint("%s · %s", check, plural(v.Attempts, "attempt", "attempts")))
 	if v.Status != "passed" {
@@ -215,6 +218,7 @@ func usage() {
 		" " + f("FLAGS"),
 		"   -role <name>                 role (roles.yaml) or agent to run as",
 		"   -model <name>                model override: gateway name or provider/model",
+		"   -tier <name>                 run every tier-declaring role on that chain (roles.yaml tiers:)",
 		"   -y                           approve edits, commands and fetches without asking",
 		"   -resume                      continue the most recent session",
 		"   -unsafe                      lift the sandbox (any path, any command)",

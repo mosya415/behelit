@@ -501,7 +501,11 @@ func (r *Repl) cmdAgents(string) bool {
 		for _, p := range o.roles.Sources {
 			ps = append(ps, prettyPath(p, root))
 		}
-		section("team", faint("%s", strings.Join(ps, ", ")))
+		what := strings.Join(ps, ", ")
+		if t := o.activeTier(); t != "" {
+			what += " · tier " + t
+		}
+		section("team", faint("%s", what))
 		var rows [][]string
 		for _, a := range o.roles.Roles {
 			name := a.Name
@@ -516,9 +520,9 @@ func (r *Repl) cmdAgents(string) bool {
 			if a.Context > 0 {
 				ctx = kfmt(a.Context)
 			}
-			rows = append(rows, []string{name, strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))})
+			rows = append(rows, []string{name, orDash(a.Tier), strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))})
 		}
-		table([]string{"role", "models", "effort", "context", "tools", "check"}, rows)
+		table([]string{"role", "tier", "models", "effort", "context", "tools", "check"}, rows)
 	}
 	section("agents")
 	var rows [][]string
@@ -615,11 +619,12 @@ func (r *Repl) cmdTasks(arg string) bool {
 // statusWord colors a task status.
 func statusWord(s string) string {
 	switch s {
-	case "passed", "completed":
+	case "passed", "completed", "approve":
 		return cGreen + gUp + " " + s + cReset
 	case "running":
 		return cYellow + gPartial + " " + s + cReset
-	case "unverified", "not_applied":
+	// unreviewed is deliberately non-blocking, so it must not read as a failure.
+	case "unverified", "not_applied", "unreviewed":
 		return cYellow + gPartial + " " + s + cReset
 	}
 	return cRed + gDown + " " + s + cReset
@@ -859,6 +864,15 @@ func (r *Repl) cmdModel(arg string) bool {
 		}
 		row("current", chain)
 		row("via", hostOf(s.client.Endpoint())+faint(" · %s tools", transportName(s.client)))
+		if s.agent.Tier != "" {
+			// The declared tier and the one actually in force, because a -tier
+			// run answers "which models am I on?" differently from the file.
+			tier := s.agent.Tier
+			if act := r.orch.activeTier(); act != "" && act != s.agent.Tier {
+				tier += faint(" (running %s)", act)
+			}
+			row("tier", tier)
+		}
 		if p := s.client.Profile(); p.Family != "" {
 			row("profile", faint("%s · context %s · max output %s", p.Family, kfmt(p.Context), kfmt(min(p.Output, outputTokenMax))))
 		}

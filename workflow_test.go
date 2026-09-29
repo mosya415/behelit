@@ -1801,3 +1801,356 @@ func TestWorkflowRefusedResumeKeepsThePause(t *testing.T) {
 		t.Fatal("the pause file must survive a refused resume")
 	}
 }
+
+// ── review on a delegate step ───────────────────────────────────────────────
+
+// reviewerReplies is coderWritesFile plus a reviewer whose verdict the test
+// chooses; the reviewer runs on cheap-a, so its requests are identifiable.
+func reviewerReplies(t *testing.T, verdict string) *fakeServer {
+	return newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		switch req.Model {
+		case "coder-a", "coder-b":
+			if strings.Contains(req.Body, `"role":"tool"`) {
+				return fakeReply{content: "created done.txt"}
+			}
+			return fakeReply{calls: []ToolCall{call("w", "write", map[string]any{"path": "done.txt", "content": "ok\n"})}}
+		case "cheap-a":
+			return fakeReply{content: verdict}
+		}
+		return fakeReply{content: "ok"}
+	})
+}
+
+// tryWF loads and binds a workflow without failing the test, for the errors a
+// run must refuse before it spends a token.
+func tryWF(t *testing.T, h *harness, dir, text string) error {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "wf.yaml")
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := loadWorkflow(path)
+	if err != nil {
+		return err
+	}
+	return wf.bind(h.orch, h.sess.agent.Name, wf.effectiveVars(nil))
+}
+
+func TestWorkflowDelegateStepReview(t *testing.T) {
+	const text = `steps:
+  build:
+    delegate: create done.txt
+    role: coder
+    review: reviewer
+    on_fail: continue
+  after:
+    run: echo the reviewer spoke
+    when: ${steps.build.review} == %s
+`
+	t.Run("reject blocks the apply and fails the step", func(t *testing.T) {
+		h, dir := wfHarness(t, reviewerReplies(t, "VERDICT: reject\nthe test does not prove the fix"))
+		code, st, r := runWF(t, h, dir, fmt.Sprintf(text, "reject"), nil)
+		if code != 1 {
+			t.Fatalf("a blocked change is not a green run: exit %d", code)
+		}
+		ss := stepByName(st, "build")
+		if ss.Status != stepFailed || ss.Reviewer != "reviewer" || ss.Review != "reject" {
+			t.Fatalf("build step: %+v", ss)
+		}
+		if !strings.Contains(ss.Detail, "reviewer") || !strings.Contains(ss.Detail, "reject") {
+			t.Fatalf("run.log must say why a passing check still failed: %q", ss.Detail)
+		}
+		if after := stepByName(st, "after"); after == nil || after.Status != stepOK {
+			t.Fatalf("${steps.build.review} == reject must gate the next step: %+v", after)
+		}
+		if _, err := os.Stat(filepath.Join(h.root, "done.txt")); err == nil {
+			t.Fatal("a rejected diff must not reach the project tree")
+		}
+		r.Close()
+		saved, err := loadRunState(r.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b := stepByName(saved, "build"); b.Reviewer != "reviewer" || b.Review != "reject" {
+			t.Fatalf("state.json: %+v", b)
+		}
+		var rec *StepRecord
+		recs := readSteps(t, h)
+		for i := range recs {
+			if recs[i].Step == "build" {
+				rec = &recs[i]
+			}
+		}
+		if rec == nil || rec.Reviewer != "reviewer" || rec.Review != "reject" {
+			t.Fatalf("step record: %+v", rec)
+		}
+	})
+	t.Run("a retry after a reject is told what actually blocked it", func(t *testing.T) {
+		const retried = `steps:
+  build:
+    delegate: create done.txt
+    role: coder
+    review: reviewer
+    retries: 1
+`
+		fs := reviewerReplies(t, "VERDICT: reject\nthe test does not prove the fix")
+		fs.models = allModels()
+		h := newRoleHarness(t, fs, wfRoles, true)
+		if code, _, _ := runWF(t, h, t.TempDir(), retried, nil); code != 1 {
+			t.Fatalf("exit %d", code)
+		}
+		second := ""
+		for _, rq := range coderReqs(fs) {
+			for _, m := range rq.Messages {
+				c, _ := m["content"].(string)
+				if strings.Contains(c, "A previous attempt") {
+					second = c
+				}
+			}
+		}
+		if second == "" {
+			t.Fatal("the second attempt never ran")
+		}
+		if !strings.Contains(second, "reviewer rejected it") || !strings.Contains(second, "Its reasons") {
+			t.Fatalf("the retry must name the reviewer, not the verifier that passed:\n%s", second)
+		}
+		if strings.Contains(second, "did not pass the verifier") {
+			t.Fatalf("the check did pass:\n%s", second)
+		}
+	})
+	t.Run("approve leaves the pipeline alone", func(t *testing.T) {
+		h, dir := wfHarness(t, reviewerReplies(t, "reads correctly\nVERDICT: approve"))
+		code, st, _ := runWF(t, h, dir, fmt.Sprintf(text, "approve"), nil)
+		if code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		ss := stepByName(st, "build")
+		if ss.Status != stepOK || ss.Review != "approve" || ss.Reviewer != "reviewer" {
+			t.Fatalf("build step: %+v", ss)
+		}
+		if stepByName(st, "after").Status != stepOK {
+			t.Fatal("${steps.build.review} == approve must gate the next step")
+		}
+		if got, _ := os.ReadFile(filepath.Join(h.root, "done.txt")); string(got) != "ok\n" {
+			t.Fatalf("an approved diff still applies: %q", got)
+		}
+	})
+}
+
+func TestWorkflowReviewBindErrors(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	for _, tc := range []struct{ name, text, want string }{
+		{"on a run step", "steps:\n  a:\n    run: echo hi\n    review: reviewer\n", "only a delegate step's diff is reviewed"},
+		{"unknown role", "steps:\n  a:\n    delegate: do it\n    role: coder\n    review: nosuchrole\n", `no role "nosuchrole"`},
+		{"self review", "steps:\n  a:\n    delegate: do it\n    role: coder\n    review: coder\n", "a role cannot review itself"},
+		{"review: on with nobody configured", "steps:\n  a:\n    delegate: do it\n    role: coder\n    review: on\n", "names no review:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tryWF(t, h, filepath.Join(dir, tc.name), tc.text)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// ── fork on a delegate step ─────────────────────────────────────────────────
+
+func TestWorkflowDelegateStepFork(t *testing.T) {
+	const text = "steps:\n  build:\n    delegate: create done.txt\n    role: coder\n    fork: true\n"
+	t.Run("refused on the steps that cannot inherit", func(t *testing.T) {
+		h, dir := wfHarness(t, alwaysReply(t, "ok"))
+		for _, bad := range []string{
+			"steps:\n  a:\n    run: echo hi\n    fork: true\n",
+			"steps:\n  a:\n    prompt: think\n    role: coder\n    fork: true\n",
+		} {
+			err := tryWF(t, h, filepath.Join(dir, truncate(bad, 12)), bad)
+			if err == nil || !strings.Contains(err.Error(), "only a delegate step inherits the caller's context") {
+				t.Fatalf("want a refusal, got %v", err)
+			}
+		}
+	})
+	// Under `lca run` the caller is the run's own lead, whose transcript is just
+	// its system prompt, and with no prompt step before it there is nothing for
+	// the child to inherit. Pinned rather than papered over.
+	t.Run("nothing to inherit under lca run", func(t *testing.T) {
+		fs, reads := coderNeedsToRead(t, "func Alpha()", "ok")
+		fs.models = allModels()
+		h := newRoleHarness(t, fs, wfRoles, true)
+		writeFixtures(t, h)
+		code, st, _ := runWF(t, h, t.TempDir(), text, nil)
+		if code != 0 || stepByName(st, "build").Status != stepOK {
+			t.Fatalf("the step must still pass: exit %d %+v", code, stepByName(st, "build"))
+		}
+		if *reads != 1 {
+			t.Fatalf("the run's lead has read nothing, so the child must read for itself: %d", *reads)
+		}
+	})
+	// Through /run mid-conversation the lead IS the user's session, and then
+	// there is something to inherit.
+	t.Run("the caller's reads reach the child through /run", func(t *testing.T) {
+		fs, reads := coderNeedsToRead(t, "func Alpha()", "ok")
+		fs.models = allModels()
+		h := newRoleHarness(t, fs, wfRoles, true)
+		writeFixtures(t, h)
+		leadHasRead(t, h, "a.go", "b.go")
+		code, st, _ := runWF(t, h, t.TempDir(), text, nil)
+		if code != 0 || stepByName(st, "build").Status != stepOK {
+			t.Fatalf("exit %d %+v", code, stepByName(st, "build"))
+		}
+		if *reads != 0 {
+			t.Fatalf("the child re-read what the lead already had (%d)", *reads)
+		}
+		if first := coderReqs(fs)[0]; !strings.Contains(first.Body, "func Alpha()") {
+			t.Fatal("the child's first request should carry the lead's reads")
+		}
+	})
+}
+
+// The reads a workflow actually accumulates are made by its prompt steps, in
+// their own child sessions — so those are what `fork: true` inherits when the
+// run's own lead has read nothing.
+func TestWorkflowDelegateStepForksFromThePromptStep(t *testing.T) {
+	const text = `steps:
+  survey:
+    prompt: read a.go and b.go
+    role: lead
+  build:
+    delegate: create done.txt
+    role: coder
+    fork: true
+`
+	reads := 0
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		switch req.Model {
+		case "lead-a", "lead-b":
+			if strings.Contains(req.Body, `"role":"tool"`) {
+				return fakeReply{content: "surveyed both files"}
+			}
+			return fakeReply{calls: []ToolCall{
+				call("r1", "read_file", map[string]any{"path": "a.go"}),
+				call("r2", "read_file", map[string]any{"path": "b.go"})}}
+		case "coder-a", "coder-b":
+			if !strings.Contains(req.Body, "func Alpha()") {
+				reads++
+				return fakeReply{calls: []ToolCall{call("r", "read_file", map[string]any{"path": "a.go"})}}
+			}
+			if !strings.Contains(req.Body, "wrote") {
+				return fakeReply{calls: []ToolCall{call("w", "write", map[string]any{"path": "done.txt", "content": "ok\n"})}}
+			}
+			return fakeReply{content: "done"}
+		}
+		return fakeReply{content: "ok"}
+	})
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, wfRoles, true)
+	writeFixtures(t, h)
+	code, st, _ := runWF(t, h, t.TempDir(), text, nil)
+	if code != 0 || stepByName(st, "build").Status != stepOK {
+		t.Fatalf("exit %d %+v", code, stepByName(st, "build"))
+	}
+	if reads != 0 {
+		t.Fatalf("the survey step had already read those files (%d re-reads)", reads)
+	}
+	first := coderReqs(fs)[0]
+	if inheritedReads(first, "a.go") != 1 || inheritedReads(first, "b.go") != 1 {
+		t.Fatalf("both of the prompt step's reads should reach the child:\n%s", truncate(first.Body, 600))
+	}
+}
+
+func TestWorkflowForkParseErrors(t *testing.T) {
+	h, dir := wfHarness(t, alwaysReply(t, "ok"))
+	err := tryWF(t, h, dir, "steps:\n  a:\n    delegate: do it\n    role: coder\n    fork: maybe\n")
+	if err == nil || !strings.Contains(err.Error(), "is not true or false") {
+		t.Fatalf("want a refusal, got %v", err)
+	}
+}
+
+// ── tiers and a resume ──────────────────────────────────────────────────────
+
+// A run that started on one chain cannot be finished on another: one green
+// result over two tiers is the dishonest failure `lca run` exists to prevent.
+func TestWorkflowRefusesTierChangeOnResume(t *testing.T) {
+	fs := alwaysReply(t, "ok")
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, tierRoles, true)
+	wfdir := t.TempDir()
+	t.Setenv("LCA_WORKFLOWS", wfdir)
+	if err := os.WriteFile(filepath.Join(wfdir, "held.yaml"),
+		[]byte("steps:\n  one:\n    run: echo one\n  two:\n    run: test -f nope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runCLI(t, h, "held"); code != 1 {
+		t.Fatalf("the second step fails, so the run stays unfinished: exit %d", code)
+	}
+	runs := mustRuns(t, h.orch.cfg)
+	dir := filepath.Join(runsDir(h.orch.cfg), runs[0].Run)
+	if runs[0].Tier != "" {
+		t.Fatalf("the run recorded a tier nobody selected: %q", runs[0].Tier)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cheap := h.orch.cfg
+	cheap.Tier = "cheap"
+	code := 0
+	out := captureStdout(t, func() { code = runWorkflow(cheap, []string{"held", "-resume"}) })
+	if code != 2 || !strings.Contains(stripANSI(out), "started on the") {
+		t.Fatalf("exit %d output:\n%s", code, out)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("a refused resume must leave the run untouched (%v)", err)
+	}
+
+	t.Run("-tier naming a different tier is refused too", func(t *testing.T) {
+		code := 0
+		out := captureStdout(t, func() { code = runWorkflow(h.orch.cfg, []string{"held", "-resume", "-tier", "cheap"}) })
+		if code != 2 || !strings.Contains(stripANSI(out), "started on the") {
+			t.Fatalf("exit %d output:\n%s", code, out)
+		}
+	})
+}
+
+// …and the tier a run recorded is the tier it resumes on: the resume line the
+// run itself printed has to work, with or without the flag repeated.
+func TestWorkflowResumesOnTheRecordedTier(t *testing.T) {
+	fs := alwaysReply(t, "ok")
+	fs.models = allModels()
+	h := newRoleHarness(t, fs, tierRoles, true)
+	wfdir := t.TempDir()
+	t.Setenv("LCA_WORKFLOWS", wfdir)
+	gate := filepath.Join(t.TempDir(), "gate")
+	if err := os.WriteFile(filepath.Join(wfdir, "held.yaml"),
+		[]byte("steps:\n  one:\n    run: echo one\n  two:\n    run: test -f "+gate+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cheap := h.orch.cfg
+	cheap.Tier = "cheap"
+	if code := runCLI(t, h, "held", "-tier", "cheap"); code != 1 {
+		t.Fatalf("the second step fails, so the run stays unfinished: exit %d", code)
+	}
+	runs := mustRuns(t, h.orch.cfg)
+	if len(runs) != 1 || runs[0].Tier != "cheap" {
+		t.Fatalf("the run must record the tier it bound to: %+v", runs)
+	}
+	if err := os.WriteFile(gate, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No -tier and no LCA_TIER: the recorded tier is what the run continues on.
+	bare := h.orch.cfg
+	bare.Tier = ""
+	code := 0
+	out := captureStdout(t, func() { code = runWorkflow(bare, []string{"held", "-resume"}) })
+	if code != 0 {
+		t.Fatalf("a run must be resumable by the command it printed: exit %d\n%s", code, stripANSI(out))
+	}
+	if st := mustRuns(t, h.orch.cfg)[0]; st.Status != "ok" || st.Cursor != 2 || st.Tier != "cheap" {
+		t.Fatalf("the finished run: %+v", st)
+	}
+}

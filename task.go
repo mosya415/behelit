@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -123,6 +124,130 @@ func runTaskTool(tc *ToolCtx, a Args) string {
 	return o.runChild(tc.Ctx, child)
 }
 
+const (
+	// forkBudgetShare bounds the inherited context to half the child's budget: a
+	// subagent that arrives with three-quarters of its window already full has
+	// nowhere to do the work, and Run's auto-compact cannot rescue it (it needs
+	// len(Msgs) > 4, and a forked transcript is exactly system+context+ack+task).
+	forkBudgetShare = 2
+	forkHeader      = "[Context inherited from the calling agent: the files it had already read, verbatim. Read a file again before changing it if the tool tells you to.]"
+	forkAck         = "Understood — I have the files above and will work from them."
+)
+
+// forkedContext hands a child the caller's accumulated file knowledge instead of
+// a blank transcript. Only the latest read of each path is inherited (an earlier
+// read is superseded waste, the same argument dedupeReads makes), and it is
+// rendered in the text transport's own <tool_result …> spelling so that (a) it is
+// valid for a native and a text child alike — a native parent's tool_calls can
+// never be replayed to a text child — and (b) the existing trimming, dedupe and
+// compaction machinery already recognises it. The synthetic acknowledgement is
+// there so the block does not hand the model a dangling tool result with nothing
+// said about it; what keeps the transcript from ending on an assistant message is
+// the task that runDelegateTool appends after this returns.
+func (o *Orchestrator) forkedContext(parent, child *Session) (msgs []Message, files, dropped int) {
+	type read struct{ path, body string }
+	var found []read
+	seen := map[string]bool{}
+	add := func(path, body string) {
+		// An error is no knowledge and a stub is knowledge already thrown away.
+		if path == "" || seen[path] || isStub(body) || strings.HasPrefix(body, "error:") {
+			return
+		}
+		// A fork cannot run an approval prompt on the child's behalf, so only an
+		// outright Allow is inheritable: what the child would have to ask for
+		// (.env under the default rules) it is not handed either. A path that does
+		// not resolve inside its jail is one it could not have read at all.
+		if _, err := child.jail().Resolve(path); err != nil {
+			return
+		}
+		if Evaluate("read", permPath(child.jail(), path), child.rules()...) != Allow {
+			return
+		}
+		// The body is rendered back into that same framing, so a file carrying it
+		// could close its own block and forge a read of another path. Such a file
+		// is not inherited; the child reads it for itself.
+		if reToolFraming.MatchString(body) {
+			return
+		}
+		seen[path] = true
+		found = append(found, read{path, body})
+	}
+	// A result carries the name the model called the tool by, so an alias
+	// ("read", "cat") has to resolve to read_file like everywhere else.
+	isRead := func(name string) bool {
+		d := resolveToolName(name)
+		return d != nil && d.Name == "read_file"
+	}
+	// Backwards: the first sighting of a path is its latest read.
+	for i := len(parent.Msgs) - 1; i >= 1; i-- {
+		m := parent.Msgs[i]
+		switch {
+		case m.Role == "tool" && isRead(m.Tool):
+			add(m.Path, m.Content)
+		case m.Role == "user" && strings.HasPrefix(m.Content, "<tool_result"):
+			blocks, ok := parseToolResults(m.Content)
+			if !ok {
+				continue // ambiguous framing: nothing in it can be trusted
+			}
+			for j := len(blocks) - 1; j >= 0; j-- {
+				if isRead(blocks[j].name) {
+					add(blocks[j].path, blocks[j].body)
+				}
+			}
+		}
+	}
+	if len(found) == 0 {
+		return nil, 0, 0
+	}
+	// The parent's own order: a stable prefix, with the most recently read file
+	// last, nearest the task.
+	for i, j := 0, len(found)-1; i < j; i, j = i+1, j-1 {
+		found[i], found[j] = found[j], found[i]
+	}
+	block := func(r read) Message {
+		// Each file its own message, exactly as appendResults spells it, so
+		// dedupeReads and trimForContext can collapse them one by one.
+		return Message{Role: "user", Content: strings.TrimRight(toolResultText("read_file", r.path, r.body), "\n")}
+	}
+	render := func(rs []read) []Message {
+		out := []Message{{Role: "user", Content: forkHeader}}
+		for _, r := range rs {
+			out = append(out, block(r))
+		}
+		return append(out, Message{Role: "assistant", Content: forkAck, Agent: child.agent.Name})
+	}
+	if budget := child.budget() / forkBudgetShare; budget > 0 {
+		// estimateTokens is a per-message sum, so dropping the front block is
+		// its own cost off the total — no need to re-render to weigh what is left.
+		total := estimateTokens(render(found))
+		for len(found) > 0 && total > budget {
+			total -= estimateTokens([]Message{block(found[0])})
+			found = found[1:] // the oldest read first: the task is about the newest
+			dropped++
+		}
+	}
+	if len(found) == 0 {
+		return nil, 0, dropped
+	}
+	for _, r := range found {
+		// Seeded only when the inherited bytes ARE the worktree's bytes: then the
+		// child has genuinely seen the file and may edit it without re-reading.
+		// Otherwise nothing is seeded and checkStale still forces a fresh read.
+		prefix := r.path + ":\n"
+		if !strings.HasPrefix(r.body, prefix) {
+			continue // a line range or a truncated read is not the whole file
+		}
+		abs, err := child.jail().Resolve(r.path)
+		if err != nil {
+			continue
+		}
+		if data, err := os.ReadFile(abs); err == nil && string(data) == strings.TrimPrefix(r.body, prefix) {
+			o.noteRead(child.jail(), r.path)
+		}
+	}
+	return render(found), len(found), dropped
+}
+
 // newChild creates a subagent session under parent.
 func (o *Orchestrator) newChild(parent *Session, ag *Agent, desc string) (*Session, error) {
 	o.mu.Lock()
@@ -209,14 +334,7 @@ func (o *Orchestrator) runChild(ctx context.Context, child *Session) string {
 	entry := o.trackStart(child.ID, "task", child.agent.Name, child.title)
 	child.view.Begin()
 	err := child.Run(ctx)
-	state, text := "completed", ""
-	for i := len(child.Msgs) - 1; i > 0; i-- {
-		if child.Msgs[i].Role == "assistant" {
-			if text = finalText(child.Msgs[i]); text != "" {
-				break
-			}
-		}
-	}
+	state, text := "completed", lastAssistantText(child)
 	switch {
 	case err == context.Canceled:
 		state = "cancelled"

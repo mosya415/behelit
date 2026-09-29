@@ -57,7 +57,7 @@ func (r *Repl) cmdRole(arg string) bool {
 		return r.showRole(a)
 	}
 	if len(fields) < 3 && fields[1] != "use" {
-		errLine("usage: /role %s <model|effort|temperature|top_p|context|steps|check|tools|use> <value>", name)
+		errLine("usage: /role %s <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value>", name)
 		return false
 	}
 	key, value := fields[1], strings.TrimSpace(strings.Join(fields[2:], " "))
@@ -76,7 +76,9 @@ func (r *Repl) cmdRole(arg string) bool {
 			errLine("usage: /role %s model <name[,fallback]>", name)
 			return false
 		}
-		a.Models, a.IsRole = models, true
+		// A hand-set chain replaces the tier, or /role save would write the tier
+		// back and silently drop what was just set.
+		a.Models, a.IsRole, a.Tier = models, true, ""
 		if o.gatewayModels > 0 { // warn about names the gateway doesn't serve
 			if served, err := r.local.ListModels(); err == nil {
 				have := map[string]bool{}
@@ -124,8 +126,53 @@ func (r *Repl) cmdRole(arg string) bool {
 			return false
 		}
 		a.Steps = n
+	case "tier":
+		if o.roles == nil || len(o.roles.Tiers) == 0 {
+			errLine("this team has no tiers: block in roles.yaml")
+			return false
+		}
+		if _, ok := o.roles.Tiers[value]; !ok {
+			errLine("no tier %q (tiers: %s)", value, o.roles.tierList())
+			return false
+		}
+		a.Tier, a.IsRole = value, true
+		o.roles.applyTier(a)
+	case "fork":
+		switch strings.ToLower(value) {
+		case "true", "yes", "on":
+			a.Fork = true
+		case "false", "no", "off":
+			a.Fork = false
+		default:
+			errLine("fork is true or false, got %q", value)
+			return false
+		}
 	case "check", "check_cmd":
 		a.CheckCmd = value
+	case "review", "reviewer":
+		if isNone(value) {
+			a.Review = "none"
+			break
+		}
+		rev := o.agents[value]
+		if rev == nil || !rev.IsRole {
+			errLine("no role %q — /role lists them, /role new %s creates one", value, value)
+			return false
+		}
+		if value == name {
+			errLine("a role cannot review itself")
+			return false
+		}
+		if len(rev.Models) == 0 && rev.Model == "" {
+			// With no chain of its own the reviewer would run on the reviewed
+			// subagent's model, which is the model reviewing its own diff.
+			errLine("%s has no model of its own — /role %s model <name[,fallback]> first", value, value)
+			return false
+		}
+		if sameFamily(a, rev) {
+			warnLine("%s and %s are the same family — a same-family second opinion shares the blind spots", a.Models[0], rev.Models[0])
+		}
+		a.Review = value
 	case "tools":
 		var tools []string
 		for _, t := range strings.FieldsFunc(value, func(c rune) bool { return c == ',' || c == ' ' }) {
@@ -142,7 +189,7 @@ func (r *Repl) cmdRole(arg string) bool {
 		a.Tools, a.ToolsSet = tools, true
 	default:
 		errLine("don't know how to set %q", key)
-		hint("model · effort · temperature · top_p · context · steps · check · tools · use")
+		hint("model · tier · effort · temperature · top_p · context · steps · check · review · fork · tools · use")
 		return false
 	}
 	// the running session picks the change up immediately
@@ -190,7 +237,7 @@ func (r *Repl) showRoles() bool {
 		rows = append(rows, []string{mark, a.Name, strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))})
 	}
 	table([]string{"", "role", "models", "effort", "context", "tools", "check"}, rows)
-	hint("/role <name> model <m1,m2> · effort high · temperature 0.6 · check \"go test ./...\" · use")
+	hint("/role <name> <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value> — e.g. model <m1,m2> · effort high · check \"go test ./...\" · use")
 	hint("/role save writes the team to .lca/roles.yaml · /delegate <role> <task> hands one task over")
 	return false
 }
@@ -213,7 +260,14 @@ func (r *Repl) showRole(a *Agent) bool {
 	if a.Steps > 0 {
 		row("steps", strconv.Itoa(a.Steps))
 	}
+	row("tier", firstNonEmpty(a.Tier, faint("— (its own chain)")))
 	row("check", firstNonEmpty(a.CheckCmd, faint("— (a delegated task will come back unverified)")))
+	row("review", firstNonEmpty(a.Review, faint("— (the verifier decides alone)")))
+	fork := faint("— (starts from a blank context)")
+	if a.Fork {
+		fork = "true" + faint(" (starts from the caller's reads)")
+	}
+	row("fork", fork)
 	if a.ToolsSet {
 		row("tools", strings.Join(a.Tools, ", "))
 	} else {

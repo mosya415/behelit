@@ -38,6 +38,7 @@ type Config struct {
 	Thinking     string   // reasoning mode: on | off | low | medium | high | max (LCA_THINKING)
 	Agent        string   // primary agent to start with (LCA_AGENT)
 	SubagentMax  int      // max subagent nesting depth (LCA_SUBAGENT_DEPTH)
+	Tier         string   // active model tier (-tier / LCA_TIER); remaps every role that names one
 
 	TransportOverride string // force a tool transport for the whole run (eval -transport)
 }
@@ -82,6 +83,7 @@ func loadConfig() Config {
 		Thinking:     os.Getenv("LCA_THINKING"),
 		Agent:        env("LCA_AGENT", "build"),
 		SubagentMax:  atoiDefault(os.Getenv("LCA_SUBAGENT_DEPTH"), 1),
+		Tier:         os.Getenv("LCA_TIER"),
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

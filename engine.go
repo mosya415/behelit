@@ -434,6 +434,25 @@ func (s *Session) tools() ([]*ToolDef, []ToolSchema) {
 	return s.toolDefs, s.schemas
 }
 
+// activeTier is the tier every tier-declaring role was remapped to ("" = each
+// role runs the tier it declares).
+func (o *Orchestrator) activeTier() string {
+	if o.roles == nil {
+		return ""
+	}
+	return o.roles.Tier
+}
+
+// tier is the tier that produced this session's chain, for the trace and /model.
+// A role with a chain of its own has no tier whatever the run selected, or a
+// trace grouped by tier would credit its tokens to a chain it never ran.
+func (s *Session) tier() string {
+	if s.agent.Tier == "" {
+		return ""
+	}
+	return firstNonEmpty(s.orch.activeTier(), s.agent.Tier)
+}
+
 // budget is the context budget for this session: the role's context limit,
 // else LCA_CTX_TOKENS, else 75% of the model's window.
 func (s *Session) budget() int {
@@ -1105,7 +1124,7 @@ func (s *Session) appendResults(calls []pendingCall, results []string) {
 			s.Msgs = append(s.Msgs, Message{Role: "tool", ToolCallID: c.id, Content: results[i], Tool: c.name, Path: c.args.Str("path")})
 			continue
 		}
-		fmt.Fprintf(&text, "<tool_result name=\"%s\" path=\"%s\">\n%s\n</tool_result>\n", c.name, c.args.Str("path"), results[i])
+		text.WriteString(toolResultText(c.name, c.args.Str("path"), results[i]))
 	}
 	if text.Len() > 0 {
 		s.Msgs = append(s.Msgs, Message{Role: "user", Content: text.String()})

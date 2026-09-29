@@ -26,11 +26,15 @@ import (
 //	  dir: /home/u/llmbench
 //	models:                     # per-model settings (gateway names)
 //	  some-model: {transport: text}   # its native tool parser is broken/missing
+//	tiers:                      # named chains: develop on premium, operate on cheap
+//	  cheap:   [qwen3-30b-a3b]
+//	  premium: [kimi-k2.6, glm-5.2]
 //	defaults:
 //	  context: 128000
 //	  steps: 50
 //	  verify_attempts: 2        # verifier failures fed back before giving up
 //	  check_timeout: 600        # seconds
+//	  review: reviewer          # team-wide reviewer for passed delegations
 //	sandbox:
 //	  allow: [go, git, make, pytest, python3, ls, cat, grep, bsk]
 //	  shell: true             # run commands through sh: pipes and && work,
@@ -45,7 +49,9 @@ import (
 //	    prompt: |
 //	      You lead the task…
 //	  coder:
-//	    models: [qwen3-coder-480b, deepseek-v4-pro]
+//	    models: [qwen3-coder-480b, deepseek-v4-pro]  # or: tier: premium
+//	    review: reviewer        # a second opinion on a diff the verifier passed
+//	    fork: true              # start from the caller's reads, not a blank context
 //	    effort: medium
 //	    tools: [read_file, grep, glob, list_dir, edit, write, run_command]
 //	    check_cmd: go test ./...
@@ -66,6 +72,10 @@ type RolesConfig struct {
 	ModelOpts      map[string]*ModelOpts // per-model settings from the model card
 	VerifyAttempts int
 	CheckTimeout   int
+	Review         string              // defaults.review: the reviewer for roles that name none
+	Tiers          map[string][]string // tiers: — named model chains, validated like a role's
+	TierOrder      []string            // declaration order, for messages and YAML()
+	Tier           string              // the active tier (cfg.Tier): -tier / LCA_TIER
 	Roles          []*Agent
 	Sources        []string
 	Warnings       []string
@@ -142,6 +152,9 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		if n, err := strconv.Atoi(defs.str("check_timeout")); err == nil && n > 0 {
 			rc.CheckTimeout = n
 		}
+		if v := defs.str("review"); v != "" {
+			rc.Review = v
+		}
 		if rn := doc.child("remote"); rn != nil || os.Getenv("LCA_REMOTE") != "" {
 			rem, err := parseRemote(rn)
 			if err != nil {
@@ -195,6 +208,26 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 				}
 			}
 		}
+		if ts := doc.child("tiers"); ts != nil {
+			if rc.Tiers == nil {
+				rc.Tiers = map[string][]string{}
+			}
+			for _, tn := range ts.Children {
+				names := listOrCSV(tn)
+				if len(names) == 0 {
+					return nil, fmt.Errorf("%s: tiers.%s: is empty — a tier is an ordered chain of gateway model names", p, tn.Key)
+				}
+				for _, m := range names {
+					if err := checkModelName(m); err != nil {
+						return nil, fmt.Errorf("%s: tiers.%s: %w", p, tn.Key, err)
+					}
+				}
+				if rc.Tiers[tn.Key] == nil {
+					rc.TierOrder = append(rc.TierOrder, tn.Key)
+				}
+				rc.Tiers[tn.Key] = names
+			}
+		}
 		if sb := doc.child("sandbox"); sb != nil {
 			if a := sb.child("allow"); a != nil {
 				rc.Allow = listOrCSV(a)
@@ -227,12 +260,82 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			}
 		}
 	}
+	rc.Tier = cfg.Tier
+	if rc.Tier != "" {
+		if len(rc.Tiers) == 0 {
+			return nil, fmt.Errorf("-tier %s: this team has no tiers: block (looked in %s)", rc.Tier, orNoFiles(rc.Sources))
+		}
+		if _, ok := rc.Tiers[rc.Tier]; !ok {
+			return nil, fmt.Errorf("tier %q is not defined (tiers: %s)", rc.Tier, rc.tierList())
+		}
+	}
+	remapped := 0
+	var pinned []string
 	for _, n := range order {
 		a := byName[n]
+		if a.Tier != "" {
+			if _, ok := rc.Tiers[a.Tier]; !ok {
+				if len(rc.Tiers) == 0 {
+					return nil, fmt.Errorf("role %s: tier: %q, but this team has no tiers: block in roles.yaml", n, a.Tier)
+				}
+				return nil, fmt.Errorf("role %s: tier: %q is not defined (tiers: %s)", n, a.Tier, rc.tierList())
+			}
+			rc.applyTier(a)
+			remapped++
+		} else {
+			pinned = append(pinned, n)
+		}
 		if len(a.Models) == 0 {
+			// tier: is only worth offering as the alternative when the team
+			// declares one — "or tier: one of none declared" points at nothing.
+			if len(rc.Tiers) > 0 {
+				return nil, fmt.Errorf("role %s: models is required (names from the gateway's /v1/models), or tier: one of %s", n, rc.tierList())
+			}
 			return nil, fmt.Errorf("role %s: models is required (names from the gateway's /v1/models)", n)
 		}
 		rc.Roles = append(rc.Roles, a)
+	}
+	if rc.Tier != "" && remapped == 0 {
+		// The active tier is reported by /agents, doctor and every trace record,
+		// so a selection that moved no role at all has to say so: the alternative
+		// is a run that looks like it switched and did not.
+		rc.Warnings = append(rc.Warnings, fmt.Sprintf(
+			"-tier %s changed nothing: no role declares tier: — %s each name their own models:",
+			rc.Tier, strings.Join(pinned, ", ")))
+	}
+	// Reviewers resolve only once every file has merged: a merged team's
+	// reviewer can come from another file, so this is not checked in applyRole.
+	defined := func(name string) *Agent {
+		if a := byName[name]; a != nil && a.IsRole {
+			return a
+		}
+		return nil
+	}
+	names := strings.Join(order, ", ")
+	if rc.Review != "" && !isNone(rc.Review) && defined(rc.Review) == nil {
+		return nil, fmt.Errorf("defaults: review: %q is not a role (defined: %s)", rc.Review, names)
+	}
+	for _, a := range rc.Roles {
+		if a.Review != "" && !isNone(a.Review) {
+			if a.Review == a.Name {
+				return nil, fmt.Errorf("role %s: review: a role cannot review itself", a.Name)
+			}
+			if defined(a.Review) == nil {
+				return nil, fmt.Errorf("role %s: review: %q is not a role (defined: %s)", a.Name, a.Review, names)
+			}
+		}
+		// reviewerFor's resolution, not a.Review alone: one reviewer named under
+		// defaults: covers the whole team, which is exactly where a family
+		// collision is most likely and where the warning is worth the most.
+		rev := rc.reviewerOf(a, defined)
+		if rev == nil {
+			continue
+		}
+		if sameFamily(a, rev) {
+			rc.Warnings = append(rc.Warnings, fmt.Sprintf(
+				"role %s: its reviewer %s runs %s, the same family as %s — a same-family second opinion shares the blind spots the review exists to find",
+				a.Name, rev.Name, rev.Models[0], a.Models[0]))
+		}
 	}
 	for _, a := range rc.Roles {
 		for _, m := range a.Models[1:] {
@@ -247,6 +350,76 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		return nil, fmt.Errorf("entry role %q is not defined", rc.Entry)
 	}
 	return rc, nil
+}
+
+// checkModelName rejects an endpoint where a gateway model name belongs: the
+// gateway does the routing, roles.yaml only names models.
+func checkModelName(name string) error {
+	if strings.Contains(name, "://") || strings.Count(name, ":") > 0 && strings.Count(name, ".") >= 3 {
+		return fmt.Errorf("model %q looks like an address — use the name from the gateway's /v1/models", name)
+	}
+	return nil
+}
+
+// isNone is how roles.yaml switches an inherited setting off by name.
+func isNone(s string) bool { return s == "none" || s == "off" || s == "-" }
+
+// reviewerOf resolves a role's effective reviewer against a lookup — the role's
+// own review:, else defaults: review: — in the same order Orchestrator.reviewerFor
+// uses at runtime, so what the loader warns about is what will actually run.
+func (rc *RolesConfig) reviewerOf(a *Agent, lookup func(string) *Agent) *Agent {
+	name := a.Review
+	if name == "" {
+		name = rc.Review
+	}
+	if name == "" || isNone(name) {
+		return nil
+	}
+	rev := lookup(name)
+	if rev == a { // the team default cannot make a role review itself
+		return nil
+	}
+	return rev
+}
+
+// sameFamily reports whether two roles' first models come from one family per
+// models.go. A gateway name no profile rule recognises has no family, and two
+// unrecognised names are no evidence of anything: warning on them would bury the
+// case the warning exists for under noise on every fleet with its own names.
+func sameFamily(a, b *Agent) bool {
+	if len(a.Models) == 0 || len(b.Models) == 0 {
+		return false
+	}
+	fa := lookupProfile(a.Models[0]).Family
+	return fa != "" && fa == lookupProfile(b.Models[0]).Family
+}
+
+// orNoFiles names the empty search: a message about a missing key has to be able
+// to say that no file was found to hold it.
+func orNoFiles(paths []string) string {
+	if len(paths) == 0 {
+		return "no roles.yaml"
+	}
+	return strings.Join(paths, ", ")
+}
+
+// applyTier points a role at a tier's chain: the tier it declares, or the active
+// tier when the run selected one. A tier is a chain, not a profile — whatever it
+// resolves to still picks up its own settings under models:.
+func (rc *RolesConfig) applyTier(a *Agent) {
+	name := a.Tier
+	if rc.Tier != "" {
+		name = rc.Tier
+	}
+	a.Models = append([]string(nil), rc.Tiers[name]...)
+}
+
+// tierList names the declared tiers in declaration order.
+func (rc *RolesConfig) tierList() string {
+	if len(rc.TierOrder) == 0 {
+		return "none declared"
+	}
+	return strings.Join(rc.TierOrder, ", ")
 }
 
 func listOrCSV(n *yNode) []string {
@@ -267,13 +440,38 @@ func applyRole(a *Agent, n *yNode, baseDir string) error {
 	if v := n.str("description"); v != "" {
 		a.Description = v
 	}
+	// models: and tier: each replace the other, the way a second models: replaces
+	// the first: layered files exist so a project can repoint a role the global
+	// team declared, and a merged role carrying both would refuse to load at all.
+	// Both keys in ONE node is still the authoring mistake it always was.
 	if m := n.child("models"); m != nil {
-		a.Models = nil
+		if v := n.str("tier"); v != "" {
+			return fmt.Errorf("tier: %s and models: are both set — a role names a tier or its own chain, not both", v)
+		}
+		a.Models, a.Tier = nil, ""
 		for _, name := range listOrCSV(m) {
-			if strings.Contains(name, "://") || strings.Count(name, ":") > 0 && strings.Count(name, ".") >= 3 {
-				return fmt.Errorf("model %q looks like an address — use the name from the gateway's /v1/models", name)
+			if err := checkModelName(name); err != nil {
+				return err
 			}
 			a.Models = append(a.Models, name)
+		}
+	}
+	if v := n.str("tier"); v != "" {
+		a.Tier, a.Models = v, nil
+	}
+	// No validation here: a reviewer's name resolves only once every file has
+	// merged (loadRoles does it).
+	if v := n.str("review"); v != "" {
+		a.Review = v
+	}
+	if f := n.child("fork"); f != nil {
+		switch strings.ToLower(strings.TrimSpace(f.Value)) {
+		case "true", "yes", "on":
+			a.Fork = true
+		case "", "false", "no", "off":
+			a.Fork = false
+		default:
+			return fmt.Errorf("fork must be true or false, got %q", f.Value)
 		}
 	}
 	if v := n.str("effort"); v != "" {
@@ -346,7 +544,31 @@ func validateRoleModels(rc *RolesConfig, gw *Client) ([]string, int) {
 		served[m.ID] = true
 	}
 	var warns []string
+	// A tier is warned about once, not once per role that names it.
+	for _, t := range rc.TierOrder {
+		var keep, unknown []string
+		for _, m := range rc.Tiers[t] {
+			if served[m] {
+				keep = append(keep, m)
+			} else {
+				unknown = append(unknown, m)
+			}
+		}
+		if len(unknown) == 0 {
+			continue
+		}
+		if len(keep) == 0 {
+			warns = append(warns, fmt.Sprintf("tier %s: none of %s is listed by the gateway — keeping them (it may be reloading)", t, strings.Join(unknown, ", ")))
+			continue
+		}
+		rc.Tiers[t] = keep
+		warns = append(warns, fmt.Sprintf("tier %s: %s not listed by the gateway — dropped from the chain", t, strings.Join(unknown, ", ")))
+	}
 	for _, r := range rc.Roles {
+		if r.Tier != "" {
+			rc.applyTier(r)
+			continue
+		}
 		var keep, unknown []string
 		for _, m := range r.Models {
 			if served[m] {
@@ -401,6 +623,9 @@ func (rc *RolesConfig) YAML() string {
 		}
 	}
 	fmt.Fprintf(&b, "\ndefaults:\n  verify_attempts: %d\n  check_timeout: %d\n", rc.VerifyAttempts, rc.CheckTimeout)
+	if rc.Review != "" {
+		fmt.Fprintf(&b, "  review: %s\n", rc.Review)
+	}
 	if len(rc.Allow) > 0 || rc.Shell {
 		b.WriteString("\nsandbox:\n")
 		if len(rc.Allow) > 0 {
@@ -438,13 +663,23 @@ func (rc *RolesConfig) YAML() string {
 			}
 		}
 	}
+	if len(rc.TierOrder) > 0 {
+		// The run's -tier is deliberately not written back: it is an operating
+		// choice, and registration is what this file records.
+		b.WriteString("\ntiers:\n")
+		for _, t := range rc.TierOrder {
+			fmt.Fprintf(&b, "  %s: [%s]\n", t, strings.Join(rc.Tiers[t], ", "))
+		}
+	}
 	b.WriteString("\nroles:\n")
 	for _, a := range rc.Roles {
 		fmt.Fprintf(&b, "  %s:\n", a.Name)
 		if a.Description != "" {
 			fmt.Fprintf(&b, "    description: %s\n", a.Description)
 		}
-		if len(a.Models) > 0 {
+		if a.Tier != "" {
+			fmt.Fprintf(&b, "    tier: %s\n", a.Tier)
+		} else if len(a.Models) > 0 {
 			fmt.Fprintf(&b, "    models: [%s]\n", strings.Join(a.Models, ", "))
 		}
 		if a.Thinking != "" {
@@ -464,6 +699,12 @@ func (rc *RolesConfig) YAML() string {
 		}
 		if a.CheckCmd != "" {
 			fmt.Fprintf(&b, "    check_cmd: %s\n", a.CheckCmd)
+		}
+		if a.Review != "" {
+			fmt.Fprintf(&b, "    review: %s\n", a.Review)
+		}
+		if a.Fork {
+			b.WriteString("    fork: true\n")
 		}
 		if a.ToolsSet {
 			fmt.Fprintf(&b, "    tools: [%s]\n", strings.Join(a.Tools, ", "))

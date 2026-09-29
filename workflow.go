@@ -88,6 +88,10 @@ type WorkflowStep struct {
 	Timeout time.Duration // resolved by bind; always > 0 for a run step
 	OnFail  string        // "stop" | "continue"
 	When    []whenClause  // nil = always
+	Review  string        // delegate: "" (the role's own) | "on" | "off" | a role name
+	Fork    string        // delegate: "" (the role's own) | "true" | "false"
+
+	reviewer string // the role that reviews this step's diff, resolved by bind
 }
 
 // whenClause is one OR-branch: all of its terms must hold.
@@ -119,6 +123,8 @@ type stepOutcome struct {
 	Checked     bool   // a check ran and decided this
 	Attempts    int
 	Detail      string // why it failed: check tail, delegate status, sandbox refusal, "cancelled"
+	Reviewer    string // delegate: the role that judged the diff
+	Review      string // delegate: approve | reject | unreviewed
 	Model       string
 	Session     string      // the step's own session UID (prompt steps)
 	TaskSession string      // delegate only: the subagent session its TaskRecord carries
@@ -131,6 +137,8 @@ type StepState struct {
 	Index      int         `json:"index"`
 	Kind       string      `json:"kind"`
 	Role       string      `json:"role,omitempty"`
+	Reviewer   string      `json:"reviewer,omitempty"`
+	Review     string      `json:"review,omitempty"`
 	Model      string      `json:"model,omitempty"`
 	Session    string      `json:"session,omitempty"`
 	Status     string      `json:"status"`
@@ -160,6 +168,7 @@ type WorkflowState struct {
 	Traces   []string          `json:"traces"`   // the trace file each of those wrote
 	Vars     map[string]string `json:"vars"`
 	Lead     string            `json:"lead,omitempty"`    // the lead role the run bound to
+	Tier     string            `json:"tier,omitempty"`    // the active tier the run bound to
 	NSteps   int               `json:"n_steps,omitempty"` // how many steps the file had: Cursor alone cannot say whether work is left
 	Started  string            `json:"started"`
 	Updated  string            `json:"updated"`
@@ -182,6 +191,8 @@ type StepRecord struct {
 	Kind        string      `json:"kind"`                   // run | prompt | delegate
 	TaskSession string      `json:"task_session,omitempty"` // delegate: the subagent session, joining this step to its TaskRecord
 	Role        string      `json:"role,omitempty"`
+	Reviewer    string      `json:"reviewer,omitempty"`
+	Review      string      `json:"review,omitempty"`
 	Model       string      `json:"model,omitempty"`
 	Status      string      `json:"status"` // ok | failed | skipped
 	Exit        int         `json:"exit"`
@@ -209,13 +220,13 @@ var reWFBareRef = regexp.MustCompile(`^(vars|steps)\.([A-Za-z0-9_-]+)(?:\.([A-Za
 
 var wfTopKeys = []string{"name", "description", "role", "timeout", "vars", "steps"}
 
-var wfStepKeys = []string{"run", "prompt", "delegate", "role", "check", "retries", "timeout", "on_fail", "when"}
+var wfStepKeys = []string{"run", "prompt", "delegate", "role", "check", "retries", "timeout", "on_fail", "when", "review", "fork"}
 
 // wfFields are the placeholder fields each kind of step produces.
 var wfFields = map[string][]string{
 	stepRun:      {"out", "status", "exit"},
 	stepPrompt:   {"out", "status", "exit"},
-	stepDelegate: {"out", "status", "exit", "diff"},
+	stepDelegate: {"out", "status", "exit", "diff", "review"},
 }
 
 func loadWorkflow(path string) (*Workflow, error) {
@@ -335,6 +346,26 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 					return fail("step %s: when: %v", sn.Key, err)
 				}
 				s.When = w
+			case "review":
+				switch strings.ToLower(strings.TrimSpace(k.Value)) {
+				case "":
+					return fail("step %s: review: is empty (want a role name, or off)", sn.Key)
+				case "off", "false", "no", "none":
+					s.Review = "off"
+				case "on", "true", "yes":
+					s.Review = "on"
+				default:
+					s.Review = strings.TrimSpace(k.Value)
+				}
+			case "fork":
+				switch strings.ToLower(strings.TrimSpace(k.Value)) {
+				case "true", "yes", "on":
+					s.Fork = "true"
+				case "false", "no", "off":
+					s.Fork = "false"
+				default:
+					return fail("step %s: fork: %q is not true or false", sn.Key, k.Value)
+				}
 			}
 		}
 		switch len(actions) {
@@ -346,6 +377,12 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 		}
 		if s.Kind == stepRun && s.Role != "" {
 			return fail("step %s: role: on a run step — a shell step costs no tokens and has no role", sn.Key)
+		}
+		if s.Review != "" && s.Kind != stepDelegate {
+			return fail("step %s: review: on a %s step — only a delegate step's diff is reviewed", sn.Key, s.Kind)
+		}
+		if s.Fork != "" && s.Kind != stepDelegate {
+			return fail("step %s: fork: on a %s step — only a delegate step inherits the caller's context", sn.Key, s.Kind)
 		}
 		if strings.TrimSpace(s.Cmd+s.Text) == "" {
 			return fail("step %s: %s: is empty", sn.Key, s.Kind)
@@ -400,7 +437,7 @@ func (wf *Workflow) checkRef(user *WorkflowStep, ref string) error {
 	}
 	name, field, ok := strings.Cut(rest, ".")
 	if !ok {
-		return fmt.Errorf("${steps.%s} needs a field: out, status, exit or diff", rest)
+		return fmt.Errorf("${steps.%s} needs a field: out, status, exit, diff or review", rest)
 	}
 	target := wf.byName[name]
 	if target == nil {
@@ -661,6 +698,26 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 		if s.Check == "" && o.agents[s.Role].CheckCmd == "" {
 			return fail("step %s: a delegate step needs check: or a role with check_cmd, or its diff is never applied", s.Name)
 		}
+		switch s.Review {
+		case "off":
+			s.reviewer = ""
+		case "", "on":
+			if rev := o.reviewerFor(o.agents[s.Role]); rev != nil {
+				s.reviewer = rev.Name
+			}
+			if s.Review == "on" && s.reviewer == "" {
+				return fail("step %s: review: on, but role %s names no review: and there is no defaults.review", s.Name, s.Role)
+			}
+		default:
+			ag := o.agents[s.Review]
+			if ag == nil || !ag.IsRole {
+				return fail("step %s: review: no role %q in roles.yaml", s.Name, s.Review)
+			}
+			if s.Review == s.Role {
+				return fail("step %s: review: %s is also the step's role — a role cannot review itself", s.Name, s.Review)
+			}
+			s.reviewer = s.Review
+		}
 	}
 	if delegates {
 		if o.remote != nil {
@@ -710,9 +767,22 @@ func (wf *Workflow) plan() [][]string {
 		if len(s.When) > 0 {
 			when = "conditional"
 		}
-		rows = append(rows, []string{strconv.Itoa(i + 1), s.Name, s.Kind, orDash(s.Role), attempts, to, when, orDash(truncate(firstLine(s.Check), 40))})
+		role := orDash(s.Role)
+		if s.reviewer != "" {
+			role += " → " + s.reviewer
+		}
+		rows = append(rows, []string{strconv.Itoa(i + 1), s.Name, s.Kind, role, attempts, to, when, orDash(truncate(firstLine(s.Check), 40))})
 	}
 	return rows
+}
+
+// orTierNone names the absent tier: no tier active means every role runs the
+// chain it declares, which is a state a message has to be able to say.
+func orTierNone(s string) string {
+	if s == "" {
+		return "(no)"
+	}
+	return s
 }
 
 func orDash(s string) string {
@@ -1137,6 +1207,7 @@ type wfRunner struct {
 	st      *WorkflowState
 	res     map[string]*StepState // by name, including steps restored from a resume
 	unlock  func()                // releases the run directory's lock
+	forkSrc *Session              // the newest prompt step's session: what `fork: true` inherits
 	stop    atomic.Bool           // Ctrl-C: stop at the next step boundary
 	signals bool                  // own SIGINT (the CLI); the REPL passes an interruptible ctx instead
 }
@@ -1563,6 +1634,11 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 		return o
 	}
 	defer r.orch.forgetChild(child.ID) // a workflow must not leak children
+	// Under `lca run` the run's lead reads nothing — every model step happens in
+	// a child like this one — so the reads a later `fork: true` can inherit are
+	// the ones a prompt step made. The session outlives forgetChild; only its
+	// resumability by task_id goes away.
+	r.forkSrc = child
 	child.view = &workflowView{View: child.view, log: r.log, step: s.Name}
 	child.checkLive = r.log
 	child.Msgs = append(child.Msgs, Message{Role: "user", Content: text})
@@ -1582,13 +1658,8 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 		exit := v.Exit
 		o.CheckExit = &exit
 	}
-	for i := len(child.Msgs) - 1; i > 0; i-- {
-		if child.Msgs[i].Role == "assistant" {
-			if t := finalText(child.Msgs[i]); t != "" {
-				o.Out = lastLines(t, tailLines, tailBytes)
-				break
-			}
-		}
+	if t := lastAssistantText(child); t != "" {
+		o.Out = lastLines(t, tailLines, tailBytes)
 	}
 	switch v.Status {
 	case "passed":
@@ -1613,10 +1684,9 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 // retries wrap runDelegateTool (which has no attempts parameter of its own), so
 // the two budgets multiply; -dry-run prints the effective number.
 //
-// Model and Usage stay empty: runDelegateTool returns only
-// {status, diff, test_tail}. The delegation's cost is in its own turn records
-// under this root session, and TaskSession is the key that joins this step's
-// record to the TaskRecord holding them.
+// Model and Usage stay empty: the delegation's cost is in its own turn records
+// under this root session, not in anything the tool hands back, and TaskSession
+// is the key that joins this step's record to the TaskRecord holding them.
 func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, check string) stepOutcome {
 	o := stepOutcome{Check: check}
 	task := text
@@ -1637,10 +1707,15 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 		if s.Timeout > 0 {
 			actx, cancel = context.WithTimeout(ctx, s.Timeout)
 		}
-		tc := &ToolCtx{Ctx: actx, S: r.lead, Name: "delegate"}
-		raw := runDelegateTool(tc, Args{"role": s.Role, "task": task, "check_cmd": check})
+		tc := &ToolCtx{Ctx: actx, S: r.lead, Name: "delegate", Reviewer: s.reviewer, ForkFrom: r.forkSrc}
+		args := Args{"role": s.Role, "task": task, "check_cmd": check, "review": s.reviewer != ""}
+		if s.Fork != "" {
+			args["fork"] = s.Fork == "true"
+		}
+		raw := runDelegateTool(tc, args)
 		cancel()
 		o.TaskSession = tc.TaskSession
+		o.Review, o.Reviewer = "", "" // a later attempt's verdict replaces an earlier one
 		var dr delegateResult
 		if err := json.Unmarshal([]byte(raw), &dr); err != nil {
 			o.Status, o.Exit, o.Detail = stepFailed, -1, strings.TrimSpace(raw)
@@ -1649,6 +1724,11 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 		}
 		o.Out, o.Diff = lastLines(dr.TestTail, tailLines, tailBytes), dr.Diff
 		o.Detail = "delegate status " + dr.Status
+		if dr.Review != nil {
+			// run.log has to say why a passing check still failed the step.
+			o.Review, o.Reviewer = dr.Review.Verdict, dr.Review.Role
+			o.Detail += " (reviewer " + dr.Review.Role + ": " + dr.Review.Verdict + ")"
+		}
 		if dr.Status == "passed" && dr.Diff == "" {
 			// The verifier passed on an unchanged tree. Not a failure by itself
 			// (a step may exist to confirm something), but it must be visible:
@@ -1676,7 +1756,14 @@ func (r *wfRunner) delegateStep(ctx context.Context, s *WorkflowStep, text, chec
 			r.log.line(o.Detail)
 		}
 		if attempt < attempts {
-			task = text + "\n\n---\nA previous attempt did not pass the verifier. Last lines of its output:\n```\n" + o.Out + "\n```"
+			// The check passing and the reviewer blocking are different problems,
+			// and a retry told to fix a test failure that did not happen is a
+			// wasted attempt.
+			why := "did not pass the verifier. Last lines of its output:"
+			if dr.Status == "rejected" && dr.Review != nil {
+				why = "passed the check, but " + dr.Review.Role + " rejected it. Its reasons:"
+			}
+			task = text + "\n\n---\nA previous attempt " + why + "\n```\n" + o.Out + "\n```"
 		}
 	}
 	return o
@@ -1731,7 +1818,7 @@ func (r *wfRunner) lookup(ref string) (string, error) {
 	case "steps":
 		name, field, ok := strings.Cut(rest, ".")
 		if !ok {
-			return "", fmt.Errorf("${steps.%s} needs a field: out, status, exit or diff", rest)
+			return "", fmt.Errorf("${steps.%s} needs a field: out, status, exit, diff or review", rest)
 		}
 		ss := r.res[name]
 		if ss == nil {
@@ -1749,6 +1836,10 @@ func (r *wfRunner) lookup(ref string) (string, error) {
 				return "", fmt.Errorf("step %s was skipped, so ${steps.%s.out} has nothing in it", name, name)
 			}
 			return ss.Out, nil
+		case "review":
+			// An empty string is the honest answer for a step nothing reviewed,
+			// so `when: ${steps.x.review} != reject` works on every delegate step.
+			return ss.Review, nil
 		case "diff":
 			if ss.DiffFile == "" {
 				return "", fmt.Errorf("step %s (%s) stored no diff, so ${steps.%s.diff} would hand this step nothing", name, ss.Status, name)
@@ -1827,7 +1918,7 @@ func (r *wfRunner) record(s *WorkflowStep, o *stepOutcome, start time.Time, d ti
 			rel = ""
 		}
 	}
-	ss := &StepState{Name: s.Name, Index: s.Index, Kind: s.Kind, Role: s.Role, Model: o.Model, Session: o.Session,
+	ss := &StepState{Name: s.Name, Index: s.Index, Kind: s.Kind, Role: s.Role, Reviewer: o.Reviewer, Review: o.Review, Model: o.Model, Session: o.Session,
 		Status: o.Status, Exit: o.Exit, Checked: o.Checked, Attempts: o.Attempts, Out: o.Out,
 		Detail: truncate(o.Detail, 2000), Started: traceTS(start),
 		Finished: nowTS(), DurationMs: d.Milliseconds(), Usage: o.Usage}
@@ -1860,6 +1951,7 @@ func (r *wfRunner) storeDiff(s *WorkflowStep, diff string) (string, error) {
 func (r *wfRunner) traceStep(s *WorkflowStep, ss *StepState, o stepOutcome) {
 	rec := StepRecord{Type: "step", TS: nowTS(), RootSession: r.lead.rootUID(), Session: ss.Session,
 		Run: r.st.Run, Workflow: r.wf.Name, Step: ss.Name, Index: ss.Index, Kind: ss.Kind, TaskSession: o.TaskSession, Role: ss.Role,
+		Reviewer: ss.Reviewer, Review: ss.Review,
 		Model: ss.Model, Status: ss.Status, Exit: ss.Exit, Check: o.Check, CheckExit: o.CheckExit,
 		Checked: ss.Checked, Attempts: ss.Attempts, DurationMs: ss.DurationMs, Usage: ss.Usage,
 		Detail: truncate(firstLine(ss.Detail), 300)}
@@ -1921,13 +2013,19 @@ func splitLeadingName(args []string) (string, []string) {
 
 func runUsage() {
 	fmt.Fprintln(os.Stderr, strings.Join([]string{
-		"usage: lca run [<name>|<runid>] [-var k=v]… [-resume] [-pause] [-dry-run] [-list] [-ask] [-role r]",
+		"usage: lca run [<name>|<runid>] [-var k=v]… [-resume] [-pause] [-dry-run] [-list] [-ask] [-role r] [-tier t]",
 		"  lca run                      list the workflows found",
 		"  lca run <name>               run it",
 		"  lca run <name> -dry-run      validate and print the plan",
 		"  lca run <name> -resume       continue its newest unfinished run",
 		"  lca run <name> -resume <runid>  continue that run",
 		"  lca run <runid> -pause       stop it at the next step boundary",
+		"",
+		" FLAGS",
+		"   -role <name>                override the workflow's default role",
+		"   -tier <name>                run every tier-declaring role on that chain (roles.yaml tiers:)",
+		"   -var k=v                    set a declared workflow variable (repeatable)",
+		"   -ask                        prompt for approvals instead of trusting the file",
 	}, "\n"))
 }
 
@@ -1944,6 +2042,7 @@ func runWorkflow(cfg Config, args []string) int {
 	list := fset.Bool("list", false, "list recent runs")
 	ask := fset.Bool("ask", false, "prompt for approvals instead of trusting the file")
 	roleFlag := fset.String("role", "", "override the workflow's default role")
+	tierFlag := fset.String("tier", "", "run this team on that tier (roles.yaml tiers:)")
 	if err := fset.Parse(rest); err != nil {
 		return 2
 	}
@@ -2012,6 +2111,7 @@ func runWorkflow(cfg Config, args []string) int {
 		errLine("-role cannot be combined with -resume — start a fresh run to change the team")
 		return 2
 	}
+	cfg.Tier = firstNonEmpty(*tierFlag, cfg.Tier)
 
 	root, _ := realRoot(cfg.Root)
 	var dir string
@@ -2023,6 +2123,13 @@ func runWorkflow(cfg Config, args []string) int {
 			return 2
 		}
 		name = st.Workflow
+		if cfg.Tier == "" {
+			// A bare -resume re-establishes the tier the run recorded: the resume
+			// line the run itself printed has to work, and knowing that LCA_TIER
+			// stands in for the flag is not something to require. A -tier naming
+			// a DIFFERENT tier still trips the mismatch guard below.
+			cfg.Tier = st.Tier
+		}
 	}
 
 	// A resume reloads the very file the run started from, not whatever the
@@ -2073,6 +2180,12 @@ func runWorkflow(cfg Config, args []string) int {
 		entry = orch.roles.Entry
 	}
 	leadName := firstNonEmpty(wf.Role, entry, cfg.Agent)
+	if st != nil && st.Tier != orch.activeTier() {
+		// Steps 1..n ran on another chain; one green result over two tiers is
+		// exactly the dishonest failure this design exists to prevent.
+		errLine("this run started on the %s tier and %s is active now — start a fresh run", orTierNone(st.Tier), orTierNone(orch.activeTier()))
+		return 2
+	}
 	if st != nil && st.Lead != "" && st.Lead != leadName {
 		// roles.yaml's entry: can change between two invocations, and nothing
 		// else would notice that the rest of the run bound to another lead.
@@ -2188,7 +2301,7 @@ func newRunState(cfg Config, o *Orchestrator, wf *Workflow, lead string, vars ma
 		id = newRunID(wf.Name, fmt.Sprintf("%s-%d%d", time.Now().Format("20060102-150405"), os.Getpid(), n))
 	}
 	st := &WorkflowState{Version: wfStateVersion, Run: id, Workflow: wf.Name, Path: wf.Path, Sum: wf.Sum,
-		Root: o.jl.Root, Lead: lead, NSteps: len(wf.Steps), Sessions: []string{o.rec.id}, Traces: []string{o.tracer.Path},
+		Root: o.jl.Root, Lead: lead, Tier: o.activeTier(), NSteps: len(wf.Steps), Sessions: []string{o.rec.id}, Traces: []string{o.tracer.Path},
 		Vars: vars, Started: nowTS(), Status: "running"}
 	return filepath.Join(runsDir(cfg), id), st
 }

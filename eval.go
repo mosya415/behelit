@@ -24,11 +24,13 @@ import (
 // trace JSONL (turns, tokens, cached_tokens, tool calls, fallbacks,
 // delegations).
 //
-//	lca eval [-out dir] [-role r] [-run regexp] [-transport native,text] [-keep] [-v] tasks/
+//	lca eval [-out dir] [-role r] [-run regexp] [-transport native,text] [-tier cheap,premium] [-keep] [-v] tasks/
 //
 // -transport runs every task once per listed tool transport (forcing it for
 // all roles) and prints them side by side: pass rate and the share of invalid
-// tool calls settle "native vs text" with data from your own fleet.
+// tool calls settle "native vs text" with data from your own fleet. -tier does
+// the same over roles.yaml's tiers: the workflow developed against premium
+// models, scored again on commodity ones.
 //
 // A task is tasks/<name>.yaml or tasks/<name>/task.yaml:
 //
@@ -61,6 +63,7 @@ type EvalTask struct {
 type EvalResult struct {
 	Task              string   `json:"task"`
 	Transport         string   `json:"transport,omitempty"`
+	Tier              string   `json:"tier,omitempty"`
 	Status            string   `json:"status"`
 	Attempts          int      `json:"attempts"`
 	CheckExit         *int     `json:"check_exit,omitempty"`
@@ -91,11 +94,12 @@ func runEval(cfg Config, args []string) int {
 	keep := fset.Bool("keep", false, "keep task workspaces")
 	verbose := fset.Bool("v", false, "print every tool call")
 	transports := fset.String("transport", "", "comma-separated tool transports to compare (native,text); default: as configured")
+	tierList := fset.String("tier", "", "comma-separated tiers to compare (roles.yaml tiers:); default: as configured")
 	if err := fset.Parse(args); err != nil {
 		return 2
 	}
 	if fset.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: lca eval [-out dir] [-role r] [-run regexp] [-keep] [-v] tasks/")
+		fmt.Fprintln(os.Stderr, "usage: lca eval [-out dir] [-role r] [-run regexp] [-transport native,text] [-tier cheap,premium] [-keep] [-v] tasks/")
 		return 2
 	}
 	var filter *regexp.Regexp
@@ -145,6 +149,26 @@ func runEval(cfg Config, args []string) int {
 		}
 	}
 
+	// Up front, so a typo does not burn the matrix: the tiers are read from the
+	// team the tasks will run with, before the first task starts.
+	tiers := []string{""}
+	if *tierList != "" {
+		rc, err := loadRoles(cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "eval: roles:", err)
+			return 2
+		}
+		tiers = nil
+		for _, ti := range strings.Split(*tierList, ",") {
+			ti = strings.TrimSpace(ti)
+			if _, ok := rc.Tiers[ti]; !ok {
+				fmt.Fprintf(os.Stderr, "eval: -tier: %q is not a tier in this team (tiers: %s)\n", ti, rc.tierList())
+				return 2
+			}
+			tiers = append(tiers, ti)
+		}
+	}
+
 	resultsPath := filepath.Join(*out, "results.jsonl")
 	rf, err := os.OpenFile(resultsPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -167,39 +191,45 @@ func runEval(cfg Config, args []string) int {
 	}
 
 	what := plural(len(tasks), "task", "tasks")
+	if len(tiers) > 1 {
+		what += " × " + strings.Join(tiers, ", ")
+	}
 	if len(modes) > 1 {
 		what += " × " + strings.Join(modes, ", ")
 	}
 	section("eval", faint("%s", what))
 	passed, total := 0, 0
 	var all []EvalResult
-	for _, mode := range modes {
-		for _, t := range tasks {
-			if *role != "" {
-				t.Role = *role
-			}
-			tcfg := cfg
-			tcfg.TransportOverride = mode
-			dir := filepath.Join(*out, t.Name)
-			if mode != "" {
-				dir = filepath.Join(*out, mode, t.Name)
-			}
-			res := runEvalTask(tcfg, t, dir, *keep, *verbose)
-			res.Transport = mode
-			total++
-			all = append(all, res)
-			b, _ := json.Marshal(res)
-			rf.Write(append(b, '\n'))
-			if res.Status == "passed" {
-				passed++
-			}
-			label := t.Name
-			if mode != "" {
-				label += faint(" · %s", mode)
-			}
-			fmt.Printf("  %s  %s\n", padTo(statusWord(res.Status), 14, 0), label+faint("  %s", fmtDurShort(time.Duration(res.DurationMs)*time.Millisecond)))
-			if res.Error != "" {
-				hint("%s", truncate(res.Error, 200))
+	for _, tier := range tiers {
+		for _, mode := range modes {
+			for _, t := range tasks {
+				if *role != "" {
+					t.Role = *role
+				}
+				tcfg := cfg
+				tcfg.TransportOverride = mode
+				tcfg.Tier = tier
+				dir := filepath.Join(append([]string{*out}, nonEmpty(tier, mode, t.Name)...)...)
+				res := runEvalTask(tcfg, t, dir, *keep, *verbose)
+				res.Transport, res.Tier = mode, tier
+				total++
+				all = append(all, res)
+				b, _ := json.Marshal(res)
+				rf.Write(append(b, '\n'))
+				if res.Status == "passed" {
+					passed++
+				}
+				label := t.Name
+				if tier != "" {
+					label += faint(" · %s", tier)
+				}
+				if mode != "" {
+					label += faint(" · %s", mode)
+				}
+				fmt.Printf("  %s  %s\n", padTo(statusWord(res.Status), 14, 0), label+faint("  %s", fmtDurShort(time.Duration(res.DurationMs)*time.Millisecond)))
+				if res.Error != "" {
+					hint("%s", truncate(res.Error, 200))
+				}
 			}
 		}
 	}
@@ -216,6 +246,9 @@ func runEval(cfg Config, args []string) int {
 			invalid = fmt.Sprintf("%d/%d", r.InvalidCalls, r.AttemptedCalls)
 		}
 		row := []string{r.Task}
+		if len(tiers) > 1 {
+			row = append(row, r.Tier)
+		}
 		if len(modes) > 1 {
 			row = append(row, r.Transport)
 		}
@@ -225,13 +258,19 @@ func runEval(cfg Config, args []string) int {
 		rows = append(rows, row)
 	}
 	head := []string{"task"}
+	if len(tiers) > 1 {
+		head = append(head, "tier")
+	}
 	if len(modes) > 1 {
 		head = append(head, "transport")
 	}
 	head = append(head, "status", "time", "turns", "in", "cached", "out", "tools", "invalid", "delegated", "fallbacks")
 	table(head, rows)
 	if len(modes) > 1 {
-		printTransportComparison(modes, all)
+		printVariantComparison("native vs text", "transport", modes, all, func(r EvalResult) string { return r.Transport })
+	}
+	if len(tiers) > 1 {
+		printVariantComparison("tiers", "tier", tiers, all, func(r EvalResult) string { return r.Tier })
 	}
 	fmt.Println()
 	if passed == total {
@@ -246,14 +285,15 @@ func runEval(cfg Config, args []string) int {
 	return 0
 }
 
-// printTransportComparison summarizes each transport over the same tasks.
-func printTransportComparison(modes []string, all []EvalResult) {
-	section("native vs text")
+// printVariantComparison summarizes each variant over the same tasks: pass rate,
+// invalid-call rate, turns, tokens and cache ratio side by side.
+func printVariantComparison(title, column string, labels []string, all []EvalResult, of func(EvalResult) string) {
+	section(title)
 	var rows [][]string
-	for _, m := range modes {
+	for _, m := range labels {
 		var n, pass, turns, prompt, cached, invalid, attempted int
 		for _, r := range all {
-			if r.Transport != m {
+			if of(r) != m {
 				continue
 			}
 			n++
@@ -279,7 +319,19 @@ func printTransportComparison(modes []string, all []EvalResult) {
 		rows = append(rows, []string{m, fmt.Sprintf("%d/%d", pass, n), fmt.Sprintf("%.1f%%", rate*100),
 			fmt.Sprintf("%.1f", float64(turns)/float64(n)), kfmt(prompt), fmt.Sprintf("%.0f%%", cache*100)})
 	}
-	table([]string{"transport", "passed", "invalid calls", "turns/task", "tokens in", "cached"}, rows)
+	table([]string{column, "passed", "invalid calls", "turns/task", "tokens in", "cached"}, rows)
+}
+
+// nonEmpty drops the unset dimensions of the matrix from a path, so a plain run
+// still writes <out>/<task> and not <out>///<task>.
+func nonEmpty(xs ...string) []string {
+	var out []string
+	for _, x := range xs {
+		if x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func loadEvalTasks(path string) ([]*EvalTask, error) {
@@ -415,7 +467,7 @@ func runEvalTask(cfg Config, t *EvalTask, dir string, keep, verbose bool) (res E
 		v.Status = "timeout"
 	}
 	cancel()
-	sess.traceTask(t.Prompt, v, t.CheckCmd, 0, 0, false, vstart)
+	sess.traceTask(t.Prompt, v, t.CheckCmd, 0, 0, false, nil, vstart)
 	sess.saveTranscript()
 	orch.tracer.Close()
 

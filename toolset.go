@@ -51,6 +51,14 @@ type ToolCtx struct {
 	// UID — the Session of the TaskRecord it writes — so a caller that records
 	// the call (a workflow step) can be joined to that record.
 	TaskSession string
+	// Reviewer overrides the role's configured reviewer for this one call. It is
+	// a caller-side channel (a workflow step), deliberately not a tool argument:
+	// choosing who reviews is registration, not a model's decision.
+	Reviewer string
+	// ForkFrom is the session a `fork: true` delegation inherits context from
+	// when it is not the caller itself — a workflow's lead reads nothing, and the
+	// reads worth handing down were made by a prompt step's own child session.
+	ForkFrom *Session
 }
 
 // Args are decoded tool arguments. Text-protocol attributes arrive as strings,
@@ -93,6 +101,16 @@ func (a Args) Bool(k string) bool {
 		return b
 	}
 	return false
+}
+
+// argBool reads an optional boolean argument: a model that omitted it gets the
+// caller's default, and an explicit false is honoured (Args.Bool cannot tell
+// "false" from "absent").
+func argBool(a Args, k string, def bool) bool {
+	if _, ok := a[k]; !ok {
+		return def
+	}
+	return a.Bool(k)
 }
 
 var toolRegistry = map[string]*ToolDef{}
