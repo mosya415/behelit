@@ -107,7 +107,17 @@ func (r *Repl) cmdConfig(arg string) bool {
 			keyW, srcW = max(keyW, visibleWidth(s.Key)), max(srcW, visibleWidth(src))
 		}
 	}
-	valW := max(termWidth()-keyW-srcW-8, 20)
+	// The value column takes what the VALUES need, bounded by what the page has
+	// left. Taking the whole remainder right-aligned the source column to the page:
+	// at a terminal of 200 `endpoint  http://127.0.0.1:18130/v1` ended in column 42
+	// and `.lca/config.json` began in column 135 — about ninety blank columns
+	// between the two fields a reader is comparing, on the screen whose entire job
+	// is lining that column up.
+	valNeed := 20
+	for _, c := range rows {
+		valNeed = max(valNeed, visibleWidth(c.val))
+	}
+	valW := min(max(houseWidth()+1-keyW-srcW-8, 20), valNeed)
 	group := ""
 	for _, c := range rows {
 		if c.group != group {

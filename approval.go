@@ -181,7 +181,7 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 	// having seen what they agreed to. When it does not fit the course WHOLE it
 	// comes out of the course and goes on the first content line instead, where
 	// panelSplit hard-splits it and never loses a byte.
-	if _, fits, _ := pnl.fitTop(pnl.width()); fits != detail {
+	if _, fits, _ := pnl.fitTop(pnl.ceiling()); fits != detail {
 		pnl.detail = ""
 		pnl.needs(visibleWidth(detail))
 		pnl.Line("%s%s%s", cBold, detail, cReset)
@@ -240,7 +240,14 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 		a.TrustAll()
 	}
 	if note != "" {
-		fmt.Println("   " + faint("%s", note))
+		// This is the line that tells the operator they have just granted standing
+		// approval for the session, so it is the worst one on the screen to render
+		// badly — and at 90 columns (118 for the mcp-write variant) it soft-wrapped
+		// with its continuation in column 1, directly under a 77-column door frame.
+		// Same measure and same indent as a tool error's hints.
+		for _, l := range wrapHint(note, min(houseWidth()-4, proseMax)) {
+			fmt.Println("   " + faint("%s", l))
+		}
 	}
 	return approved, false
 }

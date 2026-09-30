@@ -2066,6 +2066,11 @@ func TestMCPLockAndRefresh(t *testing.T) {
 // ── 28: doctor ──────────────────────────────────────────────────────────────
 
 func TestMCPDoctorSection(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	t.Setenv("JIRA_MCP_TOKEN", "tok-abcdef")
 	ro := mcpRawTool{Name: "issue_get", Description: "get", InputSchema: map[string]any{"type": "object"}}
 	ro.Annotations = &struct {
@@ -2155,6 +2160,11 @@ func TestMCPDoctorSection(t *testing.T) {
 // useful Jira exposure (search, get, comment, transition) warned on day one over
 // twelve builtins, which is how an operator learns to ignore a warning.
 func TestMCPDoctorWarnsOnTheMCPCount(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	t.Setenv("JIRA_MCP_TOKEN", "tok-abcdef")
 	tools := []mcpRawTool{
 		{Name: "issue_search", InputSchema: map[string]any{"type": "object"}},
@@ -2638,6 +2648,11 @@ func TestMCPWriteIsSequential(t *testing.T) {
 // TestMCPReplCommand covers the operator-facing entry point: the argument forms,
 // and the fact that the bare listing contacts nothing.
 func TestMCPReplCommand(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	t.Setenv("JIRA_MCP_TOKEN", "tok-abcdef")
 	m := newMockMCP(t)
 	f := mcpFix(t, jiraConfig(m.hostPort(), m.URL, ""), lockOf("jira", m.URL, m.tools))

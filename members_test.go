@@ -1200,6 +1200,12 @@ func TestMembersCommandAndTrace(t *testing.T) {
 	h := newRoleHarness(t, fs, roles, true)
 	t.Setenv("LCA_TEST_SSH_DOWN", "gpu07")
 	r := &Repl{orch: h.orch, sess: h.sess}
+	// A wide window, because what is asserted below is that the table names each
+	// member's host AND its directory in full. A temp directory is 60-odd columns
+	// on its own and five columns of table do not fit in 77: at 80 the allocator
+	// middle-ellipsizes `where`, which is correct there and is not what this test
+	// is about.
+	t.Setenv("COLUMNS", "200")
 	out := captureStdout(t, func() { r.cmdMembers("") })
 	for _, want := range []string{"local", "box", "box01:" + up, "gpu-0", "2 own", "coder", "unreachable", "Operation timed out", "fix ssh"} {
 		if !strings.Contains(out, want) {

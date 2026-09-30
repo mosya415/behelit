@@ -291,9 +291,14 @@ func (r *Repl) statusLine() string {
 	// Room is given up from the right, and the path — the longest and the least
 	// surprising field — is middle-ellipsized into whatever is left before the
 	// gauge is dropped, so the role and the model never move.
-	room := termWidth() - 4 - visibleWidth(strings.Join(parts, gSep)) - 3
+	// The line is printed at a two-column indent by the editor, so its budget is
+	// houseWidth()-1 and it ends in column houseWidth()+1 — the same column as the
+	// fence above it and the frames above that. The algorithm and the order things
+	// are given up in are unchanged: the gauge first, then the path is
+	// middle-ellipsized, then the joined line is cut.
+	room := houseWidth() - 1 - visibleWidth(strings.Join(parts, gSep)) - 3
 	ctx := ""
-	if bar, pct, ok := r.ctxGauge(10); ok {
+	if bar, pct, ok := r.ctxGauge(gaugeCellsInline); ok {
 		// the whole line is wrapped in cFaint by the editor, so anything that
 		// resets has to hand the faint back before the next field
 		// The bar is empty in the plain theme (no block art), and "CTX  0%" with the
@@ -308,11 +313,21 @@ func (r *Repl) statusLine() string {
 			ctx = ""
 		}
 	}
+	// The result is VERIFIED and not assumed from the helper. ellipsizeMiddle used
+	// to count runes, so a project rooted at a path with CJK components came back
+	// unchanged at 60 columns against a room of 43 and the no-wrap invariant below
+	// silently did not hold — inside the region the line editor walks back over by
+	// COUNTING rows, so the "\033[1A" landed on the status line instead of the input
+	// line and the next keystroke's "\r\033[J" erased from there. It measures
+	// columns now; this measures the answer anyway, because a width invariant an
+	// editor's cursor arithmetic depends on should be enforced rather than inferred.
 	switch {
 	case room >= visibleWidth(where):
 		parts = append(parts, where)
 	case room >= 12:
-		parts = append(parts, ellipsizeMiddle(where, room))
+		if w := ellipsizeMiddle(where, room); visibleWidth(w) <= room {
+			parts = append(parts, w)
+		}
 	}
 	if ctx != "" {
 		parts = append(parts, ctx)
@@ -324,7 +339,7 @@ func (r *Repl) statusLine() string {
 	// editor's walk-back one row out, which is the failure the comment above
 	// describes, so the joined line is cut to the room there actually is.
 	line := strings.Join(parts, gSep)
-	if room := termWidth() - 4; room > 20 && visibleWidth(line) > room {
+	if room := houseWidth() - 1; room > 20 && visibleWidth(line) > room {
 		line = ellipsize(stripANSI(line), room)
 	}
 	return line
@@ -396,7 +411,7 @@ func (r *Repl) Banner() {
 	hold := newPanel("the hold", "where you stand")
 
 	root := o.jl.Root
-	proj := cBold + filepath.Base(root) + cReset + "  " + faint("%s", ellipsizeMiddle(shortDir(filepath.Dir(root))+"/", 48))
+	proj := cBold + filepath.Base(root) + cReset + "  " + faint("%s", ellipsizeMiddle(shortDir(filepath.Dir(root))+"/", max(48, houseWidth()-28)))
 	var facts []string
 	if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
 		facts = append(facts, "git")
@@ -408,7 +423,7 @@ func (r *Repl) Banner() {
 		proj += faint(gSep+"%s", strings.Join(facts, gSep))
 	}
 	if rem := s.remote(); rem != nil {
-		proj = cBold + path.Base(rem.Dir) + cReset + "  " + faint("%s"+gSep+"%s on %s"+gSep+"over ssh", s.memberName(), ellipsizeMiddle(rem.Dir, 40), rem.Host)
+		proj = cBold + path.Base(rem.Dir) + cReset + "  " + faint("%s"+gSep+"%s on %s"+gSep+"over ssh", s.memberName(), ellipsizeMiddle(rem.Dir, max(40, houseWidth()-36)), rem.Host)
 	}
 	hold.Row("project", proj)
 
@@ -527,7 +542,7 @@ func (r *Repl) cmdHelp(arg string) bool {
 	// used to wrap every description on the screen. Anything over the cap keeps its
 	// args on a faint continuation line of its own instead of taxing the other
 	// twenty-four commands.
-	width = min(width, 30)
+	width = min(width, max(30, houseWidth()/3))
 	for _, g := range cmdGroups {
 		if len(groups[g]) == 0 {
 			continue
@@ -678,7 +693,6 @@ func (r *Repl) cmdAgents(string) bool {
 		}
 		table(head, rows)
 	}
-	section("agents")
 	var rows [][]string
 	names := sortedKeys(o.agents)
 	for _, n := range names {
@@ -699,7 +713,8 @@ func (r *Repl) cmdAgents(string) bool {
 		}
 		rows = append(rows, []string{a.Name, faint("%s", kind), model, faint("%s", firstNonEmpty(a.Description, gNil))})
 	}
-	table([]string{"agent", "kind", "model", "what it does"}, rows)
+	// the agent's name and its model id are identifiers; the description is prose
+	sectionTable("agents", "", []string{"agent", "kind", "model", "what it does"}, rows, 0, 2)
 	if o.roles != nil {
 		hint("%s", "delegate(role, task) sends a change to a role"+gSep+"task(agent, …) asks a helper")
 	}
@@ -756,7 +771,6 @@ func (r *Repl) cmdTasks(arg string) bool {
 		fmt.Println("  " + faint("no subagent has run yet in this session"))
 		return false
 	}
-	section("subagent runs")
 	var rows [][]string
 	for _, h := range hist {
 		dur := gEllipsis
@@ -765,7 +779,8 @@ func (r *Repl) cmdTasks(arg string) bool {
 		}
 		rows = append(rows, []string{faint("%s", h.ID), h.Kind, h.Agent, statusWord(h.Status), faint("%s", dur), firstLine(h.Title)})
 	}
-	table([]string{"id", "kind", "agent", "status", "time", "task"}, rows)
+	// the task is the operator's own sentence and its two ends both say what it was
+	sectionTable("subagent runs", "", []string{"id", "kind", "agent", "status", "time", "task"}, rows, 5)
 	hint("/tasks <id> shows a run's result")
 	return false
 }
@@ -886,6 +901,10 @@ func (r *Repl) cmdContext(string) bool {
 	// disagreed about where to look. Fixed-width, so the token figures stay in one
 	// column as the session fills.
 	used := fmt.Sprintf("~%s of ~%s tokens", kfmt(tok), kfmt(budget)) + faint(gSep+"%s", plural(len(msgs), "message", "messages"))
+	// 20 cells, not gaugeCells: /context's bar sits alone on its row and is the one
+	// gauge in the program drawn at its own length. It is left exactly as it is,
+	// with printPerf's 12 and the wizard's 13 — collapsing the three is a look
+	// change with no width in it, and it would move goldens for nothing.
 	if bar, gpct, ok := r.ctxGauge(20); ok {
 		used = bar + faint("  %3d%%  ", gpct) + used
 	} else {
@@ -920,7 +939,7 @@ func (r *Repl) cmdContext(string) bool {
 			}
 			rows = append(rows, []string{faint("%s", byteCount(it.bytes)), it.label})
 		}
-		pnl.Table(nil, rows, pnl.width()-4)
+		pnl.Table(nil, rows, pnl.room())
 	}
 	fmt.Println()
 	pnl.Print()

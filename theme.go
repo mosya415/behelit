@@ -212,6 +212,25 @@ type Theme struct {
 	// when this is false — every one of them inherits the rule from here instead
 	// of each caller remembering it.
 	Frames bool
+
+	// Screen is the OTHER question, and keeping the two apart is the whole point
+	// of it being a second field: Frames says whether we may DECORATE, Screen says
+	// whether there is a terminal whose width we are laying out against.
+	//
+	// They are not the same question and they were being answered by the one
+	// field. Frames is false for a pipe — and also false for NO_COLOR and for
+	// TERM=dumb on a real 80-column screen, because "plain" means the sober screen
+	// rather than a monochrome dungeon. Asking Frames "is there a width to fit to"
+	// therefore handed the accessibility and CI tier none of the width work: its
+	// tables were not fitted and its rows were not wrapped, so a plan row the
+	// dungeon tier fits to 92 columns came out at 182 and the terminal's own soft
+	// wrap dropped the remainder into column 1 — which destroys the column
+	// alignment that is the entire point of a table, and is worse than an
+	// ellipsis, because the reader can no longer tell which column a value is in.
+	//
+	// So: no decoration without Frames, and no width without Screen. A pipe has
+	// neither and keeps both promises — no box, and every cell whole.
+	Screen bool
 	Palette
 	Glyphs
 }
@@ -488,7 +507,7 @@ func glyphsASCII() Glyphs {
 func dungeonTheme(c termCaps, why string) Theme {
 	return Theme{
 		Name: themeDungeon, Why: why,
-		Colour: true, Depth: c.depth, Unicode: c.unicode, Frames: c.tty,
+		Colour: true, Depth: c.depth, Unicode: c.unicode, Frames: c.tty, Screen: c.tty,
 		Palette: dungeonPalette(c.depth),
 		Glyphs:  glyphSet(c.unicode),
 	}
@@ -497,7 +516,8 @@ func dungeonTheme(c termCaps, why string) Theme {
 func plainTheme(c termCaps, why string) Theme {
 	return Theme{
 		Name: themePlain, Why: why,
-		Colour: false, Depth: depthNone, Unicode: c.unicode, Frames: false,
+		// Frames off, Screen on: the sober tier still knows how wide the window is.
+		Colour: false, Depth: depthNone, Unicode: c.unicode, Frames: false, Screen: c.tty,
 		Palette: Palette{}, // every escape empty: one code path, no branches
 		Glyphs:  glyphSet(c.unicode),
 	}

@@ -239,13 +239,12 @@ func runEval(ctx context.Context, cfg Config, args []string) int {
 				}
 				fmt.Printf("  %s  %s\n", padTo(statusWord(res.Status), 14, 0), label+faint("  %s", fmtDurShort(time.Duration(res.DurationMs)*time.Millisecond)))
 				if res.Error != "" {
-					hint("%s", truncate(res.Error, 200))
+					hint("%s", ellipsize(res.Error, 200))
 				}
 			}
 		}
 	}
 
-	section("results")
 	var rows [][]string
 	for _, r := range all {
 		cached := gNil
@@ -276,7 +275,10 @@ func runEval(ctx context.Context, cfg Config, args []string) int {
 		head = append(head, "transport")
 	}
 	head = append(head, "status", "time", "turns", "in", "cached", "out", "tools", "invalid", "delegated", "fallbacks")
-	table(head, rows)
+	// the task name is the identifier here; every other column is a number that is
+	// naturally short, so the allocator cannot shave it at all — and the lintel is
+	// drawn to the table, so the two end in the same column at every width
+	sectionTable("results", "", head, rows, 0)
 	if len(modes) > 1 {
 		printVariantComparison("native vs text", "transport", modes, all, func(r EvalResult) string { return r.Transport })
 	}

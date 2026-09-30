@@ -277,16 +277,25 @@ func (p *pickState) lines() []string {
 	// desynchronises the walk-back and the next repaint's "\r\033[J" then erases
 	// whatever was above the menu.
 	framed := p.title != ""
+	// ONE reading of the terminal for the whole repaint. The frame, the rows, the
+	// notes and the legend are all measured against this number and the walk-back
+	// counts the lines it produced, so a window resized between two of those
+	// measurements cannot leave the region half at one width and half at another —
+	// which is the shear. panel.at() is what carries the snapshot into the frame.
+	h := houseWidth()
 	pnl := newPanel(p.title, p.detail)
-	w := termWidth()
+	w := h + 1
 	if framed {
-		w = min(termWidth()-2, 76) - 4
+		w = h - 4
 	}
 	labelW := 0
 	for _, i := range p.window() {
 		labelW = max(labelW, visibleWidth(p.rows[i].label))
 	}
-	labelW = min(labelW, 40)
+	// Half the content, never less than the 40 columns it always had: a served id
+	// like qwen3-coder-480b-a35b-instruct is 30 columns before its window gauge,
+	// and a sixty-model gateway is exactly where a wide window pays.
+	labelW = min(labelW, max(40, (h-4)/2))
 	var out []string
 	add := func(s string) {
 		// Cut from the RIGHT, not the middle. A row reads left to right in priority
@@ -337,12 +346,12 @@ func (p *pickState) lines() []string {
 		// it WRAPS onto known extra lines instead of being ellipsized like a row.
 		// The line count stays known either way, which is what the walk-back needs.
 		if here && c.note != "" {
-			for i, l := range wrapTo(c.note, w-12) {
+			for i, l := range clamp2(c.note, min(w-12, proseWidth())) {
 				add(lead + "     " + faint("%s%s", map[bool]string{true: gHint + " ", false: strings.Repeat(" ", visibleWidth(gHint)+1)}[i == 0], l))
 			}
 		}
 		if here && c.warn != "" {
-			for i, l := range wrapTo(c.warn, w-12) {
+			for i, l := range clamp2(c.warn, min(w-12, proseWidth())) {
 				mark := cYellow + gPartial + cReset + " "
 				if i > 0 {
 					mark = strings.Repeat(" ", visibleWidth(gPartial)+1)
@@ -355,6 +364,13 @@ func (p *pickState) lines() []string {
 		add(lead + faint("%s %d more", gEllipsis, n))
 	}
 	if framed {
+		// The frame is pinned HERE and not before the rows went in, because it is
+		// drawn to the rows: a 62-column menu inside a 161-column box on a 200-column
+		// screen was 97 blank columns with a ║ at the end of them. It is still ONE
+		// width for the whole repaint, and still derived from the single h reading
+		// above — the rows were measured against h-4, so the frame they ask for cannot
+		// exceed h and nothing in the region can be at two widths.
+		pnl.at(min(h, max(min(panelFloor, h), pnl.contentWidth())))
 		out = append(out, pnl.Lines()...)
 	}
 	// The legend WRAPS and is never ellipsized: at 80 columns "^a all · ^n none ·
@@ -362,7 +378,7 @@ func (p *pickState) lines() []string {
 	// sixty-model gateway pickable — select-all and the filter — were invisible on
 	// exactly the screens that need them. The line count stays known either way,
 	// which is all the walk-back needs.
-	for i, l := range wrapTo(p.legend(), termWidth()-5) {
+	for i, l := range wrapTo(p.legend(), h-4) {
 		lead := "   " + faint("%s ", gHint)
 		if i > 0 {
 			lead = "     "
@@ -370,6 +386,21 @@ func (p *pickState) lines() []string {
 		out = append(out, lead+faint("%s", l))
 	}
 	return out
+}
+
+// clamp2 is wrapTo with a hard stop at two lines, the second ellipsized. The
+// picker's reserve (pickChrome + 4) pays for exactly two lines of note and two of
+// warning on the one highlighted row; before this, the note was merely EXPECTED
+// to be short, and a long one at a narrow terminal took four lines on its own and
+// blew a budget the "\033[<n>A" walk-back depends on. The legend is deliberately
+// not clamped: it is the only place ^a, ^n and "type to filter" are documented,
+// and documentation that is cut has not been written.
+func clamp2(s string, n int) []string {
+	ls := wrapTo(s, n)
+	if len(ls) > 2 {
+		ls = []string{ls[0], ellipsize(strings.Join(ls[1:], " "), max(n, 20))}
+	}
+	return ls
 }
 
 // wrapTo breaks a sentence at spaces into lines of at most n columns.

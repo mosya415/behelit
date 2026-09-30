@@ -265,7 +265,9 @@ func (r *Repl) cmdMembers(string) bool {
 		rows = append(rows, []string{label, faint("%s", m.Where()+dirSuffix(m)), memberSandbox(o, m),
 			faint("%s", orDash(strings.Join(byMember[n], ", "))), status})
 	}
-	table([]string{"member", "where", "sandbox", "roles", "status"}, rows)
+	// `where` is host:dir — an identifier whose two ends are the two things that
+	// name a machine, so when it has to give way it gives way in the middle.
+	table([]string{"member", "where", "sandbox", "roles", "status"}, rows, 1)
 	for _, f := range fixes {
 		errLine("%s", f)
 	}

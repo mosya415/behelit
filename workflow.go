@@ -887,7 +887,11 @@ func (wf *Workflow) plan() [][]string {
 		}
 		// The member column is always present: -dry-run is where an operator reads
 		// what will run where.
-		rows = append(rows, []string{strconv.Itoa(i + 1), s.Name, s.Kind, role, orDash(s.Member), attempts, to, when, orDash(truncate(firstLine(s.Check), 40))})
+		// The check goes in WHOLE. It used to be cut at 40 columns before the table
+		// ever saw it, which threw away bytes at every terminal width — including the
+		// ones with room to print the command an operator is about to authorise. The
+		// table's own fit pass decides what, if anything, has to give.
+		rows = append(rows, []string{strconv.Itoa(i + 1), s.Name, s.Kind, role, orDash(s.Member), attempts, to, when, orDash(firstLine(s.Check))})
 	}
 	return rows
 }
@@ -1533,10 +1537,13 @@ func roleSuffix(s *WorkflowStep) string {
 func (r *wfRunner) headline(s *WorkflowStep, cmd string) string {
 	switch s.Kind {
 	case stepRun:
-		return truncate(firstLine(cmd), 60)
+		// ellipsize and not truncate: this is a display cut, so it uses the tier's own
+		// marker rather than a literal "…" that would land a UTF-8 ellipsis in an ASCII
+		// row. The cap binds now that firstLine no longer cuts at 60 bytes first.
+		return ellipsize(firstLine(cmd), max(60, houseWidth()-16))
 	case stepDelegate:
 		if s.Check != "" {
-			return s.Role + "  " + faint("check: %s", truncate(firstLine(s.Check), 40))
+			return s.Role + "  " + faint("check: %s", ellipsize(firstLine(s.Check), max(40, houseWidth()-36)))
 		}
 		return s.Role
 	default:
@@ -1564,7 +1571,7 @@ func (r *wfRunner) report(s *WorkflowStep, o stepOutcome, d time.Duration) {
 		bits = append(bits, plural(o.Attempts, "attempt", "attempts"))
 	}
 	if det := firstLine(o.Detail); o.Status == stepFailed && det != "" {
-		bits = append(bits, truncate(det, 60))
+		bits = append(bits, ellipsize(det, max(60, houseWidth()-16)))
 	}
 	fmt.Println(line + faint("%s", strings.Join(bits, gSep)))
 }
@@ -1663,7 +1670,7 @@ func (r *wfRunner) summary() {
 	// and a corridor of block-bracketed rooms in it is new decoration. The table
 	// below states every one of the same facts in words.
 	if activeTheme.Frames {
-		for i, l := range r.mapStrip(nominalContent() - 10) {
+		for i, l := range r.mapStrip(panelRowRoom()) {
 			if i == 0 {
 				pnl.Row("map", l)
 			} else {
@@ -1684,9 +1691,11 @@ func (r *wfRunner) summary() {
 			failed++
 		}
 		rows = append(rows, []string{ss.Name, ss.Kind, orDash(ss.Role), stepStatusWord(ss.Status),
-			fmtDurShort(time.Duration(ss.DurationMs) * time.Millisecond), strconv.Itoa(ss.Attempts), truncate(firstLine(ss.Detail), 40)})
+			fmtDurShort(time.Duration(ss.DurationMs) * time.Millisecond), strconv.Itoa(ss.Attempts), firstLine(ss.Detail)})
 	}
-	pnl.Table([]string{"step", "kind", "role", "status", "time", "tries", "detail"}, rows, pnl.width()-4)
+	// The detail goes in whole, for the same reason the plan's check does — and the
+	// step name and the detail are the two identifiers on the row.
+	pnl.Table([]string{"step", "kind", "role", "status", "time", "tries", "detail"}, rows, pnl.room(), 0, 6)
 	fmt.Println()
 	pnl.Print()
 	tally := fmt.Sprintf("%d/%d ok", ok, len(r.wf.Steps))
@@ -2472,11 +2481,18 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 
 	if *dry {
-		section("plan", wf.Name+gSep+shortDir(wf.Path))
+		// the step name and the check are identifiers: both ends of each carry meaning
+		// — and the plan is measured BEFORE the lintel is drawn, so on a wide screen the
+		// rule ends in the same column as the widest step rather than in a column the
+		// page picked
+		plan, w := tableBlock([]string{"#", "step", "kind", "role", "member", "tries", "timeout", "when", "check"}, wf.plan(), 1, 8)
+		sectionTo(w, "plan", wf.Name+gSep+shortDir(wf.Path))
 		if wf.Desc != "" {
 			row("about", wf.Desc)
 		}
-		table([]string{"#", "step", "kind", "role", "member", "tries", "timeout", "when", "check"}, wf.plan())
+		for _, l := range plan {
+			fmt.Println(l)
+		}
 		hint("nothing ran: -dry-run validates and prints the plan")
 		return 0
 	}
@@ -2632,8 +2648,8 @@ func (r *wfRunner) digest() string {
 
 func printWorkflows(cfg Config) {
 	wfs, warns := listWorkflows(cfg)
-	section("workflows")
 	if len(wfs) == 0 {
+		section("workflows")
 		fmt.Println("  " + faint("none — put one in %s", shortDir(filepath.Join(cfg.Root, ".lca", "workflows"))))
 		hint("a workflow is an ordered YAML program: run/prompt/delegate steps; see examples/workflows")
 	} else {
@@ -2641,7 +2657,7 @@ func printWorkflows(cfg Config) {
 		for _, wf := range wfs {
 			rows = append(rows, []string{wf.Name, plural(len(wf.Steps), "step", "steps"), shortDir(filepath.Dir(wf.Path)), wf.Desc})
 		}
-		table([]string{"name", "steps", "from", "description"}, rows)
+		sectionTable("workflows", "", []string{"name", "steps", "from", "description"}, rows)
 		hint("%s", "lca run <name> [-var k=v …]"+gSep+"-dry-run prints the plan")
 	}
 	for _, w := range warns {
@@ -2651,8 +2667,8 @@ func printWorkflows(cfg Config) {
 
 func printRuns(cfg Config) {
 	runs, warns := listRuns(cfg, 20)
-	section("runs")
 	if len(runs) == 0 && len(warns) == 0 {
+		section("runs")
 		fmt.Println("  " + faint("none yet"))
 		return
 	}
@@ -2665,7 +2681,7 @@ func printRuns(cfg Config) {
 		}
 		rows = append(rows, []string{st.Run, st.Workflow, stepStatusWord(st.Status), step, st.Updated})
 	}
-	table([]string{"run", "workflow", "status", "at", "updated"}, rows)
+	sectionTable("runs", "", []string{"run", "workflow", "status", "at", "updated"}, rows)
 	for _, w := range warns {
 		warnLine("%s", w)
 	}

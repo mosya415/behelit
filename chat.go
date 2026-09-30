@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Message is one transcript entry. It doubles as the on-disk transcript format,
@@ -564,9 +565,20 @@ func isContextOverflow(err error) bool {
 	return reOverflow.MatchString(err.Error())
 }
 
+// truncate bounds a string to n columns for a MACHINE path: a trace record, a
+// stored run detail, an error message, a child session's name, a tool-call label.
+// Its marker is the literal "…" and deliberately not the theme's, because these
+// bytes are written to files and sent to models and may not depend on the
+// operator's locale — LC_ALL=C must not change what a trace says.
+//
+// It cuts on a rune boundary, which a byte slice did not: a cut inside a UTF-8
+// sequence writes an invalid record. A display cut wants ellipsize() instead,
+// which measures the same way and uses the tier's own marker so an ASCII row does
+// not get a UTF-8 ellipsis in it.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	r := []rune(s)
+	return string(r[:n]) + "…"
 }

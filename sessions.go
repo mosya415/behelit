@@ -137,13 +137,22 @@ func sessionWhen(id string) string {
 	return id
 }
 
+// firstLine takes the FIRST LINE of s, and nothing else. It used to also cut it
+// at 60 bytes, which is two jobs in one name and quietly defeated every
+// width-aware cap downstream of it: the plan's check, the failed step's detail,
+// the /tasks title and the run summary were all cut to 60 before the table or the
+// truncate that was supposed to decide their length ever saw them. So the check
+// went 40 → 60 columns rather than 40 → whole, at every terminal width and even
+// in a pipe, where the promise is that every cell is printed whole. The cut was
+// also a byte slice and would split a multi-byte rune, and it appended a literal
+// UTF-8 "…" into rows the ASCII tier had otherwise rendered with "...".
+//
+// A caller that wants a length says so, with truncate(), which measures columns
+// and uses the tier's own marker.
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
-	}
-	if len(s) > 60 {
-		s = s[:60] + "…"
 	}
 	return s
 }

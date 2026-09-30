@@ -202,7 +202,8 @@ roles:
 	if cheap != "" {
 		rows = append(rows, []string{"cheap", cheap, faint("%s", gNil)})
 	}
-	table([]string{"role", "models", "check"}, rows)
+	// role and models are identifiers: they cut in the middle, where both ends survive
+	table([]string{"role", "models", "check"}, rows, 0, 1)
 	if cheap == "" {
 		hint("no small model is served, so no cheap role was written — compaction runs on the lead's model")
 	}
@@ -553,7 +554,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 			rows = append(rows, []string{r.Name, orDash(r.Tier), strings.Join(chain, faint(" %s ", gFlow)),
 				temp, topP, effort, ctxfmt(budget) + faint(" (%s)", bsrc), replayName(prof.Replay)})
 		}
-		table([]string{"role", "tier", "models", "temp", "top_p", "effort", "context", "reasoning"}, rows)
+		table([]string{"role", "tier", "models", "temp", "top_p", "effort", "context", "reasoning"}, rows, 0, 2)
 		if failed && len(served) > 0 {
 			hint("red models aren't listed by the gateway — use names from: %s", strings.Join(sortedKeys(served), ", "))
 		}
@@ -798,7 +799,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	}
 
 	section("workspace")
-	row("root", ellipsizeMiddle(shortDir(cfg.Root), 70))
+	row("root", ellipsizeMiddle(shortDir(cfg.Root), max(70, houseWidth()-6)))
 	if _, err := gitCmd(cfg.Root, nil, nil, "rev-parse", "--show-toplevel"); err == nil {
 		okLine("git repository — delegate can use worktrees")
 	} else {

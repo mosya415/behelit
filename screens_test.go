@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The look, asserted rather than described.
@@ -25,9 +26,16 @@ import (
 // suite otherwise runs under the theme the process started with, which is
 // deliberately not the environment's — so a screen test has to say which theme it
 // is about.
-func screenTheme(t *testing.T, name string, unicode bool) {
+// cols is variadic and defaults to 80, which is why the twenty-six calls that
+// were written before the program could be any other width did not have to
+// change: they still say 80, by saying nothing.
+func screenTheme(t *testing.T, name string, unicode bool, cols ...int) {
 	t.Helper()
-	t.Setenv("COLUMNS", "80")
+	w := 80
+	if len(cols) > 0 {
+		w = cols[0]
+	}
+	t.Setenv("COLUMNS", strconv.Itoa(w))
 	saved := activeTheme
 	t.Cleanup(func() { setTheme(saved) })
 	caps := termCaps{tty: true, colour: name == themeDungeon, depth: depth256, unicode: unicode}
@@ -604,7 +612,7 @@ func TestRunMapStatesItsCountsAndKeepsItsRoomsWhole(t *testing.T) {
 			statuses[i] = []string{stepOK, stepFailed, stepSkipped, ""}[i%4]
 		}
 		r := testRunner(n, statuses)
-		width := nominalContent() - 10
+		width := panelRowRoom()
 		rows := r.mapStrip(width)
 		if len(rows) == 0 {
 			t.Fatalf("%d steps drew no map", n)
@@ -745,16 +753,33 @@ func TestPickerRepaintFitsItsReserve(t *testing.T) {
 	for _, c := range cs {
 		bare = append(bare, choice{id: c.id, label: c.label, detail: c.detail})
 	}
-	for h := 3; h <= 20; h++ {
-		p := newPickState(bare, pickOpts{multi: true, title: "setup", detail: "3/6", height: h})
-		if n := len(p.lines()); n > h+pickChrome {
-			t.Errorf("a viewport of %d rows repainted %d lines; the structural chrome is %d", h, n, pickChrome)
-		}
-		// and the highlighted row's note and warning stay inside the four rows the
-		// reserve keeps spare for them
-		q := newPickState(cs, pickOpts{multi: true, title: "setup", detail: "3/6", height: h})
-		if n := len(q.lines()); n > h+pickChrome+4 {
-			t.Errorf("a viewport of %d rows repainted %d lines with a note; the reserve pays for %d", h, n, h+pickChrome+4)
+	// The structural reserve holds from the 80-column floor up. Below it the LEGEND
+	// takes more rows than pickChrome counts — it is the only place ^a, ^n and "type
+	// to filter" are documented, so it wraps whole rather than being cut, and wrapTo
+	// refuses to wrap below 20 columns at all. That is the height axis: at HEAD the
+	// same budget is already overshot by two rows at 40 columns and five at 20, and
+	// drawing the legend to the page rather than to the terminal's last column
+	// (which is where it used to end at 60, in the pending-wrap column) moves the
+	// boundary by one row at 60. Named here rather than papered over.
+	for _, cols := range widthCases {
+		t.Setenv("COLUMNS", strconv.Itoa(cols))
+		for h := 3; h <= 20; h++ {
+			p := newPickState(bare, pickOpts{multi: true, title: "setup", detail: "3/6", height: h})
+			q := newPickState(cs, pickOpts{multi: true, title: "setup", detail: "3/6", height: h})
+			plain, noted := len(p.lines()), len(q.lines())
+			if cols >= 80 && plain > h+pickChrome {
+				t.Errorf("a viewport of %d rows repainted %d lines at a terminal of %d; the structural chrome is %d", h, plain, cols, pickChrome)
+			}
+			// And THIS holds at every width, which is what the two-line clamp on the
+			// note and the warning buys: the highlighted row's own two sentences cost
+			// exactly the four rows the reserve keeps spare for them, where before the
+			// clamp a long note at a narrow terminal took four lines on its own.
+			if noted-plain > 4 {
+				t.Errorf("a highlighted row's note and warning cost %d rows at a terminal of %d; the reserve pays for 4", noted-plain, cols)
+			}
+			if cols >= 80 && noted > h+pickChrome+4 {
+				t.Errorf("a viewport of %d rows repainted %d lines with a note at a terminal of %d; the reserve pays for %d", h, noted, cols, h+pickChrome+4)
+			}
 		}
 	}
 	// and the reserve itself is what pickHeight hands out
@@ -855,8 +880,8 @@ func TestProseWrapsWithItsGutter(t *testing.T) {
 		if !strings.HasPrefix(r, " "+gProse+" ") {
 			t.Errorf("a wrapped row lost the gutter: %q", r)
 		}
-		if w := visibleWidth(r); w > 80 {
-			t.Errorf("a wrapped row is %d columns: %q", w, r)
+		if w := visibleWidth(r); w > houseWidth()+1 {
+			t.Errorf("a wrapped row is %d columns, the page ends in column %d: %q", w, houseWidth()+1, r)
 		}
 		words = append(words, strings.TrimSpace(strings.TrimPrefix(r, " "+gProse+" ")))
 	}
@@ -948,5 +973,1083 @@ func TestErrorHintsFitTheTerminal(t *testing.T) {
 	}
 	if rejoined := strings.Join(got, " "); rejoined != long {
 		t.Errorf("the wrap changed the sentence:\n want %q\n  got %q", long, rejoined)
+	}
+}
+
+// ── the width, asserted ─────────────────────────────────────────────────────
+//
+// The program used to be 76 columns wide whatever the terminal was, so a
+// 140-column window held the whole interface in its left half and a 200-column
+// one in its left third. Structure now takes the window up to a page (pageMax)
+// and prose stops at a reading measure (proseMax). Four promises come out of
+// that, and all four are checked below: the 80-column floor does not move,
+// nothing is drawn past the page, the width is actually USED, and a repainted
+// region is measured against ONE snapshot of the terminal.
+
+// widthCases are the terminals the width is asserted at: the clamp floor, two
+// narrow windows, the floor this look was designed for, a full-screen laptop, the
+// complaint's own case, the page's ceiling and a tmux pane across two monitors.
+var widthCases = []int{20, 40, 60, 80, 100, 140, 200, 400}
+
+// chromeCourse is the visible width of l when l is a full-width course of chrome
+// — a panel's top or bottom course, or a section's lintel — and 0 when it is
+// anything else. These are the lines that are supposed to end in the same column,
+// which is the whole claim of houseWidth().
+func chromeCourse(l string) int {
+	s := stripANSI(l)
+	for _, pre := range []string{" " + gPanelTL, " " + gPanelBL, " " + gRule + gRule + " "} {
+		if strings.HasPrefix(s, pre) {
+			return visibleWidth(s)
+		}
+	}
+	return 0
+}
+
+// panelSpan is the two ends a frame's width must lie between: the floor it is
+// drawn to when its content asked for nothing, and the page. It is written here
+// once so the several width tests cannot each have their own idea of it.
+func panelSpan() (floor, ceiling int) {
+	return min(panelFloor, houseWidth()), houseWidth() + 1
+}
+
+// The chrome, at three widths, in both tiers, as exact lines. Every one of these
+// ends in column houseWidth()+1: the frame, the lintel, the input fence and the
+// submitted band all agree, which they did not before — the lintel was one course
+// short of the frame beside it and the fence and the band had no gutter at all.
+//
+// In the plain tier the assertion is the opposite one and just as important: with
+// Theme.Frames off the panels come back through bareLines(), so there is no frame
+// to widen, nothing is split and no path is cut. The only width-sensitive chrome
+// left in that tier is the lintel.
+func TestChromeGoldenAtEveryWidth(t *testing.T) {
+	for _, c := range []struct {
+		tier string
+		cols int
+		want []string
+	}{
+		{"dungeon", 80, []string{
+			" ╔═ THE HOLD ═ where you stand ═════════════════════════════════════════════╗",
+			" ╚══════════════════════════════════════════════════════════════════════════╝",
+			" ╔═ A DOOR ═ edit sum.go ══════════════════════════════════════ [coder t1] ═╗",
+			" ╚══════════════════════════════════════════════════════════════════════════╝",
+			" ── PLAN  nightly ───────────────────────────────────────────────────────────",
+			" ────────────────────────────────────────────────────────────────────────────",
+			" › fix Sum in sum.go                                                         ",
+		}},
+		{"dungeon", 100, []string{
+			" ╔═ THE HOLD ═ where you stand ═════════════════════════════════════════════╗",
+			" ╚══════════════════════════════════════════════════════════════════════════╝",
+			" ╔═ A DOOR ═ edit sum.go ══════════════════════════════════════ [coder t1] ═╗",
+			" ╚══════════════════════════════════════════════════════════════════════════╝",
+			" ── PLAN  nightly ───────────────────────────────────────────────────────────",
+			" ────────────────────────────────────────────────────────────────────────────────────────────────",
+			" › fix Sum in sum.go                                                                             ",
+		}},
+		{"dungeon", 140, []string{
+			" ╔═ THE HOLD ═ where you stand ═════════════════════════════════════════════╗",
+			" ╚══════════════════════════════════════════════════════════════════════════╝",
+			" ╔═ A DOOR ═ edit sum.go ══════════════════════════════════════ [coder t1] ═╗",
+			" ╚══════════════════════════════════════════════════════════════════════════╝",
+			" ── PLAN  nightly ───────────────────────────────────────────────────────────",
+			" ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+			" › fix Sum in sum.go                                                                                                                     ",
+		}},
+		{"plain", 80, []string{
+			" THE HOLD  where you stand",
+			" project   cli-agents  ~/work/",
+			" A DOOR  edit sum.go  [coder t1]",
+			"   - if n < 0 { continue }",
+			" ── PLAN  nightly ───────────────────────────────────────────────────────────",
+			" ────────────────────────────────────────────────────────────────────────────",
+			" › fix Sum in sum.go                                                         ",
+		}},
+		{"plain", 100, []string{
+			" THE HOLD  where you stand",
+			" project   cli-agents  ~/work/",
+			" A DOOR  edit sum.go  [coder t1]",
+			"   - if n < 0 { continue }",
+			" ── PLAN  nightly ───────────────────────────────────────────────────────────",
+			" ────────────────────────────────────────────────────────────────────────────────────────────────",
+			" › fix Sum in sum.go                                                                             ",
+		}},
+		{"plain", 140, []string{
+			" THE HOLD  where you stand",
+			" project   cli-agents  ~/work/",
+			" A DOOR  edit sum.go  [coder t1]",
+			"   - if n < 0 { continue }",
+			" ── PLAN  nightly ───────────────────────────────────────────────────────────",
+			" ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+			" › fix Sum in sum.go                                                                                                                     ",
+		}},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", c.tier, c.cols), func(t *testing.T) {
+			screenTheme(t, c.tier, true, c.cols)
+			assertLines(t, strings.Join(chromeSpecimen(), "\n"), c.want)
+		})
+	}
+}
+
+// chromeSpecimen is one of each full-width surface: a panel with a row, a lit
+// door with a preview line, a lintel, the input fence and a submitted band.
+func chromeSpecimen() []string {
+	hold := newPanel("the hold", "where you stand")
+	hold.Row("project", "cli-agents  ~/work/")
+	h := stripEach(hold.Lines())
+	door := newPanel("a door", "edit sum.go").door().tag("[coder t1]")
+	door.Line("%s", "  - if n < 0 { continue }")
+	d := stripEach(door.Lines())
+	lintel := strings.Split(strings.Trim(stripANSI(captureStdout(&testing.T{}, func() { section("plan", "nightly") })), "\n"), "\n")
+	out := []string{h[0], h[len(h)-1], d[0], d[len(d)-1]}
+	out = append(out, lintel...)
+	return append(out, stripANSI(inputFence(houseWidth())), stripANSI(inputBand(houseWidth(), "› fix Sum in sum.go")))
+}
+
+// drawTables is the two widest DATA screens the program draws, through the real
+// primitives: the -dry-run plan and eval's results, each with its own lintel.
+// The sweep below had no table in it at all, which is why a 92-column plan row on
+// an 80-column terminal and a 94-column results row went unseen.
+func drawTables() {
+	tb := wideTables[0]
+	sectionTable("plan", "nightly", tb.header, tb.rows, tb.mid...)
+	ev := wideTables[4]
+	sectionTable("results", "", ev.header, ev.rows, ev.mid...)
+}
+
+// Nothing may be drawn past the TERMINAL, and the room the terminal has must be
+// used.
+//
+// Two bounds, because the change separated two questions that were one number.
+// Decoration — a frame, a lintel, a fence, a band — stops at the page, because a
+// 400-column rule is noise. DATA takes the window: a table is budgeted against
+// the terminal (fitWidth), so at 200 columns a 165-column plan row goes in whole
+// instead of being cut to 161 with 39 columns standing empty beside it. So the
+// per-line bound here is the terminal's own room and the chrome bound is the page.
+//
+// The 80 in max(80, …) is not slack: a gauge row is a fixed-width picture of a
+// fraction, so it keeps its width at a terminal narrower than the floor this look
+// was designed for.
+//
+// The one piece of chrome that may be wider than the page is a frame that Row()
+// asked to widen for a token it could not break (panel.need) — /stats' trace path
+// is the case, and TestPanelKeepsAnUnbreakableValueWhole is where that hatch is
+// checked. chromeCourse skips it by only matching a course that is at least the
+// floor.
+func TestNoScreenExceedsItsTerminal(t *testing.T) {
+	for _, tier := range []struct {
+		name    string
+		theme   string
+		unicode bool
+	}{
+		{"dungeon", themeDungeon, true},
+		{"plain", themePlain, true},
+		{"ascii", themeDungeon, false},
+	} {
+		for _, cols := range widthCases {
+			t.Run(fmt.Sprintf("%s/%d", tier.name, cols), func(t *testing.T) {
+				screenTheme(t, tier.theme, tier.unicode, cols)
+				out := captureStdout(t, func() { drawTurn(); drawPanels(); drawPicker(); drawTables() })
+				page := houseWidth() + 1
+				room := max(80, fitWidth())
+				// The two data tables are asserted EXACTLY, and their rows are then
+				// exempt from the per-line bound — because a table whose floors cannot
+				// reach the budget is the one thing on a screen that is allowed to be
+				// wider than the terminal, and it is a decision rather than a leak. A
+				// nine-column plan cannot be made to fit 80 columns by any cutting that
+				// leaves the row readable, so it goes in whole and the terminal soft-wraps
+				// it, which keeps the bytes contiguous. Exempting them by exact line
+				// rather than by a looser bound keeps the bound tight for everything else.
+				tableRow := map[string]bool{}
+				blockWidth := map[int]bool{}
+				for _, i := range []int{0, 4} {
+					tb := wideTables[i]
+					ls, got := tableBlock(tb.header, tb.rows, tb.mid...)
+					natural, floor := tableSpan(tb.header, tb.rows, "  ")
+					want := natural
+					if floor <= fitWidth() && natural > fitWidth() {
+						want = fitWidth()
+					}
+					if got != want {
+						t.Errorf("%s is %d columns at a terminal of %d; it should be %d (natural %d, floors %d, room %d)",
+							tb.name, got, cols, want, natural, floor, fitWidth())
+					}
+					for _, l := range ls {
+						tableRow[stripANSI(l)] = true
+					}
+					blockWidth[got] = true
+				}
+				for _, l := range strings.Split(out, "\n") {
+					if tableRow[stripANSI(l)] {
+						continue
+					}
+					if w := visibleWidth(l); w > room {
+						t.Errorf("%d columns at a terminal of %d (its room is %d):\n%q", w, cols, room, stripANSI(l))
+					}
+					// No course of decoration goes past the page — unless it is a lintel
+					// drawn to a data block, and then it is exactly that block's width,
+					// because a rule one column short of the table it heads reads as a
+					// rendering fault rather than as a decision.
+					if w := chromeCourse(l); w != 0 && w > page && !blockWidth[w] {
+						t.Errorf("a course of chrome is %d columns, the page is %d and no block is that wide:\n%q",
+							w, page, stripANSI(l))
+					}
+				}
+			})
+		}
+	}
+}
+
+// A panel's courses must be the same width at every terminal, not just at 80: the
+// top one is assembled from styled parts and the bottom is a plain repeat, so the
+// two are computed twice and can drift — and now they are computed from a number
+// that moves with the content as well as with the window.
+//
+// The width itself is the contract the change moved. A frame is drawn to what is
+// IN it, floored at panelFloor so a two-line panel is still a box and ceilinged at
+// the page. Drawn to the page unconditionally, THE HOLD on a 200-column screen was
+// a 161-column box whose longest row ended in column 62: 99 blank columns, padded
+// and closed with a ║, which reads worse than the same rows in a 76-column box
+// because the box measures the emptiness and the rule points at it.
+func TestPanelFrameIsSquareAtEveryWidth(t *testing.T) {
+	for _, cols := range widthCases {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			floor, ceiling := panelSpan()
+			for _, c := range []struct{ title, detail, right string }{
+				{"the hold", "where you stand", ""},
+				{"a door", "edit some/very/long/path/that/goes/on.go", "[coder t1]"},
+				{"steps", "", "r-20260930-1"},
+				{"x", "", ""},
+			} {
+				p := newPanel(c.title, c.detail).tag(c.right)
+				p.Row("label", "value")
+				ls := p.Lines()
+				want := visibleWidth(ls[0])
+				for _, l := range ls {
+					if visibleWidth(l) != want {
+						t.Errorf("panel %q is ragged at a terminal of %d:\n%s", c.title, cols, strings.Join(stripEach(ls), "\n"))
+						break
+					}
+				}
+				if want < floor+1 || want > ceiling {
+					t.Errorf("panel %q is %d columns at a terminal of %d; the floor is %d and the page is %d",
+						c.title, want, cols, floor+1, ceiling)
+				}
+				// and it is drawn to its content, not to a constant: the frame is exactly
+				// what the widest thing in it asked for, once the floor and the page have
+				// had their say
+				if got := p.width() + 1; got != want {
+					t.Errorf("panel %q draws %d columns but measures %d at a terminal of %d", c.title, want, got, cols)
+				}
+				if w := min(ceiling-1, max(p.contentWidth(), floor)); p.width() != w {
+					t.Errorf("panel %q is %d columns at a terminal of %d; its content asks for %d (floor %d, page %d)",
+						c.title, p.width(), cols, w, floor, ceiling-1)
+				}
+			}
+			// At 80 the floor IS the page, so nothing moved there and could not have:
+			// every panel is the 76-column frame it has always been.
+			if cols == 80 {
+				p := newPanel("the hold", "where you stand")
+				p.Row("project", "cli-agents  ~/work/")
+				if w := visibleWidth(p.Lines()[0]); w != 77 {
+					t.Errorf("the 80-column frame is %d columns; it has always been 77", w)
+				}
+			}
+		})
+	}
+}
+
+// ── the tables ──────────────────────────────────────────────────────────────
+
+// wideTables are the four widest tables the program draws, with the cells the
+// display truncates used to cut before the table ever saw them.
+var wideTables = []struct {
+	name   string
+	header []string
+	rows   [][]string
+	mid    []int
+}{
+	{"plan",
+		[]string{"#", "step", "kind", "role", "member", "tries", "timeout", "when", "check"},
+		[][]string{
+			{"1", "build", "run", "—", "—", "1", "10m", "always", "go build ./... && go vet ./... && gofmt -l ."},
+			{"2", "harden-the-parser", "delegate", "coder → lead", "box", "3", "30m", "conditional", "go test -count=1 -race ./... && ./scripts/check-goldens.sh"},
+			// 79 characters, which is the row the suite could not see: firstLine() cut
+			// every cell at 60 bytes before the table was ever asked to fit it, so the
+			// width-aware caps downstream were dead code for anything longer and the
+			// fixture's own longest check was two short of noticing.
+			{"3", "exit-status-reaches-the-model", "run", "—", "—", "1", "5m", "always", "go test ./internal/orchestrator/... -run TestExitStatusReachesTheModel -count=1"},
+		},
+		[]int{1, 8}},
+	{"agents",
+		[]string{"agent", "kind", "model", "what it does"},
+		[][]string{
+			{"lead", "primary", "qwen3-coder-480b-a35b-instruct", "plans the work and answers"},
+			{"explore", "helper", "inherits", "reads the tree and reports back without changing anything"},
+		},
+		[]int{0, 2}},
+	{"roles",
+		[]string{"role", "tier", "models", "temp", "top_p", "effort", "context", "reasoning"},
+		[][]string{
+			{"lead", "—", "kimi-k3 → qwen3-coder-480b-a35b-instruct", "0.2 (role)", "0.95 (card)", "high", "1.05M (server)", "native"},
+			{"coder", "local", "qwen3-coder-480b-a35b-instruct", "0.0 (role)", "1.0 (default)", "provider default", "131k (card)", "—"},
+		},
+		[]int{0, 2}},
+	{"steps",
+		[]string{"step", "kind", "role", "status", "time", "tries", "detail"},
+		[][]string{
+			{"build", "run", "—", "● ok", "1.2s", "1", ""},
+			{"harden-the-parser", "delegate", "coder", "✕ failed", "42.1s", "2", "go test -count=1 -race ./... failed: sum_test.go:42 wanted 3 got -1"},
+		},
+		[]int{0, 6}},
+	// eval's results table is the one whose HEADER ROW alone is 94 columns: eleven
+	// columns of which ten are naturally short, so it cannot go below its own header
+	// and the floors can never reach an 80-column budget. It belongs here because it
+	// is the case that proves the shave gate: at 80 there is nothing to be gained by
+	// cutting the task name, and it is the only cell that identifies the row.
+	{"results",
+		[]string{"task", "status", "time", "turns", "in", "cached", "out", "tools", "invalid", "delegated", "fallbacks"},
+		[][]string{
+			{"exit-status-reaches-the-model", "● pass", "12.4s", "3", "18.2k", "91%", "1.1k", "7", "0", "1/1", "0"},
+			{"delegation-survives-a-retry", "✕ fail", "48.0s", "9", "64.0k", "77%", "4.2k", "22", "2/24", "1/2", "1"},
+		},
+		[]int{0}},
+}
+
+// The fit pass, stated as the THREE branches it has.
+//
+//  1. The natural widths fit: every cell is printed UNCHANGED, which is what keeps
+//     every table that fits today byte-identical and what a wide window buys.
+//  2. They do not fit and the floors can reach the budget: the widest column that
+//     can still afford it gives up one column at a time until the row lands
+//     exactly on the budget, and only then is a cell ellipsized.
+//  3. They do not fit and the floors CANNOT reach the budget: nothing is shaved at
+//     all. This is the branch the suite used to get wrong, because it obtained the
+//     floor width by asking for a budget of 1 — which is itself case 3 — and then
+//     asserted that the result was the floor. At an 80-column terminal the nine-
+//     column plan row shaved `harden-the-parser` to `harde…parser` and the check to
+//     twelve columns, and was STILL 84 columns against a budget of 77: it
+//     soft-wrapped to two physical rows exactly as the unshaved row did, so the
+//     shave bought no rows and cost the two cells that identify the row.
+//
+// The budget is fitWidth() and not the page, because a table is data and data
+// takes the window.
+func TestTablesFitAndStopCutting(t *testing.T) {
+	widest := func(ls []string) int {
+		w := 0
+		for _, l := range ls {
+			w = max(w, visibleWidth(l))
+		}
+		return w
+	}
+	for _, tb := range wideTables {
+		for _, cols := range []int{80, 100, 140, 200, 400} {
+			t.Run(fmt.Sprintf("%s/%d", tb.name, cols), func(t *testing.T) {
+				screenTheme(t, themeDungeon, true, cols)
+				budget := fitWidth()
+				// the allocator's own numbers, not a second copy of the rule
+				natural, floor := tableSpan(tb.header, tb.rows, "  ")
+				got := tableLines(tb.header, tb.rows, "  ", budget, tb.mid...)
+				cut := strings.Contains(stripANSI(strings.Join(got, "\n")), gEllipsis)
+				shown := strings.Join(stripEach(got), "\n")
+				switch {
+				case natural <= budget:
+					if widest(got) != natural || cut {
+						t.Errorf("a table that fits (%d into %d) was fitted anyway:\n%s", natural, budget, shown)
+					}
+				case floor <= budget:
+					if w := widest(got); w != budget {
+						t.Errorf("fitted to %d columns; the budget is %d and the floors are %d:\n%s", w, budget, floor, shown)
+					}
+					if !cut {
+						t.Errorf("a table shaved from %d to %d columns cut nothing:\n%s", natural, widest(got), shown)
+					}
+				default:
+					// a shave that cannot land buys nothing, so it is not taken: the row
+					// overflows at its natural widths, with every cell intact
+					if w := widest(got); w != natural {
+						t.Errorf("shaved to %d columns although the floors (%d) cannot reach the budget (%d):\n%s",
+							w, floor, budget, shown)
+					}
+					if cut {
+						t.Errorf("cut a cell although the floors (%d) cannot reach the budget (%d):\n%s", floor, budget, shown)
+					}
+				}
+				// the payoff, named: a value that fits the WINDOW is printed whole, and at
+				// 200 every one of these tables fits the window
+				if cols >= 200 && cut {
+					t.Errorf("%s still cuts a cell at a terminal of %d (natural %d, budget %d):\n%s", tb.name, cols, natural, budget, shown)
+				}
+			})
+		}
+	}
+}
+
+// pipedTheme installs what themeFor actually returns for a run whose stdout is
+// not a terminal: no decoration AND no width. It is not the same thing as
+// themePlain on a tty, which is NO_COLOR or TERM=dumb on a real screen — no
+// decoration and a perfectly good width — and standing one in for the other is how
+// the sober tier came to get none of the width work.
+func pipedTheme(t *testing.T, cols int) {
+	t.Helper()
+	t.Setenv("COLUMNS", strconv.Itoa(cols))
+	saved := activeTheme
+	t.Cleanup(func() { setTheme(saved) })
+	setTheme(themeFor(themeDungeon, termCaps{tty: false, colour: true, depth: depthTruecolor, unicode: true}))
+	if activeTheme.Frames || activeTheme.Screen {
+		t.Fatal("a run with no terminal has neither frames nor a width")
+	}
+}
+
+// With no TERMINAL there is no width to fit to, so nothing is fitted — and that
+// now holds for a panel's table too, which is what bareLines() has always promised
+// every other line in the panel and could not keep for its rows.
+//
+// The condition is driven for real. This used to install themePlain on a tty and
+// assert the no-fit behaviour there, which locked in the conflation it was meant
+// to guard: a sober 80-column terminal then got no fitting at all, and its plan
+// row went from bounded to 182 columns.
+func TestPipedTableKeepsEveryCellWhole(t *testing.T) {
+	pipedTheme(t, 80)
+	for _, tb := range wideTables {
+		pnl := newPanel("steps")
+		pnl.Table(tb.header, tb.rows, pnl.room(), tb.mid...)
+		out := strings.Join(stripEach(pnl.Lines()), "\n")
+		if strings.Contains(out, gEllipsis) {
+			t.Errorf("%s lost a cell with no frame to fit to:\n%s", tb.name, out)
+		}
+		for _, r := range tb.rows {
+			for _, c := range r {
+				if c != "" && !strings.Contains(out, stripANSI(c)) {
+					t.Errorf("%s dropped %q with no frame to fit to:\n%s", tb.name, c, out)
+				}
+			}
+		}
+	}
+}
+
+// A four-step run's STEPS table is ONE framed row per step at every width, and at
+// 140 it is one row per step with nothing cut.
+//
+// Before the fit pass, `detail` was truncated to 40 columns before the table saw
+// it and no other column could give anything up, so the row measured 87 against a
+// frame of 72 and panelSplit put every step on two framed rows — eleven rows for
+// four steps, with a step name broken across a ║. Both directions are fixed by
+// the same allocator: at 80 the columns share the shortfall and each step keeps
+// its row, and at 140 the whole row goes in whole.
+func TestStepsTableFitsOneRowPerStep(t *testing.T) {
+	tb := wideTables[3]
+	rows := append([][]string{}, tb.rows...)
+	for len(rows) < 4 {
+		rows = append(rows, tb.rows[1])
+	}
+	for _, cols := range []int{80, 100, 140, 200} {
+		screenTheme(t, themeDungeon, true, cols)
+		pnl := newPanel("steps")
+		// room() and not width(): the frame is drawn to the table, so asking the
+		// frame how wide it is before the table is in it is the question the other way
+		// round. room() is the ceiling's interior, which is the budget.
+		pnl.Table(tb.header, rows, pnl.room(), tb.mid...)
+		body := strings.Join(stripEach(pnl.Lines()), "\n")
+		if n := len(pnl.lines); n != len(rows)+1 {
+			t.Errorf("a four-step STEPS table is %d framed rows at a terminal of %d, want %d:\n%s",
+				n, cols, len(rows)+1, body)
+		}
+		if cols >= 140 && strings.Contains(body, gEllipsis) {
+			t.Errorf("STEPS still cuts a cell at a terminal of %d:\n%s", cols, body)
+		}
+	}
+}
+
+// ── the prose ───────────────────────────────────────────────────────────────
+
+// The answer grows with the window and then STOPS. Structure takes the width;
+// a sentence takes a reading measure, because a 200-column line of text is
+// harder to read than an 80-column one — and at 80 it wraps to exactly the 77
+// columns it always did.
+func TestProseStopsAtAReadingMeasure(t *testing.T) {
+	const para = "The guard was removed because negatives are counted now, and the test that " +
+		"asserted the old behaviour was rewritten to assert the new one; nothing else in the " +
+		"package reads the counter, so the change is local to Sum and its two callers."
+	for _, cols := range []int{80, 100, 140, 200, 400} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			pw := newProseWriter(false, false)
+			pw.anim = true
+			out := stripANSI(captureStdout(t, func() { pw.printLine(para); pw.end() }))
+			widest := 0
+			for _, l := range strings.Split(out, "\n") {
+				widest = max(widest, visibleWidth(l))
+			}
+			// the answer is printed in its own gutter, so a wrapped line is the
+			// measure plus the three columns of " ▌ " in front of it — and the measure is
+			// taken from the PAGE, so that sum lands in column houseWidth()+1, where
+			// every frame, lintel and fence on the same screen ends. Measured from the
+			// terminal it was three columns past all of them at 80, and its last cell
+			// rested in the DECAWM pending-wrap column.
+			const gutter = 3
+			measure := min(houseWidth()-2, proseMax)
+			if widest > houseWidth()+1 {
+				t.Errorf("the answer's longest line is %d columns at a terminal of %d; the page ends in column %d",
+					widest, cols, houseWidth()+1)
+			}
+			if widest > measure+gutter {
+				t.Errorf("the answer ran to %d columns at a terminal of %d; the measure is %d", widest, cols, measure)
+			}
+			// and it does use the measure it has: wrapTo breaks on spaces, so the
+			// longest line lands within one word of it
+			if widest < measure+gutter-12 {
+				t.Errorf("the answer only reached %d columns at a terminal of %d; the measure is %d", widest, cols, measure)
+			}
+			if cols >= 100 && widest > proseMax+gutter {
+				t.Errorf("the answer ran past the reading measure (%d) at a terminal of %d: %d columns", proseMax, cols, widest)
+			}
+		})
+	}
+}
+
+// ── a mid-session resize ────────────────────────────────────────────────────
+
+// There is no SIGWINCH handler and there does not need to be one: every width is
+// read at draw time, the transcript already printed is history and is never
+// re-emitted, and the three regions that DO repaint each take one snapshot per
+// repaint. What is asserted here is the last of those — that a region is
+// internally consistent, so a window moved between two repaints can leave two
+// differently-sized snapshots but never one snapshot at two sizes, which is the
+// shear.
+func TestResizeDoesNotShearARepaintedRegion(t *testing.T) {
+	var cs []choice
+	for i := 0; i < 30; i++ {
+		cs = append(cs, choice{id: fmt.Sprintf("m%d", i),
+			label:  fmt.Sprintf("qwen3-coder-480b-a35b-instruct-%d", i),
+			detail: "window 131k (server)",
+			note:   "a note long enough to wrap onto a second line inside the frame and then onto a third",
+			warn:   "and a warning that is also long enough to need more than one line of the frame it is in"})
+	}
+	snapshot := func(cols int) []string {
+		t.Setenv("COLUMNS", strconv.Itoa(cols))
+		p := newPickState(cs, pickOpts{multi: true, title: "setup", detail: "3/6", height: 8})
+		return p.lines()
+	}
+	screenTheme(t, themeDungeon, true, 140)
+	for _, order := range [][]int{{140, 80}, {80, 140}, {200, 20}, {60, 400}} {
+		var widths []int
+		for _, cols := range order {
+			ls := snapshot(cols)
+			page := houseWidth() + 1
+			// one width for the whole region: every framed line is the same width, and
+			// no line is past the page the walk-back was counted from
+			framed := 0
+			for _, l := range ls {
+				if w := chromeCourse(l); w != 0 {
+					if framed == 0 {
+						framed = w
+					}
+					if w != framed {
+						t.Fatalf("the picker mixed %d and %d columns in one repaint at a terminal of %d", framed, w, cols)
+					}
+				}
+				// At the clamp floor the legend is the one thing that cannot comply:
+				// wrapTo refuses to wrap below 20 columns, which is wider than a
+				// 17-column page, and the legend is the only place ^a, ^n and "type to
+				// filter" are documented — so it wraps whole rather than being cut. That
+				// is the height axis and it is unchanged in direction by this work.
+				if cols > 20 && visibleWidth(l) > page {
+					t.Errorf("a picker line is %d columns at a terminal of %d; the page is %d:\n%q",
+						visibleWidth(l), cols, page, stripANSI(l))
+				}
+			}
+			// The frame is content-shaped, so what is asserted is the span and not a
+			// constant: never narrower than the floor, never past the page.
+			if floor, ceiling := panelSpan(); framed < floor+1 || framed > ceiling {
+				t.Errorf("the picker's frame is %d columns at a terminal of %d; the floor is %d and the page is %d",
+					framed, cols, floor+1, ceiling)
+			}
+			widths = append(widths, framed)
+		}
+		// A wider terminal never gives a NARROWER menu. That is the monotonicity the
+		// old "two terminals must differ" check was reaching for, and it is the one
+		// that still holds once the frame follows its content: above the width at which
+		// the notes stop growing (the reading measure) two terminals legitimately
+		// produce the same frame.
+		if len(widths) == 2 {
+			if (order[0] < order[1]) != (widths[0] < widths[1]) && widths[0] != widths[1] {
+				t.Errorf("terminals %v produced frames %v: the wider terminal got the narrower menu", order, widths)
+			}
+		}
+	}
+	// and the editor's own repainted region: the band, the fence above the live line
+	// and the fence under the band are one function drawn to one snapshot, so they
+	// cannot disagree — and all three end in the same column as the frames above.
+	for _, cols := range widthCases {
+		screenTheme(t, themeDungeon, true, cols)
+		page := houseWidth() + 1
+		const typed = "› fix Sum in sum.go"
+		fence, band := inputFence(houseWidth()), inputBand(houseWidth(), typed)
+		// the band pads to the page and never cuts, so at the clamp floor — where the
+		// operator's own line is wider than a 17-column page — it is the line's width
+		wantBand := max(page, 1+visibleWidth(typed))
+		if visibleWidth(fence) != page || visibleWidth(band) != wantBand {
+			t.Errorf("the fence is %d columns and the band %d at a terminal of %d; the page is %d",
+				visibleWidth(fence), visibleWidth(band), cols, page)
+		}
+		e := &LineEditor{}
+		out := captureStdout(t, func() { e.submit("› ", []rune("fix Sum in sum.go")) })
+		if !strings.Contains(out, band) || !strings.Contains(out, fence) {
+			t.Errorf("submit drew something other than one band and one fence at a terminal of %d: %q", cols, out)
+		}
+	}
+}
+
+// ── what the width work claimed and did not do ──────────────────────────────
+
+// firstLine takes the FIRST LINE and nothing else.
+//
+// It also cut at 60 bytes, which is two jobs in one name, and every width-aware
+// cap downstream of it was dead code for anything longer: the plan's check, a
+// failed step's detail, a /tasks title and the run summary were all cut to 60
+// before the table or the truncate meant to decide their length ever saw them. So
+// the headline claim — that the check goes in WHOLE — was false at every width,
+// including in a pipe, where the promise is that every cell is printed whole.
+func TestFirstLineBoundsALineAndNotALength(t *testing.T) {
+	const check = "go test ./internal/orchestrator/... -run TestExitStatusReachesTheModel -count=1"
+	if len(check) != 79 {
+		t.Fatalf("the sample check is %d bytes, not the 79 this test is about", len(check))
+	}
+	if got := firstLine(check + "\nand a second line"); got != check {
+		t.Errorf("firstLine cut a 79-byte line:\n want %q\n  got %q", check, got)
+	}
+	// and a multi-byte rune is never split: the old cut was a byte slice
+	cjk := strings.Repeat("項目", 40)
+	if got := firstLine(cjk); got != cjk || !utf8.ValidString(got) {
+		t.Errorf("firstLine returned %d bytes of %d, valid=%v", len(got), len(cjk), utf8.ValidString(got))
+	}
+
+	// In a pipe the cell goes through byte-identical, at every width, because there
+	// is no width to fit to at all.
+	for _, cols := range []int{80, 120, 200, 400} {
+		pipedTheme(t, cols)
+		rows := [][]string{{"1", "step", "run", firstLine(check)}}
+		out := strings.Join(tableLines([]string{"#", "step", "kind", "check"}, rows, "  ", fitWidth()), "\n")
+		if !strings.Contains(out, check) {
+			t.Errorf("a piped plan cut the check at COLUMNS=%d:\n%s", cols, out)
+		}
+	}
+	// and on a screen wide enough to hold it, likewise
+	screenTheme(t, themeDungeon, true, 200)
+	rows := [][]string{{"1", "step", "run", firstLine(check)}}
+	out := strings.Join(stripEach(tableLines([]string{"#", "step", "kind", "check"}, rows, "  ", fitWidth())), "\n")
+	if !strings.Contains(out, check) {
+		t.Errorf("a 200-column terminal cut a 79-column check:\n%s", out)
+	}
+}
+
+// The allocator measures every cell in COLUMNS and then asks for a cut, so the cut
+// has to be in columns too. ellipsize and ellipsizeMiddle counted runes, which for
+// a wide-rune cell handed back up to twice the columns they were asked for — and
+// because every column but the last is padded, the row does not merely overflow,
+// it SHEARS: padTo sees a cell already past its promised width and pads nothing,
+// so every column to the right slides on that one line and the reader can no
+// longer tell which column a value belongs to.
+func TestACutIsMeasuredInColumnsAndNotInRunes(t *testing.T) {
+	const cjk = "box01:/home/u/项目文档目录/深层子目录/更深一层/工作区"
+	screenTheme(t, themeDungeon, true, 80)
+	for _, n := range []int{8, 12, 20, 24, 40} {
+		if w := visibleWidth(ellipsize(cjk, n)); w > n {
+			t.Errorf("ellipsize(%d) returned %d columns", n, w)
+		}
+		if w := visibleWidth(ellipsizeMiddle(cjk, n)); w > n {
+			t.Errorf("ellipsizeMiddle(%d) returned %d columns", n, w)
+		}
+	}
+	if got := ellipsize("abcdefgh", 40); got != "abcdefgh" {
+		t.Errorf("ellipsize shortened something that fits: %q", got)
+	}
+
+	// and the grid stays a grid: the next column starts in the SAME screen column
+	// on every row, with the wide-rune cell in a padded middle column
+	header := []string{"member", "where", "sandbox", "roles", "status"}
+	rows := [][]string{
+		{"local", "/home/u/proj", "off", "lead, coder", "ok"},
+		{"box01", cjk, "on", "reviewer", "ok"},
+		{"box02", "box02:/srv/p", "on", "—", "unreachable"},
+	}
+	for _, cols := range []int{80, 100, 140} {
+		screenTheme(t, themeDungeon, true, cols)
+		ls := stripEach(tableLines(header, rows, "  ", fitWidth(), 1))
+		budget := fitWidth()
+		at := -1
+		for i, l := range ls {
+			if w := visibleWidth(l); w > budget {
+				t.Errorf("a row with a wide-rune cell is %d columns against a budget of %d at a terminal of %d:\n%s",
+					w, budget, cols, strings.Join(ls, "\n"))
+			}
+			// where does "sandbox" start? every row must agree
+			j := strings.Index(l, "  on")
+			if j < 0 {
+				j = strings.Index(l, "  off")
+			}
+			if j < 0 {
+				continue
+			}
+			c := visibleWidth(l[:j])
+			if at < 0 {
+				at = c
+			}
+			if c != at {
+				t.Errorf("the sandbox column starts in column %d on row %d and %d elsewhere at a terminal of %d:\n%s",
+					c, i, at, cols, strings.Join(ls, "\n"))
+			}
+		}
+	}
+}
+
+// The status line sits INSIDE the region the line editor walks back over by
+// counting rows, so "it must not be able to wrap" is an invariant the cursor
+// arithmetic depends on. With a CJK project root the rune-counting ellipsize
+// returned the path unchanged at 60 columns against a room of 43, the final clamp
+// passed it through too, and the 92-column line wrapped: the "\033[1A" then landed
+// on the status line instead of the input line and the next keystroke's "\r\033[J"
+// erased from there, stranding the input line and redrawing the prompt one row
+// lower on every press.
+func TestStatusLineNeverWrapsWithWideRunes(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	r, h := replFor(t, fs, testRoles)
+	h.sess.Loop = true
+	h.sess.jail().Root = "/Users/u/文档/项目/服务端/工作目录"
+	for _, cols := range []int{40, 60, 80, 100, 140, 200} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			line := r.statusLine()
+			// the editor prints it at a two-column indent
+			if w := visibleWidth(line) + 2; w > max(cols, houseWidth()+1) {
+				t.Errorf("the status line is %d columns at a terminal of %d: %q", w, cols, stripANSI(line))
+			}
+		})
+	}
+}
+
+// A redirected answer is the payload, and its bytes may not depend on the window
+// the run happened in any more than they may carry an escape. The markdown rules
+// are computed before the prose writer decides anything, so an ungated width in
+// them wrote 77 dashes at COLUMNS=80 and 88 at COLUMNS=140 into the same file.
+func TestARedirectedAnswerDoesNotDependOnTheWindow(t *testing.T) {
+	const answer = "first paragraph\n\n---\n\n| model | window | note |\n| --- | --- | --- |\n" +
+		"| qwen3-coder-480b-a35b-instruct | 262144 | served |\n| glm-5.3 | 131072 | falling back |\n\nlast paragraph"
+	render := func(cols string) string {
+		pipedTheme(t, 80)
+		t.Setenv("COLUMNS", cols)
+		return captureStdout(t, func() {
+			pw := newProseWriter(false, false) // anim is false: this is a pipe
+			pw.feed(answer)
+			pw.end()
+		})
+	}
+	base := render("80")
+	for _, cols := range []string{"", "100", "140", "200", "400"} {
+		if got := render(cols); got != base {
+			t.Errorf("the same answer redirected at COLUMNS=%q differs from COLUMNS=80:\n want %q\n  got %q", cols, base, got)
+		}
+	}
+	if strings.ContainsRune(base, 0x1b) {
+		t.Errorf("a redirected answer carried an escape: %q", base)
+	}
+}
+
+// The memory guard cuts a cell on a RUNE boundary and hands back the reset of a
+// styled one. A byte slice made the emitted row invalid UTF-8 and dropped the
+// cell's own cReset, so the faint attribute leaked into every line printed after
+// the table until something else happened to reset it. And it only applies where
+// there is a width to apply it for: with no terminal the promise is that every
+// cell goes through unchanged.
+func TestTheCellGuardCutsCleanlyAndOnlyWithAWidth(t *testing.T) {
+	screenTheme(t, themeDungeon, true, 80)
+	big := faint("%s", strings.Repeat("項目", 3000))
+	got := capCell(big)
+	if !utf8.ValidString(got) {
+		t.Error("capCell produced invalid UTF-8")
+	}
+	if !strings.HasSuffix(got, cReset) {
+		t.Errorf("capCell dropped the cell's reset: %q", got[max(0, len(got)-20):])
+	}
+	out := strings.Join(tableLines([]string{"step", "detail"}, [][]string{{"x", big}}, "  ", fitWidth(), 1), "\n")
+	if !utf8.ValidString(out) {
+		t.Error("a table row with an over-long styled cell is not valid UTF-8")
+	}
+	pipedTheme(t, 80)
+	whole := strings.Repeat("a", cellBytes*2)
+	out = strings.Join(tableLines([]string{"step", "detail"}, [][]string{{"x", whole}}, "  ", fitWidth(), 1), "\n")
+	if !strings.Contains(out, whole) {
+		t.Error("a piped table cut a cell although there was no width to fit to")
+	}
+}
+
+// A marker line that wraps is the one thing that ruins the scrollback: every later
+// tick's "\r\033[K" repaints only the last visual row and leaves a trail of
+// half-erased flames behind it. The guard was a magic 12 and at the clamp floor
+// the room is exactly 12, so it did not fire.
+func TestTheMarkerNeverExceedsItsTerminal(t *testing.T) {
+	for _, cols := range widthCases {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			pw := newProseWriter(false, false)
+			pw.anim = true
+			pw.markerPrefix = " " + cDim + gTorch + cReset + " "
+			pw.markerLabel = "waiting for meta-llama/Llama-3.1-405B-Instruct-FP8"
+			line := pw.markerPrefix + pw.markerText(gSpinner[0], pw.markerLabel)
+			if w := visibleWidth(line); w > max(cols, houseWidth()+1) {
+				t.Errorf("the marker is %d columns at a terminal of %d: %q", w, cols, stripANSI(line))
+			}
+		})
+	}
+}
+
+// The one place chrome was printed AFTER the payload, so the payload could never
+// be the thing that fit. The command itself is what you would paste into a shell
+// and is never cut; the hint is droppable and drops.
+func TestTheRunHeadlineKeepsItsCommandAndDropsItsHint(t *testing.T) {
+	const cmdline = "go test ./internal/orchestrator/... -run TestExitStatusReachesTheModel -count=1 -race"
+	for _, cols := range []int{80, 100, 140, 200} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			line := runHeadline(cmdline)
+			if !strings.Contains(stripANSI(line), cmdline) {
+				t.Errorf("the headline cut the command at a terminal of %d: %q", cols, stripANSI(line))
+			}
+			// the command is the payload and is never cut, so the bound is the page OR
+			// the bare command line when even that does not fit — and never more
+			bare := visibleWidth(runHeadline("x")) - 1 + visibleWidth(cmdline)
+			if w := visibleWidth(line); w > max(houseWidth()+1, bare) {
+				t.Errorf("the headline is %d columns at a terminal of %d: %q", w, cols, stripANSI(line))
+			}
+			if hinted := strings.Contains(stripANSI(line), "Ctrl-C"); hinted != (visibleWidth(line) <= houseWidth()+1) {
+				t.Errorf("the hint is %v at a terminal of %d, where the bare command line measures %d against a page of %d",
+					hinted, cols, bare, houseWidth()+1)
+			}
+		})
+	}
+}
+
+// Every one-sentence follow-up line — a hint, an ok/warn/err line, a tool error's
+// hints, the note after answering "a" at a door — wraps to the reading measure and
+// indents its continuations under itself. hint() used to be the one prose surface
+// with no measure at all: doctor's longest is 169 columns, which broke to column 1
+// at 80 and was the widest line on the whole screen at 200 and 400.
+//
+// A line whose payload is a single unbreakable token is the exception, because
+// wrapping it puts the token alone on a line that is still too long and splits it
+// away from the sentence that introduced it.
+func TestASentenceLineWrapsButAPasteDoesNot(t *testing.T) {
+	const long = "add a profile in models.go, or set models.llama-4.2-scout-17b-16e-instruct-fp8: " +
+		"{temperature, top_p, effort, reasoning_replay} in roles.yaml from the model card"
+	_, trust, note := doorAnswer("a", false)
+	if !trust || note == "" {
+		t.Fatal("answering \"a\" at a read door must grant the session and say so")
+	}
+	for _, cols := range widthCases {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			// Below a terminal of about 40 the reading measure is narrower than wrapTo's
+			// own 20-column floor, so a sentence is printed whole and the terminal soft
+			// wraps it — the same call the picker's legend makes, for the same reason:
+			// documentation that has been cut has not been written.
+			measured := min(houseWidth()-3, proseMax) > 24
+			out := captureStdout(t, func() {
+				hint("%s", long)
+				warnLine("%s", long)
+				errLine("%s", long)
+			})
+			for _, l := range strings.Split(strings.Trim(out, "\n"), "\n") {
+				// an unbreakable token in the middle of the sentence overflows its own
+				// row, whole: that is the one thing wider than the page here
+				if w := visibleWidth(l); measured && w > max(80, houseWidth()+1) && !strings.Contains(l, "instruct-fp8:") {
+					t.Errorf("a hint is %d columns at a terminal of %d: %q", w, cols, stripANSI(l))
+				}
+			}
+			// the door's note is printed through the same wrap
+			for _, l := range wrapHint(note, min(houseWidth()-4, proseMax)) {
+				if w := visibleWidth(l) + 3; measured && w > max(80, houseWidth()+1) {
+					t.Errorf("the trust-all note is %d columns at a terminal of %d: %q", w, cols, l)
+				}
+			}
+			// and a sentence whose value is one unbreakable token is not split away
+			// from it
+			const path = "/var/folders/gj/6_3zn_0d6/T/TestMCPLockAndRefresh2864069200/002/.lca/mcp.lock.json"
+			got := captureStdout(t, func() { okLine("wrote %s", path) })
+			if !strings.Contains(stripANSI(got), "wrote "+path) {
+				t.Errorf("a paste was split at a terminal of %d: %q", cols, stripANSI(got))
+			}
+		})
+	}
+	// and it does wrap where it can: at 80 the 160-column hint is more than one row
+	screenTheme(t, themeDungeon, true, 80)
+	if n := len(strings.Split(strings.Trim(captureStdout(t, func() { hint("%s", long) }), "\n"), "\n")); n < 2 {
+		t.Errorf("a %d-column hint printed as %d row(s) at a terminal of 80", visibleWidth(long), n)
+	}
+}
+
+// NO_COLOR and TERM=dumb on a real terminal are the sober tier, not a pipe: no
+// decoration and a perfectly good width. Deciding the fit budget from
+// activeTheme.Frames handed that tier none of the width work — its tables were not
+// fitted and its label/value rows were not wrapped, so the plan row the dungeon
+// tier fits to a bounded width came out at 182 columns and the terminal's own soft
+// wrap dropped the remainder into column 1, destroying the column alignment that
+// is the whole point of a table.
+func TestTheSoberTierGetsTheWidthWork(t *testing.T) {
+	tb := wideTables[0]
+	for _, cols := range []int{80, 100, 140} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themePlain, true, cols)
+			if activeTheme.Frames {
+				t.Fatal("the sober tier draws no frames")
+			}
+			if !activeTheme.Screen {
+				t.Fatal("the sober tier is on a terminal and has a width")
+			}
+			plain, _ := tableBlock(tb.header, tb.rows, tb.mid...)
+			screenTheme(t, themeDungeon, true, cols)
+			dungeon, _ := tableBlock(tb.header, tb.rows, tb.mid...)
+			if strings.Join(stripEach(plain), "\n") != strings.Join(stripEach(dungeon), "\n") {
+				t.Errorf("the sober tier and the dungeon tier fitted the plan differently at a terminal of %d:\nsober:\n%s\ndungeon:\n%s",
+					cols, strings.Join(stripEach(plain), "\n"), strings.Join(stripEach(dungeon), "\n"))
+			}
+			// and a long label/value row wraps in both tiers rather than running off
+			const long = "the model was asked for native tool calls and answered with a text block, so the call was reparsed from prose"
+			screenTheme(t, themePlain, true, cols)
+			for _, l := range strings.Split(strings.Trim(captureStdout(t, func() { row("thinking", long) }), "\n"), "\n") {
+				if w := visibleWidth(l); w > houseWidth()+1 {
+					t.Errorf("a sober-tier row is %d columns at a terminal of %d: %q", w, cols, l)
+				}
+			}
+		})
+	}
+	// and a real pipe still gets neither
+	pipedTheme(t, 80)
+	out := strings.Join(tableLines(tb.header, tb.rows, "  ", fitWidth(), tb.mid...), "\n")
+	if strings.Contains(out, gEllipsis) {
+		t.Errorf("a piped plan cut a cell:\n%s", out)
+	}
+}
+
+// The frames and the lintels are drawn to what is IN them. Grown to the page
+// instead, a 200-column screen showed THE HOLD as a 161-column box whose longest
+// row ended in column 62 and `doctor` as four 161-column rules over lines of 12 to
+// 52 columns: text squeezed left inside a box that measures the emptiness, with
+// the rule pointing at it. The session's own shell — the input fence and the
+// submitted band — still takes the whole page, because the line it frames is the
+// operator's own and has no content width to be sized to.
+func TestFramesAreDrawnToTheirContents(t *testing.T) {
+	for _, cols := range []int{80, 140, 200, 400} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			hold := newPanel("the hold", "where you stand")
+			hold.Row("project", "cli-agents  ~/work/")
+			hold.Row("gateway", "gw.lan:8080  ● UP · 6 models")
+			ls := hold.Lines()
+			frame := visibleWidth(ls[0])
+			content := 0
+			for _, l := range ls[1 : len(ls)-1] {
+				content = max(content, visibleWidth(strings.TrimRight(stripANSI(l), " ║|")))
+			}
+			// a frame is at most four columns of stone and gutter past its widest row,
+			// or the floor, whichever is more
+			floor, _ := panelSpan()
+			if want := max(content+2, floor+1); frame > want {
+				t.Errorf("the frame is %d columns around %d columns of content at a terminal of %d:\n%s",
+					frame, content, cols, strings.Join(stripEach(ls), "\n"))
+			}
+			// the shell keeps the page
+			if w := visibleWidth(inputFence(houseWidth())); w != houseWidth()+1 {
+				t.Errorf("the input fence is %d columns; the page is %d", w, houseWidth()+1)
+			}
+			// and an unmeasured lintel is the floor, never the page
+			lintel := stripANSI(strings.Trim(captureStdout(t, func() { section("gateway", "gw.lan:8080") }), "\n"))
+			if w := visibleWidth(lintel); w != min(panelFloor, houseWidth())+1 {
+				t.Errorf("an unmeasured lintel is %d columns at a terminal of %d; the floor is %d",
+					w, cols, min(panelFloor, houseWidth())+1)
+			}
+		})
+	}
+	// A lintel over a MEASURED block is that block's width, so the rule and the
+	// table it heads end in the same column.
+	for _, cols := range []int{100, 140, 200} {
+		screenTheme(t, themeDungeon, true, cols)
+		tb := wideTables[0]
+		_, w := tableBlock(tb.header, tb.rows, tb.mid...)
+		out := strings.Split(strings.Trim(stripANSI(captureStdout(t, func() {
+			sectionTable(tb.name, "nightly", tb.header, tb.rows, tb.mid...)
+		})), "\n"), "\n")
+		want := min(max(w, min(panelFloor, houseWidth())+1), max(fitWidth(), houseWidth()+1))
+		if got := visibleWidth(out[0]); got != want {
+			t.Errorf("the lintel is %d columns over a %d-column table at a terminal of %d; want %d", got, w, cols, want)
+		}
+	}
+}
+
+// Under LC_ALL=C the tier spells its ellipsis "..." and measures it as three
+// columns, so nothing it cuts may carry a U+2026 — the row would then hold the
+// tier's own marker in one place and a UTF-8 ellipsis in another, in the locale
+// that was chosen because it cannot carry one. firstLine used to append a literal
+// "…" to every cell over 60 bytes, so the plan's check did exactly that.
+func TestTheASCIITierCutsInASCII(t *testing.T) {
+	for _, cols := range []int{80, 100} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, false, cols)
+			out := captureStdout(t, func() { drawTables() })
+			if strings.ContainsRune(out, '…') {
+				for _, l := range strings.Split(out, "\n") {
+					if strings.ContainsRune(l, '…') {
+						t.Errorf("the ASCII tier emitted a UTF-8 ellipsis: %q", stripANSI(l))
+					}
+				}
+			}
+			if !strings.Contains(out, "...") && cols == 100 {
+				t.Error("nothing was cut at a terminal of 100, so this asserts nothing")
+			}
+		})
+	}
+}
+
+// A lintel gives its DETAIL up before it gives up its stone, and the retry that
+// shortens the detail has to land: it re-measures with visibleWidth, so a detail
+// of wide runes used to leave the fill below two courses and the rule ragged.
+func TestALintelGivesUpItsDetailAndStaysSquare(t *testing.T) {
+	for _, cols := range widthCases {
+		for _, detail := range []string{
+			"nightly",
+			"/private/tmp/claude-501/widelab/.lca/workflows/harden-the-workflow-parser.yaml",
+			"项目文档目录/深层子目录/更深一层/工作区/配置文件.yaml",
+		} {
+			screenTheme(t, themeDungeon, true, cols)
+			got := stripANSI(strings.Trim(captureStdout(t, func() { section("plan", detail) }), "\n"))
+			want := min(panelFloor, houseWidth()) + 1
+			if w := visibleWidth(got); w != want {
+				t.Errorf("a lintel is %d columns at a terminal of %d, want %d:\n%q", w, cols, want, got)
+			}
+		}
+	}
+}
+
+// A pipe's bytes may not depend on the window. The answer is the case that was
+// caught — the markdown rules were computed before the prose writer decided
+// anything — but a lintel and a shortened path had the same shape, so the whole
+// piped screen is asserted rather than the one line.
+func TestPipedBytesDoNotDependOnTheWindow(t *testing.T) {
+	render := func(cols string) string {
+		pipedTheme(t, 80)
+		t.Setenv("COLUMNS", cols)
+		return captureStdout(t, func() {
+			drawTables()
+			section("gateway", "gw.lan:8080")
+			row("trace", prettyPath("/var/log/lca/traces/20260930-022035-2339.jsonl", ""))
+			okLine("wrote %s", "/private/tmp/claude-501/widelab/.lca/mcp.lock.json")
+			hint("per-task results: %s", "/private/tmp/claude-501/widelab/.lca/evals/20260930")
+		})
+	}
+	base := render("80")
+	for _, cols := range []string{"", "24", "100", "140", "200", "400"} {
+		if got := render(cols); got != base {
+			t.Errorf("a piped screen at COLUMNS=%q differs from COLUMNS=80:\n want %q\n  got %q", cols, base, got)
+		}
 	}
 }

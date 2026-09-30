@@ -158,6 +158,26 @@ func (e *LineEditor) suggest(buf string) []suggestion {
 
 func (e *LineEditor) out(s string) { fmt.Print(s) }
 
+// inputFence and inputBand are the prompt's own chrome: the hairline that bounds
+// the input area, and the gray-green slab a submitted line collapses into. They
+// are two functions rather than five expressions so the fence above the line and
+// the fence below the band cannot be drawn to two widths.
+//
+// Both take the ONE leading space every frame is printed in. They had none, which
+// is why at a terminal of 60 the fence measured 60 against a 59-column frame
+// directly above it — the off-by-one is fixed at its source rather than by
+// patching the number.
+func inputFence(w int) string { return " " + cFaint + strings.Repeat(gRule, w) + cReset }
+
+// The band PADS and never cuts: the text in it is what the operator just typed,
+// and a prompt longer than the page is one the terminal may soft-wrap but that we
+// must not shorten. So a band is houseWidth()+1 columns or exactly as wide as the
+// line it holds, whichever is more — and it is drawn once, after the line is
+// submitted, where nothing walks back over it.
+func inputBand(w int, text string) string {
+	return " " + cBandBg + padTo(text, w, 0) + cReset
+}
+
 // ReadLine prints prompt and returns the entered line. Returns errLineCancel on
 // Ctrl-C (caller should just continue) and io.EOF on Ctrl-D / stream end.
 func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
@@ -189,7 +209,7 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 	// top fence of the input area, at the house width and not the terminal's: the
 	// fence and the frames above it are the same chrome and have to agree
 	if !e.bare {
-		e.out(cFaint + strings.Repeat(gRule, houseWidth()) + cReset + "\r\n")
+		e.out(inputFence(houseWidth()) + "\r\n")
 	}
 	e.render(prompt, buf, pos)
 	for {
@@ -428,20 +448,19 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 		e.out("\r\033[J" + prompt + e.display(buf) + "\r\n")
 		return
 	}
+	// ONE width snapshot for the band and the hairline under it, so the two can
+	// never disagree because the window moved between them.
+	w := houseWidth()
 	if e.staged != "" {
-		w := houseWidth()
-		band := cBandBg + padTo(stripANSI(prompt)+pasteSummary(e.staged)+"  "+displayRunes(buf), w, 0) + cReset
-		e.out("\r\033[J" + band + "\r\n" + cFaint + strings.Repeat(gRule, w) + cReset + "\r\n")
+		e.out("\r\033[J" + inputBand(w, stripANSI(prompt)+pasteSummary(e.staged)+"  "+displayRunes(buf)) +
+			"\r\n" + inputFence(w) + "\r\n")
 		return
 	}
 	if len(buf) == 0 {
 		e.out("\r\033[J" + prompt + "\r\n")
 		return
 	}
-	w := houseWidth()
-	bar := cFaint + strings.Repeat(gRule, w) + cReset
-	band := cBandBg + padTo(stripANSI(prompt)+displayRunes(buf), w, 0) + cReset
-	e.out("\r\033[J" + band + "\r\n" + bar + "\r\n")
+	e.out("\r\033[J" + inputBand(w, stripANSI(prompt)+displayRunes(buf)) + "\r\n" + inputFence(w) + "\r\n")
 }
 
 // render redraws the input line and, when the line is a "/command" prefix, a
@@ -455,10 +474,26 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 		e.out(prompt + e.display(buf))
 	}
 	below := 0
+	// ONE width snapshot for the whole menu: this region is walked back over by
+	// COUNTING its rows (below, further down), so a row that soft-wraps puts the
+	// "\033[<n>A" one row out and the next repaint's "\r\033[J" erases the line
+	// above the input. The descriptions were never bounded at all, so a long one at
+	// a narrow terminal already did exactly that.
+	// "  " + %-11s + " " = 14, against a printed H+1 — and then bounded by the
+	// reading measure, because a description is PROSE. At 140 the /mcp description
+	// printed as one 112-column sentence, 24 columns past the measure the answer is
+	// held to and the longest run of prose anywhere on the screen; the walk-back
+	// only needs the row count to stay known, and a tighter bound keeps it known
+	// for free.
+	descRoom := min(houseWidth()-13, proseMax)
 	for _, m := range menu {
 		line := "\r\n  " + cFaint + fmt.Sprintf("%-11s", m.name) + cReset
 		if m.desc != "" {
-			line += " " + cFaint + m.desc + cReset
+			d := m.desc
+			if descRoom > 8 && visibleWidth(d) > descRoom {
+				d = ellipsize(stripANSI(d), descRoom)
+			}
+			line += " " + cFaint + d + cReset
 		}
 		e.out(line)
 		below++

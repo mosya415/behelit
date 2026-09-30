@@ -1123,7 +1123,7 @@ func (r *Repl) runProbes(p *setupPlan) {
 				mu.Lock()
 				p.probes[id] = res
 				mu.Unlock()
-				fmt.Printf("\r\033[K  %s %s %s\n", probeGlyph(res.status), id, faint("%s", truncate(res.detail, 60)))
+				fmt.Printf("\r\033[K  %s %s %s\n", probeGlyph(res.status), id, faint("%s", ellipsize(res.detail, max(60, houseWidth()-16))))
 			}(id)
 		}
 		wg.Wait()

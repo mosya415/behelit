@@ -232,7 +232,6 @@ func (r *Repl) showRoles() bool {
 		fmt.Println("  " + faint("no roles yet — /setup builds one, or /role new <name> model <model>"))
 		return false
 	}
-	section("roles")
 	var rows [][]string
 	for _, a := range roles {
 		mark := " "
@@ -249,7 +248,7 @@ func (r *Repl) showRoles() bool {
 		}
 		rows = append(rows, []string{mark, a.Name, strings.Join(a.Models, faint(" %s ", gFlow)), firstNonEmpty(a.Thinking, gNil), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, gNil))})
 	}
-	table([]string{"", "role", "models", "effort", "context", "tools", "check"}, rows)
+	sectionTable("roles", "", []string{"", "role", "models", "effort", "context", "tools", "check"}, rows, 1, 2, 6)
 	hint("%s", "/role <name> <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value> — e.g. model <m1,m2>"+gSep+"effort high"+gSep+"check \"go test ./...\""+gSep+"use")
 	hint("%s", "/role save writes the team to .lca/roles.yaml"+gSep+"/delegate <role> <task> hands one task over")
 	return false

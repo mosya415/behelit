@@ -190,12 +190,110 @@ func termWidth() int {
 	return 80
 }
 
-// houseWidth is the one width our own chrome is drawn to: the 76-column house, or
-// the terminal when it is narrower. The panels, the lintel and the prompt's band
-// and fences all ask for it — a 140-column terminal used to get a 140-column
-// hairline above a 76-column frame, which reads as one of them being broken.
-func houseWidth() int { return min(termWidth(), 76) }
+// pageMax is THE PAGE: the widest our own CHROME is ever drawn, whatever the
+// terminal. It is the ceiling on houseWidth() and so on every frame, lintel,
+// fence, band, status line and identifier cap.
+//
+// It is a ceiling on DECORATION and deliberately not on data. A table is data,
+// and data takes the window: tables are budgeted against the terminal instead
+// (fitWidth), because a value that fits the window must be printed whole. A
+// 400-column rule, by contrast, is noise whatever the window.
+//
+// It used to be justified partly on the -dry-run plan row "measuring about 160
+// columns once its check is handed over whole". Measured, a real plan row with a
+// two-command check is 165, so that derivation disagreed with the number it was
+// offered for — and the plan is no longer budgeted here at all. What the number
+// is actually tied to is the door: a door must never hard-split a source or diff
+// line it is asking you to approve, real source stops around 100–120 columns, and
+// 120 + 4 of frame + 1 of gutter is comfortably inside. It is also exactly double
+// the 80-column floor, so the program's two settled widths are an octave apart
+// rather than arbitrary neighbours.
+//
+// Above it the surplus is left empty ON PURPOSE. An eye travelling from a label
+// in column 2 to a value that ended in column 40, across 120 blank columns, is
+// the failure — not the fix. panelFloor is that same rule one level down: the
+// page is where a frame STOPS growing, and panelFloor is where it stops growing
+// for content that never asked for the room.
+const pageMax = 160
 
+// proseMax is the reading measure for SENTENCES: the ceiling on proseWidth().
+// Typography puts comfortable reading at 45–90 characters and this is the top of
+// that band. It is tied at both ends — it must be at least 77, because 77 is what
+// the answer already wraps to at a terminal of 80 and the floor may not narrow,
+// and at most 90, or it stops being a reading measure. Being a ceiling and not a
+// target, it only bites from a terminal of 92 up: the answer reads the way it
+// reads in a full-screen laptop window, at every window wider than that.
+const proseMax = 88
+
+// houseWidth is the one width our own chrome is drawn to: the panels, the lintel,
+// the prompt's band and fences, the status line, the table budget and the
+// picker's frame all ask for it. It was a fixed 76 whatever the terminal, which
+// is why a 200-column window held the whole program in its left third — and why a
+// 140-column terminal used to get a 140-column hairline above a 76-column frame,
+// which reads as one of them being broken.
+//
+// The four columns it gives up are load-bearing and not slack for its own sake.
+// One is the gutter every frame is already printed in. The other three mean
+// nothing is ever drawn closer than three columns to the right edge: the cursor
+// never rests in the DECAWM pending-wrap column, and a window narrowed between a
+// region being drawn and its next repaint has to shrink by MORE THAN THREE
+// columns before it can wrap a line the editor's walk-back counted. At a terminal
+// of 80 the arithmetic yields 76, which is what it has always been — the floor
+// did not move, the ceiling went away.
+func houseWidth() int { return min(max(termWidth()-4, 16), pageMax) }
+
+// proseWidth is the measure a SENTENCE is wrapped to. Structure takes the window;
+// prose stops where reading stops being comfortable, because a 200-column line of
+// text is harder to read than an 80-column one. Where the window is wide, the
+// extra room goes to something that earns it — a wider data column, a path
+// printed in full, a table that no longer truncates — and never to longer
+// sentences.
+//
+// The two columns are the answer's own gutter. The prose writer prefixes every
+// row with a three-column " ▌ ", so a measure of houseWidth()-2 lands the last
+// cell of a wrapped line in column houseWidth()+1 — where every frame, lintel and
+// fence on the same screen ends. Measured from termWidth() instead, the answer
+// stuck out three columns past all of them at a terminal of 80 and its last cell
+// rested in the DECAWM pending-wrap column that houseWidth() gives up four
+// columns to avoid. At 80 the measure is 74, still well inside the 45–90 band.
+func proseWidth() int { return min(houseWidth()-2, proseMax) }
+
+// panelRowRoom is the room a Row's value has past its label column. It was
+// written out twice — here and in the test that checks it — so it exists once.
+func panelRowRoom() int { return nominalContent() - 10 }
+
+// hasScreen is "is there a terminal whose width we are laying out against", and
+// it is NOT the same question as "may we decorate". Theme.Screen says why the two
+// are separate fields; every width decision in this file asks this one, and only
+// the decoration asks activeTheme.Frames. A pipe or a file answers no to both,
+// which is what keeps its cells whole and its rows unwrapped.
+func hasScreen() bool { return activeTheme.Screen }
+
+// fitWidth is the budget a TABLE is fitted to: 0 when there is no terminal to fit
+// to at all — the rows are somebody's payload and every cell is printed whole —
+// and otherwise the room the terminal actually has.
+//
+// It is deliberately NOT the page. The page is the ceiling on decoration, and
+// budgeting a table against it cut a 165-column plan row to 161 on a 200-column
+// screen with 39 columns standing empty beside it: the operator's own complaint
+// happening inside the fix for it. A table is data, and data takes the window.
+//
+// It cannot STRETCH anything. The fit pass prints natural widths whenever they
+// fit, so a wider budget can only ever mean fewer cells are cut — which is why
+// this being the one number past the page costs nothing anywhere else. Above the
+// clamp's 220 columns a table stops widening with the window like everything
+// else; no table this program draws is near that.
+func fitWidth() int {
+	if !hasScreen() {
+		return 0
+	}
+	return max(termWidth()-3, houseWidth()+1)
+}
+
+// clampWidth guards a garbage $COLUMNS. Nothing derives a CHROME number from
+// termWidth() directly: every strings.Repeat and every wrap measure goes through
+// houseWidth() (<= pageMax) or proseWidth() (<= proseMax). fitWidth() is the one
+// number allowed past the page, and 220 is where it stops.
 func clampWidth(n int) int {
 	switch {
 	case n < 20:
@@ -222,9 +320,38 @@ func eyebrow(s string) {
 	fmt.Printf(" %s%s %s%s\n", cFaint, gRule, strings.ToUpper(s), cReset)
 }
 
+// wrapValue is what a bare label/value line does with a value too long for the
+// page. It WRAPS onto continuation lines rather than ellipsizing: doctor's
+// `thinking` row is 224 columns and every byte of it is the answer, so a row that
+// ran off the screen at every terminal width becomes an aligned block that keeps
+// all of them.
+//
+// A single unbreakable token — a path, a model id, a URL — comes back whole and
+// is never cut: a cut path is worse than a soft-wrapped one, and no repainted
+// region draws through row() or kv(). And only where there are frames: piped or
+// redirected, the value stays on one unbroken line, because a line break inserted
+// into somebody's payload is as much of a change as a box drawn around it.
+func wrapValue(value string, room int) []string {
+	if !hasScreen() || room <= 20 || visibleWidth(value) <= room {
+		return []string{value}
+	}
+	segs := wrapTo(stripANSI(value), room)
+	if len(segs) <= 1 { // one unbreakable token: keep it whole, with its styling
+		return []string{value}
+	}
+	return segs
+}
+
 // kv prints a key/value row: faint uppercase label, verbatim value.
 func kv(label, value string) {
-	fmt.Printf("  %s%-8s%s %s\n", cFaint, strings.ToUpper(label), cReset, value)
+	// "  " + %-8s + " " is 11 columns, against a printed width of houseWidth()+1
+	for i, l := range wrapValue(value, min(houseWidth()-10, proseMax)) {
+		if i == 0 {
+			fmt.Printf("  %s%-8s%s %s\n", cFaint, strings.ToUpper(label), cReset, l)
+			continue
+		}
+		contValue(l)
+	}
 }
 
 // contValue prints a continuation line aligned under the value column.
@@ -311,20 +438,94 @@ func shortDir(p string) string {
 // section prints a titled hairline: " ── TITLE  detail ───────────". The title
 // is chrome (upper-cased); the optional detail is data (paths, ids) and is
 // shown verbatim.
-func section(title string, detail ...string) {
+//
+// A lintel is chrome FOR THE BLOCK BENEATH IT, so it is drawn to that block —
+// sectionTo, or sectionTable where the block is a table. Drawn to the page
+// instead, `doctor` on a 200-column screen was four 161-column rules standing
+// over lines of 12 to 52 columns: the rule pointing straight at the emptiness,
+// four times. A caller with nothing measured gets the panelFloor lintel, which is
+// wide enough to read as a lintel and narrow enough to make no claim about content
+// it cannot see.
+func section(title string, detail ...string) { sectionTo(0, title, detail...) }
+
+// sectionTable is the lintel and its table as one call — the one pairing where
+// the block's width IS known before anything is printed, and the pairing every
+// data screen in the program is made of: the plan, doctor's roles, the results
+// table, /agents, /skills, /members. The rule ends in the same column as the
+// widest row under it at every width.
+func sectionTable(title, detail string, header []string, rows [][]string, mid ...int) {
+	ls, w := tableBlock(header, rows, mid...)
+	sectionTo(w, title, detail)
+	for _, l := range ls {
+		fmt.Println(l)
+	}
+}
+
+// tableBlock is table() held back one step: the fitted lines and the printed width
+// they came out at, so a caller can draw its lintel to the table instead of the
+// table to its lintel. It exists because the measure has to be taken before the
+// first line is printed, and taking it twice is how two numbers drift apart.
+func tableBlock(header []string, rows [][]string, mid ...int) ([]string, int) {
+	ls := tableLines(header, rows, "  ", fitWidth(), mid...)
+	w := 0
+	for _, l := range ls {
+		w = max(w, visibleWidth(l))
+	}
+	return ls, w
+}
+
+// sectionTo is section drawn to the PRINTED width of the widest line that will
+// appear under it; 0 means the caller has not measured its block.
+//
+// The ceiling is fitWidth() and not the page, because the one block that
+// legitimately runs past the page is a table — data takes the window — and a
+// lintel one column short of its own table reads as a rendering fault rather than
+// as a decision. The floor is panelFloor, for the reason panelFloor gives.
+func sectionTo(under int, title string, detail ...string) {
 	t := strings.ToUpper(title)
 	d := ""
 	if len(detail) > 0 && detail[0] != "" {
 		d = strings.Join(detail, " ")
 	}
-	plain := t
-	if d != "" {
-		plain += "  " + d
+	// The lintel is drawn to its own block: its printed width is h+1, which is the
+	// printed width of the widest line beneath it. With nothing measured it is the
+	// floor, and at a terminal of 80 the floor is houseWidth() — so the 80-column
+	// lintel is the one it has always been, and it is still exactly where a frame
+	// ends rather than one course short of it.
+	//
+	// With no terminal it is the CONSTANT one an 80-column screen draws. Everything
+	// else in a pipe already refuses to depend on the window — no frame, no fit, no
+	// wrap, and the answer's own rules are pinned — and a rule whose length came
+	// from $COLUMNS meant `lca run -dry-run | tee log` wrote different bytes on two
+	// machines for the same plan.
+	h := panelFloor
+	if hasScreen() {
+		h = min(max(under-1, min(panelFloor, houseWidth())), max(fitWidth(), houseWidth()+1)-1)
 	}
-	// a fixed total width (or the terminal's, if narrower) so rules line up
-	w := min(termWidth(), 76) - visibleWidth(plain) - 5
-	if w < 3 {
-		w = 3
+	plain := func() string {
+		if d == "" {
+			return t
+		}
+		return t + "  " + d
+	}
+	// The fill used to floor at 3 courses and let the line run off the screen: the
+	// -dry-run PLAN header, whose detail is a workflow name and a path, measured
+	// 164 columns on an 80-column terminal. The DETAIL is what gives way, and it is
+	// middle-ellipsized because a path and a run id both end in something that
+	// matters — until two courses of stone fit beside it. One fix in both
+	// directions: that header stops overflowing at 80 and prints whole inside a
+	// 132-column lintel at 140.
+	w := h + 1 - visibleWidth(plain()) - 5
+	if w < 2 && d != "" {
+		if room := visibleWidth(d) - (2 - w); room >= 4+visibleWidth(gEllipsis) {
+			d = ellipsizeMiddle(stripANSI(d), room)
+		} else {
+			d = ""
+		}
+		w = h + 1 - visibleWidth(plain()) - 5
+	}
+	if w < 2 {
+		w = 2
 	}
 	// The lintel: ONE weight of stone the whole way across, the title lit. It was
 	// two courses of ═ butted against a run of ─, which reads as a rule that
@@ -342,73 +543,313 @@ func section(title string, detail ...string) {
 
 // row prints a label/value line with the label column aligned.
 func row(label, value string) {
-	fmt.Printf("  %s%-9s%s %s\n", cFaint, label, cReset, value)
+	// "  " + %-9s + " " is 12 columns, against a printed width of houseWidth()+1
+	for i, l := range wrapValue(value, min(houseWidth()-11, proseMax)) {
+		if i == 0 {
+			fmt.Printf("  %s%-9s%s %s\n", cFaint, label, cReset, l)
+			continue
+		}
+		contRow(l)
+	}
+}
+
+// contRow is row()'s continuation line, aligned under its nine-column label.
+func contRow(value string) {
+	fmt.Printf("  %-9s %s\n", "", value)
 }
 
 // hint prints a faint follow-up line: what to do next.
 //
-// It is deliberately NOT wrapped. A hint is one sentence and a good third of them
-// name a command meant to be pasted; wrapping one puts a line break inside the
-// sentence, and the tests that check a hint says what it should say — that Enter
-// takes the proposal, that this run resumes with this command — look for the
-// sentence whole. The terminal's own soft wrap keeps the bytes contiguous, which
-// is the property that matters. The picker's legend is the exception and wraps
-// itself, because there the line COUNT has to stay known for the walk-back.
+// It DOES wrap now, to the same reading measure a tool error's hints already wrap
+// to, because the program was holding two incompatible positions on the one
+// surface. doctor's longest hint is 169 columns: at 80 it broke to column 1
+// instead of indenting under the ↳, and at 200 and 400 it was the widest line on
+// the whole screen — a 169-column sentence on a screen whose answer is held to 88,
+// which is the "stretched thin" case the rest of this file exists to prevent.
+//
+// The old reason for leaving it alone is kept as the exception rather than the
+// rule: a good third of these name a command meant to be pasted. wrapTo never
+// breaks inside a word, so a hint that comes back as ONE segment still wider than
+// the measure is a single unbreakable token — a command, a path, a URL — and is
+// printed whole. The sentences wrap; the pastes do not.
 func hint(format string, a ...any) {
-	fmt.Println("  " + cFaint + gHint + " " + fmt.Sprintf(format, a...) + cReset)
+	s := fmt.Sprintf(format, a...)
+	// "  " + ↳ + " " is four columns, against a printed width of h+1
+	for i, l := range wrapHint(s, min(houseWidth()-3, proseMax)) {
+		if i == 0 {
+			fmt.Println("  " + cFaint + gHint + " " + l + cReset)
+			continue
+		}
+		fmt.Println("    " + cFaint + l + cReset)
+	}
+}
+
+// wrapHint is the shared wrap for the program's one-sentence follow-up lines: the
+// hints under a screen and the hints under a tool error. It re-measures the
+// sentence plain and so loses its styling, which is the cheaper loss, and only an
+// over-long line pays it.
+func wrapHint(s string, room int) []string {
+	if !hasScreen() || room <= 24 || visibleWidth(s) <= room {
+		return []string{s}
+	}
+	segs := wrapTo(stripANSI(s), room)
+	// wrapTo breaks on spaces and never inside a word, so a segment still wider than
+	// the room it was measured against is a single unbreakable token: a command, a
+	// path, a URL.
+	//
+	// Where that token is the LAST thing on the line, the line is a verb handing you
+	// a value — `wrote /a/very/long/path` — and wrapping it buys nothing: the token
+	// ends up alone on a row that is still too long, and the word that said what it
+	// is has been split away from it. So that whole line goes through unwrapped and
+	// the terminal's own soft wrap keeps its bytes contiguous, which is the property
+	// that matters for something you are about to copy. A long token in the MIDDLE
+	// of a sentence is just a long word: the sentence wraps around it and the word
+	// overflows its own row, whole.
+	if len(segs) <= 1 || visibleWidth(segs[len(segs)-1]) > room {
+		return []string{s}
+	}
+	return segs
 }
 
 // okLine / warnLine / errLine are standalone status lines with the shared glyphs.
+// They are the same class of one-sentence line as hint() and they wrap the same
+// way, for the same reason: `doctor` at 80 emitted twenty-one over-width lines and
+// almost all of them were these, breaking to column 1 rather than indenting under
+// their own glyph. A single unbreakable token — a path, a URL, a command — still
+// goes through whole.
 func okLine(format string, a ...any) {
-	fmt.Println("  " + cGreen + gUp + cReset + " " + fmt.Sprintf(format, a...))
+	glyphLine(cGreen+gUp+cReset, fmt.Sprintf(format, a...))
 }
 func warnLine(format string, a ...any) {
-	fmt.Println("  " + cYellow + gPartial + cReset + " " + fmt.Sprintf(format, a...))
+	glyphLine(cYellow+gPartial+cReset, fmt.Sprintf(format, a...))
 }
 func errLine(format string, a ...any) {
-	fmt.Println("  " + cRed + gDown + cReset + " " + fmt.Sprintf(format, a...))
+	glyphLine(cRed+gDown+cReset, fmt.Sprintf(format, a...))
 }
 
-// table prints rows as aligned columns (ANSI-aware widths). The header row, if
-// any, is faint; the last column may be truncated to fit the terminal.
-func table(header []string, rows [][]string) {
-	for _, l := range tableLines(header, rows, "  ", termWidth()) {
+// glyphLine prints one sentence behind a status glyph, wrapped to the reading
+// measure with its continuations aligned under the sentence rather than under the
+// glyph.
+func glyphLine(glyph, s string) {
+	lead := 2 + visibleWidth(stripANSI(glyph)) + 1
+	for i, l := range wrapHint(s, min(houseWidth()+1-lead, proseMax)) {
+		if i == 0 {
+			fmt.Println("  " + glyph + " " + l)
+			continue
+		}
+		fmt.Println(strings.Repeat(" ", lead) + l)
+	}
+}
+
+// colFloor is the narrowest a table column may be shaved to, as
+// min(natural, max(header width, colFloor)): four head characters, the measured
+// ellipsis marker, four tail characters and a little slack — the least that still
+// identifies a path or a check. Below that a cell says nothing, and dropping the
+// column would be more honest than pretending. Expressed as a min() against the
+// natural width it also means a column that is naturally short — a count, a tick,
+// a status word, a duration — cannot be shaved at all, so the allocator needs no
+// table of column classes.
+const colFloor = 12
+
+// tableGap is the columns between two columns. It is a const rather than a local
+// because tableBounds' arithmetic and buildRow's padding have to agree about it.
+const tableGap = 2
+
+// cellBytes caps each cell before it is measured. It is a memory guard and NOT a
+// layout number, and it stands in the one place where every cell passes now that
+// the display truncates on the plan's check and the summary's detail are gone:
+// firstLine() bounds a cell to one line and no longer to its length, so a step
+// whose detail is one 40k line arrives here whole.
+const cellBytes = 4096
+
+// capCell applies cellBytes, and applies it the two ways a plain byte slice did
+// not. It cuts on a RUNE boundary, because a cut inside a UTF-8 sequence makes the
+// whole emitted row invalid output rather than a short one; and it hands back the
+// reset of a styled cell, because a cut that lands before a cell's own cReset
+// leaks the faint attribute into every line printed after the table until
+// something else happens to reset it. It is only ever called where there is a
+// width to fit to — with no terminal the promise is that every cell goes through
+// unchanged, and a memory guard is not a reason to break it.
+func capCell(c string) string {
+	if len(c) <= cellBytes {
+		return c
+	}
+	c = c[:cellBytes]
+	for len(c) > 0 {
+		if r, n := utf8.DecodeLastRuneInString(c); r != utf8.RuneError || n > 1 {
+			break
+		}
+		c = c[:len(c)-1]
+	}
+	if strings.ContainsRune(c, 0x1b) {
+		c += cReset
+	}
+	return c
+}
+
+// tableGrid copies the cells on the way in — they are the caller's slices, and a
+// fit pass that edited them in place would change what the caller stores — and
+// applies the memory guard where there is a width to apply it for.
+func tableGrid(header []string, rows [][]string, cols, width int) [][]string {
+	all := rows
+	if header != nil {
+		all = append([][]string{header}, rows...)
+	}
+	grid := make([][]string, len(all))
+	for i, r := range all {
+		grid[i] = make([]string, len(r))
+		for j, c := range r {
+			if width > 0 {
+				c = capCell(c)
+			}
+			grid[i][j] = c
+		}
+	}
+	return grid
+}
+
+// tableBounds is the table's own arithmetic: the natural width of each column, the
+// floor each may be shaved to, and what a set of widths adds up to as a printed
+// row. It is one function rather than three because the fit pass and the width
+// suite both need these numbers, and a suite carrying its own copy of the rule
+// asserts that the copy is self-consistent rather than that the allocator is
+// right — which is how a fit pass that shaved past what shaving could buy stayed
+// green.
+func tableBounds(header []string, grid [][]string, cols int, lead string) (natural, floor []int, total func([]int) int) {
+	natural = make([]int, cols)
+	for _, r := range grid {
+		for j, c := range r {
+			natural[j] = max(natural[j], visibleWidth(c))
+		}
+	}
+	floor = make([]int, cols)
+	for j := range floor {
+		h := 0
+		if j < len(header) {
+			h = visibleWidth(header[j])
+		}
+		floor[j] = min(natural[j], max(h, colFloor))
+	}
+	total = func(w []int) int {
+		n := visibleWidth(lead) + tableGap*(cols-1)
+		for _, x := range w {
+			n += x
+		}
+		return n
+	}
+	return natural, floor, total
+}
+
+// tableSpan is the widest and the narrowest a table of these cells can be drawn:
+// its natural printed width, and the width every flexible column at its floor adds
+// up to. Between them the fit pass can land exactly on a budget; outside them it
+// cannot, and does not try.
+func tableSpan(header []string, rows [][]string, lead string) (natural, floor int) {
+	cols := len(header)
+	for _, r := range rows {
+		cols = max(cols, len(r))
+	}
+	if cols == 0 {
+		return 0, 0
+	}
+	nat, flr, total := tableBounds(header, tableGrid(header, rows, cols, 1), cols, lead)
+	return total(nat), total(flr)
+}
+
+// table prints rows as aligned columns (ANSI-aware widths), fitted to the width
+// the chrome is drawn to. mid names the columns that cut in the MIDDLE — paths,
+// model ids, commands, step names, where both ends carry meaning.
+func table(header []string, rows [][]string, mid ...int) {
+	// A bare table's two-column lead is INSIDE its room while a frame's gutter is
+	// outside its width, so at the page the two end in the same column — but a table
+	// is data and takes the whole window, so the budget is fitWidth() and not the
+	// page. fitWidth() answers 0 where there is no terminal to fit to at all: the
+	// rows are somebody's payload in a pipe or a file, and every cell goes through
+	// whole.
+	for _, l := range tableLines(header, rows, "  ", fitWidth(), mid...) {
 		fmt.Println(l)
 	}
 }
 
 // tableLines is table() as a value, so a panel can put the same aligned columns
 // inside a frame instead of at the left margin. lead is the indent every row
-// carries; width is the room the last column may grow into.
-func tableLines(header []string, rows [][]string, lead string, width int) []string {
+// carries; width is the whole room the columns have to fit in, and 0 means there
+// is no terminal to fit to and every cell is printed whole.
+//
+// The fit is a real allocation and not a cut of the last column: natural widths
+// first, and if they fit, every cell is printed UNCHANGED — which is what keeps
+// every table that fits today byte-identical, and what a wide terminal buys. If
+// they do not fit, the widest column that can still afford it gives up one column
+// at a time until they do, and only then is a cell ellipsized.
+//
+// And if the floors cannot reach the budget at all, NOTHING is shaved: the row
+// overflows at its natural widths, which is what it did before this allocator
+// existed. A shave that cannot land does not save a physical row, so its only
+// effect is to spend the two cells that identify the row. See the gate below.
+func tableLines(header []string, rows [][]string, lead string, width int, mid ...int) []string {
 	cols := len(header)
 	for _, r := range rows {
 		cols = max(cols, len(r))
 	}
-	widths := make([]int, cols)
-	all := rows
-	if header != nil {
-		all = append([][]string{header}, rows...)
+	if cols == 0 {
+		return nil
 	}
-	for _, r := range all {
-		for i, c := range r {
-			widths[i] = max(widths[i], visibleWidth(c))
+	grid := tableGrid(header, rows, cols, width)
+	natural, floor, total := tableBounds(header, grid, cols, lead)
+	fit := make([]int, cols)
+	copy(fit, natural)
+	if width > 0 && total(fit) > width {
+		// Shave only when shaving can LAND. When even the floors cannot reach the
+		// budget the row overflows either way, and a row that overflows with its step
+		// name and its command intact is strictly better than one that overflows
+		// having spent them: the terminal's own soft wrap keeps the bytes contiguous
+		// and the operator can still read what the step is.
+		//
+		// This was pure loss at the 80-column floor, which is the width that was not
+		// allowed to regress. A nine-column plan row shaved `harden-the-workflow-parser`
+		// to `harde…parser` and a two-command check to twelve columns of noise, and the
+		// row was still 84 columns against a budget of 77 — so it soft-wrapped to two
+		// physical rows exactly as the unshaved 130-column row did. The shave bought
+		// zero rows and cost the whole payload.
+		if total(floor) <= width {
+			for total(fit) > width {
+				widest, at := 0, -1
+				for j := range fit {
+					if fit[j] > floor[j] && fit[j] > widest {
+						widest, at = fit[j], j
+					}
+				}
+				if at < 0 { // every flexible column is already at its floor
+					break
+				}
+				fit[at]--
+			}
+		}
+	}
+	middle := make([]bool, cols)
+	for _, j := range mid {
+		if j >= 0 && j < cols {
+			middle[j] = true
 		}
 	}
 	buildRow := func(r []string, faintRow bool) string {
 		var b strings.Builder
 		b.WriteString(lead)
-		used := visibleWidth(lead)
 		for i, c := range r {
-			if i == len(r)-1 {
-				if room := width - used - 1; room > 8 && visibleWidth(c) > room {
-					c = ellipsize(stripANSI(c), room)
+			if visibleWidth(c) > fit[i] {
+				// both markers are measured with visibleWidth, so the ASCII tier's
+				// three-column "..." does not shear the row it lands in
+				if middle[i] {
+					c = ellipsizeMiddle(stripANSI(c), fit[i])
+				} else {
+					c = ellipsize(stripANSI(c), fit[i])
 				}
+			}
+			if i == len(r)-1 { // the last column is never padded: it ends the line
 				b.WriteString(c)
 				break
 			}
-			b.WriteString(padTo(c, widths[i], 0) + "  ")
-			used += widths[i] + 2
+			b.WriteString(padTo(c, fit[i], 0) + strings.Repeat(" ", tableGap))
 		}
 		if faintRow {
 			return cFaint + stripANSI(b.String()) + cReset
@@ -417,9 +858,10 @@ func tableLines(header []string, rows [][]string, lead string, width int) []stri
 	}
 	var out []string
 	if header != nil {
-		out = append(out, buildRow(header, true))
+		out = append(out, buildRow(grid[0], true))
+		grid = grid[1:]
 	}
-	for _, r := range rows {
+	for _, r := range grid {
 		out = append(out, buildRow(r, false))
 	}
 	return out
@@ -445,6 +887,13 @@ func tableLines(header []string, rows [][]string, lead string, width int) []stri
 // them two columns apart, which reads as one of them being clipped — so the
 // screens that stack them all say gaugeCells and not a number of their own.
 const gaugeCells = 16
+
+// gaugeCellsInline is a bar that SHARES a line with other fields — the status
+// line's. It is shorter than gaugeCells and it is still a constant, for the same
+// reason: a bar whose length changed with the window would make two readings in
+// one session incomparable, and a picture of a fraction is not a place to spend
+// spare columns.
+const gaugeCellsInline = 10
 
 // gaugeWidth is the columns a gauge of n cells occupies, brackets included. The
 // ASCII tier brackets its bar, so a caller laying out a row cannot assume n.
@@ -568,6 +1017,10 @@ type panel struct {
 	// content (see width()); this is the one thing allowed to move it, because the
 	// alternative is a ║ between the halves of a path.
 	need int
+
+	// fixed is a width a caller pinned with at(), so a whole repaint is measured
+	// against one snapshot of the terminal rather than one reading per line.
+	fixed int
 }
 
 func newPanel(title string, detail ...string) *panel {
@@ -608,7 +1061,10 @@ func (p *panel) Line(format string, a ...any) {
 // sentence broken at column 72 and continued at column 1 is unreadable. Wrapping
 // re-measures it plain and so loses its styling, which is the cheaper loss.
 func (p *panel) Row(label, value string) {
-	room := nominalContent() - 10
+	// A row's value is a sentence, so it takes the frame's room up to the reading
+	// measure and no further: past that the eye has to travel back across the whole
+	// page to find the next line.
+	room := min(panelRowRoom(), proseMax)
 	if room > 20 && visibleWidth(value) > room {
 		segs := wrapTo(stripANSI(value), room)
 		// wrapTo breaks on spaces and never inside a word, so ONE segment still
@@ -651,44 +1107,112 @@ func (p *panel) Div(title string) {
 // Table puts aligned columns inside the frame. The width it is given is the
 // frame's, not the terminal's, so the last column is cut to the frame and never
 // pushed through it.
-func (p *panel) Table(header []string, rows [][]string, width int) {
-	for _, l := range tableLines(header, rows, "", width) {
+func (p *panel) Table(header []string, rows [][]string, width int, mid ...int) {
+	// With no TERMINAL there is no width to fit to, so the rows go through whole —
+	// which is what bareLines() promises for every other line in the panel and
+	// could not keep for its table until the fit pass could be switched off. It is
+	// hasScreen() and not Frames: a sober 80-column terminal has a width even
+	// though it has no box, and its table has to be fitted to it or the rows lose
+	// their columns to the terminal's own soft wrap.
+	if !hasScreen() {
+		width = 0
+	}
+	for _, l := range tableLines(header, rows, "", width, mid...) {
 		p.lines = append(p.lines, panelLine{text: l})
 	}
 }
 
-// nominalContent is the content width a panel lays out for: the house 76-column
-// frame, or the terminal when it is narrower. Rows wrap against THIS and not
-// against the panel's final width, because the final width depends on the rows —
-// and a layout that depends on its own output cannot be reasoned about.
-func nominalContent() int {
-	w := min(termWidth()-2, 76)
-	if w < 16 {
-		w = 16
-	}
-	return w - 4
-}
+// nominalContent is the content width a panel lays out for: the page's content,
+// or the terminal when it is narrower. Rows wrap against THIS and not against the
+// panel's final width, because the final width depends on the rows — and a layout
+// that depends on its own output cannot be reasoned about. The dependency runs one
+// way: the rows are measured against the nominal width, and then the frame is
+// drawn to the rows.
+func nominalContent() int { return houseWidth() - 4 }
 
-// width is the frame width, and it deliberately does NOT depend on the content. A
-// panel that grew to fit its widest row left two panels on the same screen at two
-// different widths, which reads as one of them being broken — and a title course
-// that grew had nothing stopping it at the terminal's edge. So the frame is the
-// 76-column house width (or the terminal, when narrower), the title course is cut
-// to fit it, and over-long content is split by panelSplit or wrapped by Row.
-func (p *panel) width() int {
-	w := min(termWidth()-2, 76)
+// panelFloor is the narrowest a frame is drawn when its own content did not ask
+// for more. It is the 76-column house this look was designed in, so at a terminal
+// of 80 — where houseWidth() is exactly 76 — the floor did not move and could not
+// have.
+//
+// Above 80 it is what stops the fix from becoming the complaint. A panel holding
+// six short label/value rows and grown to the page is a 161-column box whose
+// longest row ends in column 62: 99 blank columns, padded and then closed with a
+// ║, so the box measures the emptiness and the rule points straight at it. Text
+// squeezed left inside a 161-column frame reads WORSE than the same text squeezed
+// left inside a 76-column one. A frame full of window is only honest if its rows
+// fill it — so the frame follows the rows, and where the rows do have something to
+// say (a table, a path that cannot be broken) it still takes the whole page.
+const panelFloor = 76
+
+// ceiling is the widest this frame may be drawn. It is what a caller asks for
+// BEFORE it has any content — a table needs a budget, and a budget that came from
+// the table would be a layout that depends on its own output.
+func (p *panel) ceiling() int {
+	// ...unless a caller pinned one. A repainted region has to measure its frame,
+	// its rows and its notes against ONE snapshot of the terminal, or a window
+	// resized between two of those measurements shears the region it counted.
+	if p.fixed > 0 {
+		return p.fixed
+	}
+	w := houseWidth()
 	// ...with the one exception Row() records: a value that cannot be broken gets
 	// the room it needs if the TERMINAL has it. A 140-column terminal holding a
 	// 76-column frame that shears a path has 64 columns going spare, and a frame
-	// that gives way is better than an identifier that does.
+	// that gives way is better than an identifier that does. It is bounded by the
+	// terminal as it always was, and by the page too: past pageMax a frame that kept
+	// growing would be the complaint restated at the other end.
 	if p.need+4 > w {
-		w = max(w, min(termWidth()-2, p.need+4))
+		w = max(w, min(min(termWidth()-2, pageMax), p.need+4))
 	}
-	if w < 12 {
-		w = 12
-	}
-	return w
+	return max(w, 12)
 }
+
+// room is the content width a caller lays a table out against: the ceiling's
+// interior. The table comes back at its own natural widths whenever they fit, and
+// width() then draws the frame to what the table actually measured — so a wide
+// window buys a wider table and not a wider border.
+func (p *panel) room() int { return max(p.ceiling()-4, 1) }
+
+// contentWidth is the frame width this panel's content actually asks for: its
+// widest row plus the two borders and their gutters, its widest division course,
+// and its own title course — which is content too, because a frame narrower than
+// its lintel would have fitTop cut the title of the box to fit the box.
+func (p *panel) contentWidth() int {
+	need := p.need + 4
+	for _, l := range p.lines {
+		if l.div {
+			need = max(need, visibleWidth(gPanelML+gPanelH+" "+l.text+" "+gPanelMR))
+			continue
+		}
+		need = max(need, visibleWidth(expandTabs(l.text))+4)
+	}
+	return max(need, visibleWidth(topPlain(p.title, p.detail, p.right, 1)))
+}
+
+// width is the frame width: what the content asks for, floored at panelFloor so a
+// two-line panel is still a box, and ceilinged at the page.
+//
+// It used to be the page unconditionally, on the argument that a frame that grew
+// to its content left two panels on one screen at two widths. That argument is
+// answered instead by at(), which pins one width for a whole repaint — and paying
+// for it with a box drawn around 121 blank columns was the wrong trade, because
+// the emptiness is on every wide screen while two panels printed together are on
+// one of them.
+func (p *panel) width() int {
+	if p.fixed > 0 {
+		return p.fixed
+	}
+	top := p.ceiling()
+	return max(min(top, max(p.contentWidth(), min(panelFloor, top))), 12)
+}
+
+// at pins the frame width for a whole repaint. The picker is the one caller: it
+// takes a single houseWidth() reading and measures its frame, its rows, its notes
+// and its legend against that number, so the line count the "\033[<n>A" walk-back
+// uses and the widths that produced it cannot come from two different terminals —
+// which is the shear. It also lets a test pin a width without an environment.
+func (p *panel) at(w int) *panel { p.fixed = w; return p }
 
 // fitTop cuts the title course to the frame. Things are given up in the order they
 // matter least: the detail first, then the right-hand tag, and the title only if
@@ -870,10 +1394,57 @@ func (p *panel) bareLines() []string {
 	return out
 }
 
-// ellipsize cuts s to n visible runes, ending with "…".
-func ellipsize(s string, n int) string {
+// takeCols is the longest PREFIX of s that fits n columns; lastCols is the
+// longest suffix. A wide rune that would straddle the budget is left out rather
+// than half-drawn, so the result may be one column narrower than asked — which is
+// what padTo is for. Both want s plain: they are the cut half of a measure taken
+// with visibleWidth, and every caller strips first.
+func takeCols(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	col := 0
+	for i, r := range s {
+		w := runeWidth(r)
+		if col+w > n {
+			return s[:i]
+		}
+		col += w
+	}
+	return s
+}
+
+func lastCols(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	r := []rune(s)
-	if len(r) <= n || n < 2 {
+	col := 0
+	for i := len(r) - 1; i >= 0; i-- {
+		w := runeWidth(r[i])
+		if col+w > n {
+			return string(r[i+1:])
+		}
+		col += w
+	}
+	return s
+}
+
+// ellipsize cuts s to n visible COLUMNS, ending with the tier's own marker.
+//
+// COLUMNS and not runes, which is what it counted. Everything that asks for a cut
+// measured the cell with visibleWidth first — the table allocator, statusLine, the
+// completion menu, a panel's title course — and a helper that answered in runes
+// handed back up to twice the columns it was asked for. In a table that does not
+// merely overflow, it SHEARS: every column but the last is padded to the width it
+// was promised, padTo sees a cell already past that width and pads nothing, and
+// the rest of the row slides right on that one line only. A CJK path in a
+// /members row put `sandbox` in column 54 on the header row and column 77 on the
+// row below it, so the reader could no longer tell which column a value was in.
+// In statusLine it defeated the no-wrap invariant the editor's walk-back counts
+// on, which erased the input line on every keystroke.
+func ellipsize(s string, n int) string {
+	if visibleWidth(s) <= n || n < 2 {
 		return s
 	}
 	// the marker is measured, not assumed to be one column: the ASCII tier
@@ -881,31 +1452,44 @@ func ellipsize(s string, n int) string {
 	// lands in.
 	m := visibleWidth(gEllipsis)
 	if n <= m {
-		return string(r[:n])
+		return takeCols(s, n)
 	}
-	return string(r[:n-m]) + gEllipsis
+	return takeCols(s, n-m) + gEllipsis
 }
 
-// ellipsizeMiddle keeps both ends of long identifiers (paths, model ids).
+// ellipsizeMiddle keeps both ends of long identifiers (paths, model ids), in
+// columns for the same reason as ellipsize.
 func ellipsizeMiddle(s string, n int) string {
-	r := []rune(s)
 	m := visibleWidth(gEllipsis)
-	if len(r) <= n || n < 4+m {
+	if visibleWidth(s) <= n || n < 4+m {
 		return s
 	}
 	head := (n - m) / 2
-	return string(r[:head]) + gEllipsis + string(r[len(r)-(n-m-head):])
+	return takeCols(s, head) + gEllipsis + lastCols(s, n-m-head)
 }
 
 // prettyPath shows a path relative to root when inside it, else ~-shortened,
 // middle-ellipsized to a sane width.
+//
+// "Sane" is now the page's and not a constant: max(60, …) so the 60 columns it
+// has always had at a terminal of 80 cannot narrow, and houseWidth()-16 so a
+// window with the room prints the path whole — 120 columns at 140, 144 at 200.
+// Every identifier cap in the program is written this way, which is what makes it
+// checkable that none of them moved at 80.
+//
+// With no terminal it is the 60-column floor and not the window's, for the reason
+// sectionTo gives: a piped path may not come out at two lengths on two machines.
 func prettyPath(p, root string) string {
+	n := 60
+	if hasScreen() {
+		n = max(60, houseWidth()-16)
+	}
 	if root != "" {
 		if rel, err := filepath.Rel(root, p); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
-			return ellipsizeMiddle(rel, 60)
+			return ellipsizeMiddle(rel, n)
 		}
 	}
-	return ellipsizeMiddle(shortDir(p), 60)
+	return ellipsizeMiddle(shortDir(p), n)
 }
 
 // hostOf renders a base URL as host:port — the part a person recognizes.

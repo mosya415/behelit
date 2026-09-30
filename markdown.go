@@ -28,6 +28,11 @@ var (
 	reInlineMath  = regexp.MustCompile(`\$([^$]+?)\$`)
 )
 
+// mdRuleMax is the `---` rule's length where there is no terminal to measure: the
+// length it has always had in a redirected answer, kept as a constant so those
+// bytes stay the same bytes whatever window the run happened in.
+const mdRuleMax = 24
+
 // renderMarkdownLine formats a single line (already right-trimmed). Leading
 // indentation is preserved so nested lists keep their shape.
 func renderMarkdownLine(line string) string {
@@ -36,7 +41,20 @@ func renderMarkdownLine(line string) string {
 
 	switch {
 	case reHr.MatchString(body):
-		return lead + cFaint + strings.Repeat(gRule, 24) + cReset
+		// A `---` between two paragraphs belongs to the paragraphs: on a screen it is
+		// drawn to the measure they are wrapped to, and not to a number from nowhere.
+		//
+		// ONLY on a screen. This runs before the prose writer decides anything, so
+		// with no gate `lca -p "…" > notes.md` wrote 77 dashes at COLUMNS=80 and 88 at
+		// COLUMNS=140 — two runs of the same prompt into the same file producing
+		// different bytes because of the window the operator happened to have open.
+		// A redirected answer is the payload, and its bytes may not depend on the
+		// terminal any more than they may carry an escape.
+		w := mdRuleMax
+		if hasScreen() {
+			w = proseWidth()
+		}
+		return lead + cFaint + strings.Repeat(gRule, w) + cReset
 	case reHeading.MatchString(body):
 		m := reHeading.FindStringSubmatch(body)
 		return lead + cBold + renderInline(m[2]) + cReset
@@ -200,6 +218,14 @@ func renderMarkdownTable(rows []string) []string {
 	}
 	total += 2 * (ncols - 1)
 	out = append(out, strings.Join(hc, "  "))
+	// The hairline underlines the header, so it is the width of the table AS
+	// RENDERED and nothing else. Bounded by the page instead, it was 76 columns
+	// under a 126-column header row on an 80-column terminal: a rule that stops
+	// short of the thing it underlines reads as a rendering fault, and its length
+	// changed with $COLUMNS in a redirected answer. The table's cells are the
+	// model's data and are neither reflowed nor cut, so when the table overflows the
+	// terminal its own rule overflows with it — consistently, which is the readable
+	// failure.
 	out = append(out, cFaint+strings.Repeat(gRule, total)+cReset)
 	for _, d := range rData {
 		for j := 0; j < ncols; j++ {

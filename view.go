@@ -180,21 +180,24 @@ func (v *termView) Warn(text string) {
 func (v *termView) Error(text string) {
 	first, rest, _ := strings.Cut(text, "\n")
 	out := markerRowLead() + " " + cRed + gDown + " " + first + cReset
-	// The hint lines DO wrap, unlike hint() itself: these are hints.go's sentences
-	// about what to do next, and the longest of them is 109 columns, so the one
-	// screen that only ever appears when something has already gone wrong was also
-	// the one that spilled. They are sentences and not commands to paste, so a line
-	// break inside one costs nothing; the ↳ stays on the first row and the rest is
-	// indented under it.
-	room := termWidth() - 5
+	// The hint lines wrap through wrapHint, which is now the one wrap hint() itself
+	// uses too — the program was holding two positions on the same surface, and
+	// this was the right one. These are hints.go's sentences about what to do next
+	// and the longest of them is 109 columns, so the one screen that only ever
+	// appears when something has already gone wrong was also the one that spilled.
+	// The ↳ stays on the first row and the rest is indented under it; a hint that is
+	// a single unbreakable command comes back whole so a paste still works.
+	//
+	// They are sentences, so they take the window up to the reading measure and
+	// stop: a 200-column window would otherwise print the longest as one 195-column
+	// line. The three-column lead plus the ↳ is four columns, so the measure is
+	// houseWidth()-4 and the wrapped rows end where the frames do.
+	room := min(houseWidth()-4, proseMax)
 	for _, h := range strings.Split(rest, "\n") {
 		if h == "" {
 			continue
 		}
-		ls := []string{h}
-		if room > 24 && visibleWidth(h) > room {
-			ls = wrapTo(h, room)
-		}
+		ls := wrapHint(h, room)
 		for i, l := range ls {
 			mark := gHint + " "
 			if i > 0 {
@@ -284,7 +287,8 @@ func (v *childView) line(glyph, text string) { v.markLine(" ", glyph, text) }
 // stays a spine and is never boxed — a parallel subagent's first line would cut
 // a box in half and it would never close.
 func (v *childView) markLine(mark, glyph, text string) {
-	w := termWidth() - 10
+	// the spine's own room inside the page: 70 at a terminal of 80, as it always was
+	w := max(70, houseWidth()-6)
 	if w > 20 && visibleWidth(text) > w {
 		text = ellipsize(stripANSI(text), w)
 	}

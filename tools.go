@@ -270,6 +270,7 @@ func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Du
 
 	cmd.Dir = j.Root
 	cmd.Stdin = nil // null device → reads get EOF, no interactive hang
+
 	inProcessGroup(cmd)
 
 	var buf bytes.Buffer
@@ -278,8 +279,7 @@ func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Du
 		// The command is a trap you set yourself: ^ in the gutter, the verb in
 		// stone, and then the command's own bytes verbatim — never re-cased, never
 		// re-coloured, because that line is what you would paste into a shell.
-		fmt.Fprintln(live, " "+cYellow+gCmd+cReset+" "+cDim+padTo("run", 8, 0)+cReset+
-			" $ "+cmdline+"   "+faint("(Ctrl-C to interrupt)"))
+		fmt.Fprintln(live, runHeadline(cmdline))
 		pw = &prefixWriter{w: live, prefix: "   " + cFaint + gVBar + " " + cReset}
 		mw := io.MultiWriter(&buf, pw)
 		cmd.Stdout = mw
@@ -473,4 +473,23 @@ func tokenize(s string) ([]string, error) {
 		argv = append(argv, cur.String())
 	}
 	return argv, nil
+}
+
+// runHeadline is the live line a command announces itself with: ^ in the gutter,
+// the verb in stone, then the command's own bytes verbatim — never re-cased, never
+// re-coloured, because that line is what you would paste into a shell.
+//
+// The "(Ctrl-C to interrupt)" tail goes on ONLY if the whole line still fits the
+// page. This was the one place chrome was placed AFTER the payload, so the payload
+// could never be the thing that fit: with an 84-character command the line was 117
+// columns and the widest thing in the turn at both 80 and 100, and the terminal
+// broke it mid-command. The command may not be cut, so the droppable part is what
+// gives way — the same order section() gives up its detail in. On a wide window
+// the hint is still there.
+func runHeadline(cmdline string) string {
+	head := " " + cYellow + gCmd + cReset + " " + cDim + padTo("run", 8, 0) + cReset + " $ " + cmdline
+	if tail := "   " + faint("(Ctrl-C to interrupt)"); visibleWidth(head)+visibleWidth(tail) <= houseWidth()+1 {
+		head += tail
+	}
+	return head
 }

@@ -143,6 +143,11 @@ func TestConfigShowsEveryKeyWithSource(t *testing.T) {
 }
 
 func TestSetRefusesPlaintextKeyByDefault(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
 	fs.models = allModels()
 	r, h := replFor(t, fs, testRoles)

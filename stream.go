@@ -143,8 +143,17 @@ func flameTone(frame string) string {
 // half-erased flames behind it.
 func (p *proseWriter) markerText(frame, label string) string {
 	body := cFaint + label + gSep + "" + p.thinkStat() + cReset
-	room := termWidth() - visibleWidth(p.markerPrefix) - visibleWidth(frame) - 2
-	if room > 12 && visibleWidth(body) > room {
+	// measured against the page and not the terminal, so the marker line ends in
+	// column houseWidth()+1 like every other line of chrome
+	room := max(houseWidth()-visibleWidth(p.markerPrefix)-visibleWidth(frame), 0)
+	// The guard is the marker itself and NOT a magic 12. At the clamp floor — a
+	// 20-column pane, or an exported COLUMNS of 20 — the room is exactly 12, so a
+	// `> 12` guard did not fire and a 68-column "waiting for <long model id>"
+	// printed across four visual rows. Every 90 ms tick then repainted only the
+	// last of them with "\r\033[K", leaving three rows of half-erased flames in the
+	// scrollback permanently — which is the one failure this function exists to
+	// prevent.
+	if room > visibleWidth(gEllipsis) && visibleWidth(body) > room {
 		body = cFaint + ellipsize(stripANSI(body), room) + cReset
 	}
 	return flameTone(frame) + frame + cReset + " " + body
@@ -511,7 +520,10 @@ func (p *proseWriter) emit(content string, wrap bool) {
 	// — and re-flowing it would change somebody's bytes as surely as decorating it.
 	rows := []string{content}
 	if wrap && p.anim {
-		if room := termWidth() - 3; room > 24 && visibleWidth(content) > room {
+		// The answer is prose: it grows with the window up to a reading measure and
+		// stops there. A 200-column line of text is harder to read than an 80-column
+		// one, and the spare columns are spent on the tables and the paths instead.
+		if room := proseWidth(); room > 24 && visibleWidth(content) > room {
 			rows = wrapTo(stripANSI(content), room)
 		}
 	}

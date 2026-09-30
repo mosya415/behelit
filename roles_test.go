@@ -1031,6 +1031,11 @@ func TestPerModelSamplingFromRoles(t *testing.T) {
 
 // /stats renders the session's counters without touching the model.
 func TestStatsCommand(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply { return fakeReply{content: "ok"} })
 	h := newRoleHarness(t, fs, testRoles, false)
 	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local, in: newStringInput("")}
@@ -2148,6 +2153,11 @@ func TestTierRoundTripYAML(t *testing.T) {
 }
 
 func TestDoctorShowsTier(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply { return fakeReply{content: "ok"} })
 	fs.models = allModels()
 	root := t.TempDir()
@@ -2182,6 +2192,11 @@ func TestDoctorShowsTier(t *testing.T) {
 // fork is a role setting like any other: settable from the REPL, shown by
 // /role <name>, and written back by /role save.
 func TestRoleForkCommandAndDisplay(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply { return fakeReply{content: "ok"} })
 	fs.models = allModels()
 	h := newRoleHarness(t, fs, testRoles, false)

@@ -767,6 +767,11 @@ func TestSetupKeepsSpareEndpoints(t *testing.T) {
 // the review screen still confirmed them: pick kimi, run qwen. The pick is now the
 // default, and the tier is asked for separately and printed as what will run.
 func TestSetupTiersDoNotDiscardThePicksUnlessAsked(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	fs := wizardServer(t)
 	script := kEnter + // gateway
 		kEnter + // models: the pre-ticks
@@ -909,6 +914,11 @@ func TestSetupStepNumbersMatchTheStepsThatRun(t *testing.T) {
 // collapsing onto one model, lead, coder and reviewer all ended up on it, the
 // reviewer warning that it was reviewing itself.
 func TestSetupModelsScreenOpensUntickedAndOffersTheProposal(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	fs := wizardServer(t)
 	r, orch := emptyRepl(t, fs, fullScript())
 	out := stripANSI(captureStdout(t, func() { r.cmdSetup("") }))

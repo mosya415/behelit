@@ -192,6 +192,11 @@ func TestPickCookedFallback(t *testing.T) {
 }
 
 func TestPickStateLinesCarryProvenance(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	served := modelChoice(ModelInfo{ID: "qwen3-coder-480b-a35b-instruct", MaxLen: 262144}, false)
 	card := modelChoice(ModelInfo{ID: "kimi-k3"}, false)
 	unknown := modelChoice(ModelInfo{ID: "totally-made-up-9000"}, false)
@@ -351,6 +356,11 @@ func TestPickKeepsSeededChainOrder(t *testing.T) {
 // The legend is the only place ^a, ^n and "type to filter" are documented, and at
 // 80 columns it was ellipsized to "^a a…" — on exactly the screens that need it.
 func TestPickLegendWrapsInsteadOfBeingCut(t *testing.T) {
+	// A width, explicitly. What this test asserts is CONTENT — that the screen says
+	// a particular thing — and the screen is fitted to the terminal it is drawn
+	// for, so at a narrow $COLUMNS the assertion below is about ellipsis rather
+	// than about the sentence. It failed at COLUMNS=41 before this was here.
+	t.Setenv("COLUMNS", "200")
 	p := newPickState(rows(4), pickOpts{multi: true})
 	var legend []string
 	for _, l := range p.lines() {
