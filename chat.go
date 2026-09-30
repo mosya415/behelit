@@ -515,6 +515,38 @@ var reOverflow = regexp.MustCompile(`(?i)prompt is too long|request_too_large|in
 	`tokens in request more than max tokens allowed|input token count.*exceeds|token limit exceeded|too many tokens|` +
 	`range of input length|input length.*exceeds`)
 
+// reStatedWindow pulls the real window out of an overflow refusal. Every engine
+// says it: vLLM "This model's maximum context length is 131072 tokens. However,
+// you requested …", SGLang "the input length … is longer than the model's context
+// length 131072", and the OpenAI-compatible wrappers echo one of the two. It is
+// the cheapest truth available about a deployment that does not publish
+// max_model_len — and it arrives exactly when we most need it.
+var reStatedWindow = regexp.MustCompile(`(?i)(?:maximum context length|context length|max_model_len|context window|maximum prompt length)` +
+	`[^0-9]{0,24}?(\d{3,9})`)
+
+// statedWindow is the window an error names, or 0. It refuses a number that is
+// smaller than the prompt it complains about would allow us to believe: a
+// "requested 1000032 tokens" is not a window.
+func statedWindow(err error) int {
+	if err == nil {
+		return 0
+	}
+	body := err.Error()
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Body != "" {
+		body = ae.Body
+	}
+	m := reStatedWindow.FindStringSubmatch(body)
+	if m == nil {
+		return 0
+	}
+	n, e := strconv.Atoi(m[1])
+	if e != nil || n < 1024 || n > 100_000_000 {
+		return 0
+	}
+	return n
+}
+
 func isContextOverflow(err error) bool {
 	if err == nil {
 		return false

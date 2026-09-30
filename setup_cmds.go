@@ -81,6 +81,7 @@ func runInit(cfg Config, args []string) int {
 	}
 
 	gw := NewClient(cfg)
+	applyRememberedWindow(cfg, gw)
 	models, err := gw.ListModels()
 	if err != nil {
 		errLine("can't list models at %s: %v", gw.Endpoint(), err)
@@ -409,6 +410,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 
 	section("gateway")
 	gw := NewClient(cfg)
+	applyRememberedWindow(cfg, gw)
 	row("url", gw.Endpoint())
 	models, err := gw.ListModels()
 	// The whole ModelInfo, not just a bool: MaxLen is what makes a server/profile
@@ -426,7 +428,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 		okLine("up"+gSep+"%s listed", plural(len(models), "model", "models"))
 	}
 	if len(served) > 0 {
-		reportProfiles(cfg, served)
+		reportProfiles(cfg, gw.Endpoint(), served)
 	}
 
 	section("roles")
@@ -477,6 +479,12 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 			// The window in force, in the order the runtime resolves it: the
 			// deployment's own max_model_len, then the role, then the table.
 			window, wsrc := prof.Context, prof.Src.Context
+			// A window an earlier refusal taught us is server truth too, and the
+			// runtime already prefers it — so the table has to, or doctor warns
+			// about a placeholder that is no longer in use.
+			if n := rememberedWindow(cfg, gw.Endpoint(), model); n > 0 {
+				window, wsrc = n, OriginServer
+			}
 			if info, ok := served[model]; ok && info.MaxLen > 0 {
 				window, wsrc = info.MaxLen, OriginServer
 			}
@@ -632,6 +640,13 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 			}
 			for _, w := range r.warns {
 				warnLine("%s  %s", label, w)
+			}
+			// Notes fold into detail on the happy path; a probe that ran after a
+			// failure has news of its own and no line to sit on.
+			for _, n := range r.notes {
+				if !strings.Contains(r.detail, n) {
+					hint("%s  %s", label, n)
+				}
 			}
 			if r.fix != "" {
 				hint("%s", r.fix)
@@ -824,10 +839,14 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 
 // probeModel asks one model for one tool call through the gateway, with the
 // same request shape the agent uses, and reports what came back.
-func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig, role, model string) probeResult {
-	res := probeResult{model: model, role: role}
+// The result is NAMED because probeWindow runs in a defer: with an unnamed
+// result, `return res` copies the value before the defer runs and everything it
+// learned is thrown away.
+func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig, role, model string) (res probeResult) {
+	res = probeResult{model: model, role: role}
 	c := *gw
 	c.model = model
+
 	c.transport = roles.transportOf(model)
 	// The vendor documents an engine flag per model. Naming it turns "tool calling
 	// is broken" into a line an operator can paste into the launch command — but
@@ -846,6 +865,11 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
+	// Whether the window is known is not a question about tool calling, so it is
+	// asked whatever the protocol probe does — including when it fails and the
+	// function returns early below. Registered AFTER cancel so it runs BEFORE it:
+	// defers are LIFO, and the first version of this ran with a cancelled context.
+	defer func() { probeWindow(ctx, &c, &res, gw, cfg) }()
 	req := ChatRequest{Thinking: effort, MaxTokens: 2048,
 		Headers: map[string]string{"x-session-id": "lca-doctor-" + model, "x-root-session-id": "lca-doctor"}}
 	if !c.Native() {
@@ -938,6 +962,42 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 		res.detail += gSep + "" + strings.Join(res.notes, gSep)
 	}
 	return res
+}
+
+// probeWindow asks a deployment that does not publish max_model_len how big its
+// window is, by requesting an impossible completion: engines validate the budget
+// before they generate, so the refusal states the real number and nothing is
+// decoded. It runs ONLY when the window is still unknown — a deployment that
+// answered /v1/models, or a model whose card we have, is not asked — because the
+// alternative is finding out mid-task, after the placeholder budget has spent the
+// session compacting and re-reading the same files.
+func probeWindow(ctx context.Context, c *Client, res *probeResult, gw *Client, cfg Config) {
+	if c.CtxLen() > 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, err := c.Chat(ctx, ChatRequest{
+		MaxTokens: 1 << 30,
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		Headers:   map[string]string{"x-session-id": "lca-doctor-window-" + c.Model(), "x-root-session-id": "lca-doctor"},
+	}, StreamSink{})
+	n := statedWindow(err)
+	switch {
+	case n > 0:
+		c.SetCtxLen(n)
+		if gw != nil {
+			gw.SetCtxLen(n) // the session's own client, not only doctor's copy
+		}
+		rememberWindowIn(cfg.stateDir(), c.Endpoint(), c.Model(), n)
+		res.notes = append(res.notes, fmt.Sprintf("window %s (its own refusal, remembered)", kfmt(n)))
+	case err == nil:
+		// It accepted a billion-token completion, so it clamps silently instead of
+		// refusing. Nothing was learned and nothing is pretended.
+		res.warns = append(res.warns, "window unknown: the server accepted an impossible max_tokens instead of naming its limit — set it with /set context <n>")
+	default:
+		res.warns = append(res.warns, "window unknown: its refusal names no limit ("+truncate(shortErr(err), 80)+") — set it with /set context <n>")
+	}
 }
 
 // probeParser exercises what server-side tool-call parsers actually break on:
@@ -1075,7 +1135,7 @@ func allowlistOf(cfg Config, roles *RolesConfig) []string {
 // written numbers for is a warn, and doctor's exit code does not turn red because
 // a model is new. What it must never be is silent: a quiet "no numbers" is how
 // this class of bug hides.
-func reportProfiles(cfg Config, served map[string]ModelInfo) {
+func reportProfiles(cfg Config, endpoint string, served map[string]ModelInfo) {
 	section("models", faint("what lca knows about each served model"))
 	for _, id := range sortedKeys(served) {
 		info, prof := served[id], lookupProfile(id)
@@ -1088,7 +1148,7 @@ func reportProfiles(cfg Config, served map[string]ModelInfo) {
 			warnLine("%s matched no profile", label)
 			hint("lca will send: no temperature, no top_p, no top_k, no max_tokens, no thinking switch, and will not replay the model's reasoning — the server's own defaults apply")
 			hint("fix: add a profile in models.go, or set models.%s: {temperature, top_p, effort, reasoning_replay} in roles.yaml from the model card", id)
-			reportWindow(id, info, prof)
+			reportWindow(id, info, prof, rememberedWindow(cfg, endpoint, id))
 			reportReplyBudget(cfg, id, info)
 			continue
 		}
@@ -1112,7 +1172,7 @@ func reportProfiles(cfg Config, served map[string]ModelInfo) {
 		if prof.Note != "" {
 			row("caveat", faint("%s", prof.Note))
 		}
-		reportWindow(id, info, prof)
+		reportWindow(id, info, prof, rememberedWindow(cfg, endpoint, id))
 		reportReplyBudget(cfg, id, info)
 	}
 }
@@ -1121,7 +1181,7 @@ func reportProfiles(cfg Config, served map[string]ModelInfo) {
 // Which one wins is not in question — Client.CtxLen prefers max_model_len, and
 // that precedence is right — but the difference has to be visible rather than
 // silently reconciled.
-func reportWindow(id string, info ModelInfo, prof ModelProfile) {
+func reportWindow(id string, info ModelInfo, prof ModelProfile, learned int) {
 	switch {
 	case info.MaxLen > 0 && prof.Context > 0 && info.MaxLen < prof.Context:
 		warnLine("%s: the deployment serves %s; the table says %s (%s)", id, ctxfmt(info.MaxLen), ctxfmt(prof.Context), prof.Src.Context)
@@ -1135,6 +1195,10 @@ func reportWindow(id string, info ModelInfo, prof ModelProfile) {
 		row("context", faint("%s — the deployment's own max_model_len", srcNum(info.MaxLen, OriginServer)))
 	case prof.Context > 0:
 		row("context", faint("%s — the endpoint does not report max_model_len; verify it matches the server's --max-model-len / --context-length", srcNum(prof.Context, prof.Src.Context)))
+	case learned > 0:
+		// Third source, and as authoritative as the first: the deployment told us
+		// this number itself, by refusing a prompt that did not fit.
+		row("context", faint("%s — learned from this deployment's own refusal, remembered in windows.json", srcNum(learned, OriginServer)))
 	default:
 		warnLine("%s: neither the endpoint nor the table knows this model's window", id)
 		hint("the context budget falls back to %d tokens, which is a placeholder and not a real window — set context: on the role, or add the model's window to models.go", ctxBudgetFallback)

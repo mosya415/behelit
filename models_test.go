@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -749,5 +750,89 @@ func TestDefaultTeamOverTheServedFleet(t *testing.T) {
 	}
 	if got := pickCheap(names); got != "deepseek-v4.1-flash" {
 		t.Errorf("the flash build is the cheap one, got %q", got)
+	}
+}
+
+// A deployment that does not publish max_model_len still states its window when
+// it refuses a prompt. That number is the cheapest truth available about it, and
+// it used to be thrown away: the session kept the 24k placeholder, compacted
+// every other turn and re-read the same files — which is what "multi-agent mode
+// is slow" turned out to be.
+func TestWindowLearnedFromTheServersRefusal(t *testing.T) {
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`This model's maximum context length is 131072 tokens. However, you requested 1000000032 tokens (32 in the messages, 1000000000 in the completion).`, 131072},
+		{`{"error":{"message":"the input length (26000 tokens) is longer than the model's context length 32768","type":"BadRequestError"}}`, 32768},
+		{`max_model_len is 262144, got 300000`, 262144},
+		{`context window exceeds limit`, 0},       // no number: learn nothing
+		{`you requested 1000000032 tokens`, 0},    // a request is not a window
+		{`maximum context length is 8 tokens`, 0}, // implausible
+	}
+	for _, c := range cases {
+		got := statedWindow(&APIError{Status: 400, Body: c.body})
+		if got != c.want {
+			t.Errorf("statedWindow(%.60s…) = %d, want %d", c.body, got, c.want)
+		}
+	}
+}
+
+// What a refusal taught us survives the session that paid for it.
+func TestLearnedWindowIsRemembered(t *testing.T) {
+	dir := t.TempDir()
+	ps := NewProviders(Config{}, nil, &Client{provider: &Provider{ID: "local", Local: true}})
+	ps.UseStateDir(dir)
+	ps.RememberWindow("http://gw:8080/v1/", "Kimi-K3", 131072)
+
+	if got := ps.LearnedWindow("http://gw:8080/v1", "kimi-k3"); got != 131072 {
+		t.Fatalf("in this process: %d", got) // endpoint slash and id case must not matter
+	}
+	next := NewProviders(Config{}, nil, &Client{provider: &Provider{ID: "local", Local: true}})
+	next.UseStateDir(dir)
+	if got := next.LearnedWindow("http://gw:8080/v1", "kimi-k3"); got != 131072 {
+		t.Fatalf("after a restart: %d, want the remembered window", got)
+	}
+}
+
+// doctor asks a deployment that publishes no max_model_len how big its window is,
+// by requesting an impossible completion: engines validate the budget before they
+// generate, so the refusal names the real number and nothing is decoded. The
+// answer is remembered, so the next session starts with a real budget instead of
+// the 24k placeholder that spends a session compacting.
+func TestDoctorProbesAndRemembersTheWindow(t *testing.T) {
+	var askedFor int
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		if mt, ok := req.Raw["max_tokens"].(float64); ok {
+			askedFor = int(mt)
+		}
+		if askedFor > 131072 {
+			return fakeReply{status: 400,
+				content: `This model's maximum context length is 131072 tokens. However, you requested 1073741856 tokens`}
+		}
+		return fakeReply{content: "ok"}
+	})
+	fs.models = []string{"nameless-model"}
+
+	dir := t.TempDir()
+	cfg := Config{Root: t.TempDir(), Dir: dir, BaseURL: fs.URL, Endpoints: []string{fs.URL}, Model: "nameless-model"}
+	c := NewClient(cfg)
+	res := probeResult{model: "nameless-model", role: "lead"}
+	probeWindow(context.Background(), c, &res, nil, cfg)
+
+	if askedFor <= 131072 {
+		t.Fatalf("the probe has to ask for an impossible completion, asked for %d", askedFor)
+	}
+	if c.CtxLen() != 131072 {
+		t.Fatalf("the window the server named is not in force: %d", c.CtxLen())
+	}
+	if len(res.notes) == 0 || !strings.Contains(strings.Join(res.notes, " "), "131k") {
+		t.Fatalf("doctor says nothing about what it learned: %v", res.notes)
+	}
+	// and the next process starts knowing it
+	ps := NewProviders(cfg, nil, NewClient(cfg))
+	ps.UseStateDir(cfg.stateDir())
+	if got := ps.LearnedWindow(fs.URL, "nameless-model"); got != 131072 {
+		t.Fatalf("not remembered for the next session: %d", got)
 	}
 }

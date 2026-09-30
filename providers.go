@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -115,6 +117,145 @@ type Providers struct {
 	// max_model_len. An endpoint that could not answer is stored as an empty map,
 	// so "asked already" and "serves nothing" are the same fast answer.
 	windows map[string]map[string]int
+	// learned: what a deployment's own refusal told us, endpoint → normalised model
+	// id → window. Kept in a file beside the state so the lesson outlives the
+	// session that paid for it, and treated as server truth because it came from
+	// the server. dir is where that file lives ("" = nowhere, tests and one-shots).
+	learned  map[string]map[string]int
+	stateDir string
+}
+
+// windowFile is the remembered-windows file. One small JSON object; a corrupt or
+// unreadable one is ignored rather than fatal — a forgotten window costs a
+// refusal, a failed startup costs the session.
+func (ps *Providers) windowFile() string {
+	if ps.stateDir == "" {
+		return ""
+	}
+	return filepath.Join(ps.stateDir, "windows.json")
+}
+
+// UseStateDir gives Providers somewhere to remember windows, and loads what is
+// already there.
+func (ps *Providers) UseStateDir(dir string) {
+	ps.mu.Lock()
+	ps.stateDir = dir
+	ps.mu.Unlock()
+	path := ps.windowFile()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var got map[string]map[string]int
+	if json.Unmarshal(data, &got) != nil {
+		return
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.learned = got
+}
+
+// RememberWindow records what a deployment said about itself, for this process
+// and for the next one. Write failures are silent on purpose: the number is
+// already in force for this session, and a read-only state directory must not
+// turn a recovered turn into an error.
+func (ps *Providers) RememberWindow(endpoint, model string, n int) {
+	if n <= 0 {
+		return
+	}
+	ep, id := strings.TrimRight(endpoint, "/"), normalizeModelID(model)
+	ps.mu.Lock()
+	if ps.learned == nil {
+		ps.learned = map[string]map[string]int{}
+	}
+	if ps.learned[ep] == nil {
+		ps.learned[ep] = map[string]int{}
+	}
+	ps.learned[ep][id] = n
+	dir := ps.stateDir
+	ps.mu.Unlock()
+	rememberWindowIn(dir, endpoint, model, n)
+}
+
+// rememberWindowIn is the file half, shared with doctor, which learns the same
+// thing from the same refusal but holds no Providers. Read-modify-write so two
+// processes lose at most each other's newest entry, never the file; every failure
+// is silent because the number is already in force where it was learned.
+func rememberWindowIn(stateDir, endpoint, model string, n int) {
+	if stateDir == "" || n <= 0 {
+		return
+	}
+	path := filepath.Join(stateDir, "windows.json")
+	got := map[string]map[string]int{}
+	if data, err := os.ReadFile(path); err == nil {
+		json.Unmarshal(data, &got)
+	}
+	ep, id := strings.TrimRight(endpoint, "/"), normalizeModelID(model)
+	if got[ep] == nil {
+		got[ep] = map[string]int{}
+	}
+	got[ep][id] = n
+	snapshot, err := json.MarshalIndent(got, "", " ")
+	if err != nil {
+		return
+	}
+	if os.MkdirAll(stateDir, 0o700) != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, append(snapshot, '\n'), 0o600) == nil {
+		os.Rename(tmp, path)
+	}
+}
+
+// rememberedWindow is what an earlier session learned about this model at this
+// endpoint, or 0. Read from the file, because doctor holds no Providers.
+func rememberedWindow(cfg Config, endpoint, model string) int {
+	dir := cfg.stateDir()
+	if dir == "" {
+		return 0
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "windows.json"))
+	if err != nil {
+		return 0
+	}
+	var got map[string]map[string]int
+	if json.Unmarshal(data, &got) != nil {
+		return 0
+	}
+	return got[strings.TrimRight(endpoint, "/")][normalizeModelID(model)]
+}
+
+// applyRememberedWindow puts a window learned by an earlier session in force for
+// a bare client — doctor's and init's, which have no Providers to ask. Without it
+// doctor re-probes and re-warns about a window it already knows.
+func applyRememberedWindow(cfg Config, c *Client) {
+	if c == nil || c.CtxLen() > 0 {
+		return
+	}
+	dir := cfg.stateDir()
+	if dir == "" {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "windows.json"))
+	if err != nil {
+		return
+	}
+	var got map[string]map[string]int
+	if json.Unmarshal(data, &got) != nil {
+		return
+	}
+	c.SetCtxLen(got[strings.TrimRight(c.Endpoint(), "/")][normalizeModelID(c.Model())])
+}
+
+// LearnedWindow is what a refusal from this endpoint taught us about this model.
+func (ps *Providers) LearnedWindow(endpoint, model string) int {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.learned[strings.TrimRight(endpoint, "/")][normalizeModelID(model)]
 }
 
 func NewProviders(cfg Config, fc *FileConfig, local *Client) *Providers {
@@ -203,7 +344,13 @@ func (ps *Providers) Learn(c *Client) {
 		w = ps.windows[ep]
 		ps.mu.Unlock()
 	}
-	c.SetCtxLen(w[normalizeModelID(c.Model())])
+	if n := w[normalizeModelID(c.Model())]; n > 0 {
+		c.SetCtxLen(n)
+		return
+	}
+	// A deployment that does not publish max_model_len may have told us its window
+	// once already, by refusing a prompt. That lesson is server truth too.
+	c.SetCtxLen(ps.LearnedWindow(ep, c.Model()))
 }
 
 // Client returns the client for a model ref. "" means the local client as

@@ -111,6 +111,7 @@ func NewOrchestrator(cfg Config, fc *FileConfig, jl *Jail, ap *Approver, rec *Re
 		local.provider.Transport = roles.Transport // the gateway is the local endpoint
 	}
 	ps := NewProviders(cfg, fc, local)
+	ps.UseStateDir(cfg.stateDir()) // remembered context windows outlive the session
 	o := &Orchestrator{cfg: cfg, fc: fc, jl: jl, ap: ap, rec: rec, providers: ps, roles: roles, tracer: tracer, gatewayModels: -1,
 		children: map[string]*Session{}, reads: map[string]time.Time{},
 		slots: make(chan struct{}, atoiDefault(os.Getenv("LCA_MAX_PARALLEL"), 4))}
@@ -857,6 +858,16 @@ func (s *Session) Run(ctx context.Context) error {
 			}
 			if isContextOverflow(err) && !overflowRetried && len(s.Msgs) > 3 {
 				overflowRetried = true
+				// The refusal usually names the real window. Learning it here is what
+				// turns "compact and hope" into "compact to fit": the budget for the
+				// retry is computed from the server's own number, and it is remembered
+				// for the next session so this costs one refusal per deployment, ever.
+				if n := statedWindow(err); n > 0 && n != s.client.CtxLen() {
+					s.client.SetCtxLen(n)
+					s.orch.providers.RememberWindow(s.client.Endpoint(), s.client.Model(), n)
+					s.view.Note(fmt.Sprintf("%s serves a %s window — learned from its own refusal and remembered",
+						s.client.Model(), kfmt(n)))
+				}
 				s.view.Warn("context window exceeded — compacting and retrying")
 				s.traceTurn(step, res, fallbacks, turnStart, nil, err)
 				if cerr := s.Compact(ctx, true); cerr == nil {
