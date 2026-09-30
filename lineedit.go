@@ -77,7 +77,7 @@ func (e *LineEditor) remember(line string) {
 // screen in clear while it is typed.
 func (e *LineEditor) display(buf []rune) string {
 	if e.secret {
-		return strings.Repeat("•", len(buf))
+		return strings.Repeat(gMask, len(buf))
 	}
 	return displayRunes(buf)
 }
@@ -186,9 +186,10 @@ func (e *LineEditor) ReadLine(prompt, initial string) (string, error) {
 		buf, pos = e.stage(pending, buf, pos)
 	}
 
-	// top fence of the input area
+	// top fence of the input area, at the house width and not the terminal's: the
+	// fence and the frames above it are the same chrome and have to agree
 	if !e.bare {
-		e.out(cFaint + strings.Repeat("─", termWidth()) + cReset + "\r\n")
+		e.out(cFaint + strings.Repeat(gRule, houseWidth()) + cReset + "\r\n")
 	}
 	e.render(prompt, buf, pos)
 	for {
@@ -360,7 +361,7 @@ func displayRunes(buf []rune) string {
 	var b strings.Builder
 	for _, r := range buf {
 		if r == '\n' {
-			b.WriteString("⏎ ")
+			b.WriteString(gEnter + " ")
 		} else {
 			b.WriteRune(r)
 		}
@@ -428,17 +429,17 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 		return
 	}
 	if e.staged != "" {
-		w := termWidth()
+		w := houseWidth()
 		band := cBandBg + padTo(stripANSI(prompt)+pasteSummary(e.staged)+"  "+displayRunes(buf), w, 0) + cReset
-		e.out("\r\033[J" + band + "\r\n" + cFaint + strings.Repeat("─", w) + cReset + "\r\n")
+		e.out("\r\033[J" + band + "\r\n" + cFaint + strings.Repeat(gRule, w) + cReset + "\r\n")
 		return
 	}
 	if len(buf) == 0 {
 		e.out("\r\033[J" + prompt + "\r\n")
 		return
 	}
-	w := termWidth()
-	bar := cFaint + strings.Repeat("─", w) + cReset
+	w := houseWidth()
+	bar := cFaint + strings.Repeat(gRule, w) + cReset
 	band := cBandBg + padTo(stripANSI(prompt)+displayRunes(buf), w, 0) + cReset
 	e.out("\r\033[J" + band + "\r\n" + bar + "\r\n")
 }

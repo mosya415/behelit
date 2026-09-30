@@ -152,7 +152,7 @@ func (r *Repl) cmdSetup(arg string) bool {
 	if !r.in.IsTTY() {
 		errLine("/setup needs a terminal — stdin is not one")
 		hint("non-interactive: lca init writes the team from the gateway's models")
-		hint(".lca/config.json (or /set <key> <value> from a session) sets the endpoint · lca doctor checks both")
+		hint("%s", ".lca/config.json (or /set <key> <value> from a session) sets the endpoint"+gSep+"lca doctor checks both")
 		return false
 	}
 	if n := r.sess.BackgroundRunning(); n > 0 {
@@ -161,7 +161,7 @@ func (r *Repl) cmdSetup(arg string) bool {
 		// change mid-flight.
 		errLine("%s still running in the background — /setup reloads the team and would pull it out from under it",
 			plural(n, "a subagent is", "subagents are"))
-		hint("/tasks shows them · run /setup when they are done")
+		hint("%s", "/tasks shows them"+gSep+"run /setup when they are done")
 		return false
 	}
 
@@ -212,7 +212,7 @@ func (r *Repl) cmdSetup(arg string) bool {
 			if errors.Is(err, errPickCancel) || errors.Is(err, errLineCancel) || errors.Is(err, errNoTTY) {
 				fmt.Println()
 				warnLine("setup aborted — nothing was written")
-				hint("/setup starts again · /config shows what is in force now")
+				hint("%s", "/setup starts again"+gSep+"/config shows what is in force now")
 				return false
 			}
 			errLine("%v", err)
@@ -226,7 +226,7 @@ func (r *Repl) cmdSetup(arg string) bool {
 
 func (r *Repl) setupGateway(p *setupPlan) error {
 	p.head()
-	row("now", p.endpoint+faint(" · %s", r.sources()["endpoint"].render(r.orch.jl.Root)))
+	row("now", p.endpoint+faint(gSep+"%s", r.sources()["endpoint"].render(r.orch.jl.Root)))
 	for {
 		v, err := ask(r.in, r.fieldEditor(), faint("gateway url "), p.endpoint)
 		if err != nil {
@@ -246,7 +246,7 @@ func (r *Repl) setupGateway(p *setupPlan) error {
 		p.endpoint = u
 		err = r.probeGateway(p, u)
 		if err == nil {
-			okLine("up · %s listed at %s", plural(len(p.served), "model", "models"), hostOf(u))
+			okLine("up"+gSep+"%s listed at %s", plural(len(p.served), "model", "models"), hostOf(u))
 			var rows [][]string
 			for _, m := range p.served {
 				rows = append(rows, []string{m.ID, faint("%s", windowOf(m))})
@@ -279,7 +279,7 @@ func (r *Repl) gatewayRecovery(p *setupPlan, u string) error {
 		{id: "edit", label: "edit the url", detail: faint("%s", u)},
 		{id: "anyway", label: "configure it anyway", detail: faint("name the models by hand for a gateway that is down right now")},
 	}
-	i, err := pickOne(r.in, cs, pickOpts{title: "setup", detail: faint("%s · not reachable", p.stepLabel())})
+	i, err := pickOne(r.in, cs, pickOpts{title: "setup", detail: faint("%s"+gSep+"not reachable", p.stepLabel())})
 	if err != nil {
 		return err
 	}
@@ -339,7 +339,7 @@ func windowText(m ModelInfo, short bool) string {
 		if short {
 			return srcNum(prof.Context, prof.Src.Context)
 		}
-		return srcNum(prof.Context, prof.Src.Context) + " · the server reports none"
+		return srcNum(prof.Context, prof.Src.Context) + gSep + "the server reports none"
 	}
 	if short {
 		return "window ?"
@@ -374,7 +374,7 @@ func (r *Repl) setupCredentials(p *setupPlan) error {
 		// gateway listed no models" never mentioned the credential.
 		err := r.probeGateway(p, p.endpoint)
 		if err == nil {
-			okLine("the key works · %s listed at %s", plural(len(p.served), "model", "models"), hostOf(p.endpoint))
+			okLine("the key works"+gSep+"%s listed at %s", plural(len(p.served), "model", "models"), hostOf(p.endpoint))
 			return nil
 		}
 		errLine("%s", shortErr(err))
@@ -414,7 +414,7 @@ func (r *Repl) askCredentials(p *setupPlan) error {
 		{id: "plain", label: "write the key into the file", detail: cYellow + gPartial + cReset + faint(" plain text — see the warning")},
 	}
 	i, err := pickOne(r.in, cs, pickOpts{title: "setup",
-		detail: faint("%s · a file is readable by anyone who can read the project; a variable's name is not a secret", p.stepLabel())})
+		detail: faint("%s"+gSep+"a file is readable by anyone who can read the project; a variable's name is not a secret", p.stepLabel())})
 	if err != nil {
 		return err
 	}
@@ -536,21 +536,26 @@ func (r *Repl) setupModels(p *setupPlan) error {
 
 	for {
 		var cs []choice
+		scale := windowScale(p.served)
 		for _, m := range p.served {
-			c := modelChoice(m, pre[m.ID])
+			c := modelChoice(m, pre[m.ID], scale)
 			c.seq = seq[m.ID]
 			if r := why[m.ID]; r != "" {
-				c.detail += faint("  ← proposed as %s", r)
-				c.note += " · proposed as " + r
+				c.detail += faint("  (proposed as %s)", r)
+				// FIRST in the note, not last: on a gateway with long model ids the
+				// row itself has no room left for the annotation, and a note that
+				// wraps must not be able to break the one phrase the operator is
+				// looking for across two lines.
+				c.note = "proposed as " + r + gSep + "" + c.note
 			}
 			cs = append(cs, c)
 		}
 		opts := pickOpts{multi: true, title: "setup",
-			detail: faint("%s · %d served at %s", p.stepLabel(), len(cs), hostOf(p.endpoint))}
+			detail: faint("%s"+gSep+"%d served at %s", p.stepLabel(), len(cs), hostOf(p.endpoint))}
 		// Above the menu, not as its hint line: the hint line carries the navigation
 		// keys, and a cooked fallback (no raw mode) never prints it at all.
 		if len(proposal) > 0 {
-			hint("space ticks the models you want · enter with none ticked takes the proposal: %s",
+			hint("space ticks the models you want"+gSep+"enter with none ticked takes the proposal: %s",
 				strings.Join(proposal, ", "))
 		}
 		idx, err := pick(r.in, cs, opts)
@@ -564,14 +569,14 @@ func (r *Repl) setupModels(p *setupPlan) error {
 			}
 			p.picked = append([]string(nil), proposal...)
 			okLine("%s (the proposal): %s", plural(len(p.picked), "model", "models"),
-				strings.Join(p.picked, faint(" · ")))
+				strings.Join(p.picked, faint("%s", gSep)))
 			return nil
 		}
 		p.picked = nil
 		for _, i := range idx {
 			p.picked = append(p.picked, cs[i].id)
 		}
-		okLine("%s: %s", plural(len(p.picked), "model", "models"), strings.Join(p.picked, faint(" · ")))
+		okLine("%s: %s", plural(len(p.picked), "model", "models"), strings.Join(p.picked, faint("%s", gSep)))
 		return nil
 	}
 }
@@ -582,8 +587,8 @@ func (r *Repl) setupModels(p *setupPlan) error {
 // now, and the wizard used to die one screen later with "the gateway listed no
 // models — nothing to pick from", having written nothing at all.
 func (r *Repl) setupModelsByHand(p *setupPlan) error {
-	p.head(faint("· nothing listed — name the models"))
-	hint("comma-separated ids, the lead's first · /doctor checks them against the gateway once it is up")
+	p.head(faint("%snothing listed — name the models", gSep))
+	hint("%s", "comma-separated ids, the lead's first"+gSep+"/doctor checks them against the gateway once it is up")
 	v, err := ask(r.in, r.fieldEditor(), faint("model ids "), strings.Join(p.picked, ","))
 	if err != nil {
 		return err
@@ -596,31 +601,87 @@ func (r *Repl) setupModelsByHand(p *setupPlan) error {
 	if len(p.picked) == 0 {
 		return fmt.Errorf("no model ids given — a team needs at least one")
 	}
-	okLine("%s: %s", plural(len(p.picked), "model", "models"), strings.Join(p.picked, faint(" · ")))
+	okLine("%s: %s", plural(len(p.picked), "model", "models"), strings.Join(p.picked, faint("%s", gSep)))
 	return nil
 }
 
 // modelChoice is one served model with everything the client knows about it, and
 // every number carrying its origin — a picker that prints an anonymous integer
 // lends authority to a guess.
-func modelChoice(m ModelInfo, on bool) choice {
+// windowScale is the largest window among the served models — the denominator
+// every window gauge on a picker is drawn against. It is the models' own numbers
+// and never a constant, so the bars compare the things on the screen with each
+// other and claim nothing about what is "big".
+func windowScale(ms []ModelInfo) int {
+	n := 0
+	for _, m := range ms {
+		w := m.MaxLen
+		if w == 0 {
+			w = lookupProfile(m.ID).Context
+		}
+		n = max(n, w)
+	}
+	return n
+}
+
+// windowBar is one model's window against that scale. A model whose window
+// nobody knows gets an EMPTY track rather than a short bar: "we do not know" has
+// to look nothing like "small", which is the whole reason the bar is scaled and
+// labelled instead of being drawn from a guess.
+func windowBar(m ModelInfo, scale int) string {
+	if scale <= 0 {
+		return ""
+	}
+	w := m.MaxLen
+	if w == 0 {
+		w = lookupProfile(m.ID).Context
+	}
+	return gaugeFrac(float64(w)/float64(scale), 13, cYellow)
+}
+
+// windowCell is the picker's window column: the NUMBER right-aligned in its own
+// field and the provenance left-aligned after it.
+//
+// srcNum returns them as one string, and right-aligning "1.05M (server)" against
+// "1.05M (card)" as a unit lines up the closing bracket and not the digits — which
+// is the one thing a right-aligned numeric column exists for, and it made two
+// identical windows read two columns apart. "window ?" is a phrase and not a
+// number, so it keeps the whole field.
+func windowCell(m ModelInfo) string {
+	s := windowText(m, true)
+	if n, prov, ok := strings.Cut(s, " ("); ok {
+		return padTo(n, 6, 1) + " " + padTo("("+prov, 9, 0)
+	}
+	return padTo(s, 16, 1)
+}
+
+func modelChoice(m ModelInfo, on bool, scale ...int) choice {
 	prof := lookupProfile(m.ID)
 	// windowOf's own short form, not a second reconstruction of it: srcNum returns
 	// the literal "unset" for 0, so the picker said "unset" — a sampling word, and
 	// the opposite of what is meant — for a model the table two lines above called
 	// "window unknown".
-	window := windowText(m, true)
+	window := windowCell(m)
+	// the bar goes BEFORE the number and never instead of it: srcNum already says
+	// whether the number came from the server or from the card, and a bar cannot
+	// say that
+	bar := ""
+	if len(scale) > 0 {
+		if b := windowBar(m, scale[0]); b != "" {
+			bar = b + "  "
+		}
+	}
 	c := choice{id: m.ID, label: m.ID, on: on}
 	if prof.Family == "" {
-		c.detail = padTo(window, 14, 1) + faint("  no profile")
+		c.detail = bar + window + faint("  no profile")
 		c.note = fmt.Sprintf("no profile for %q (normalised %q) — nothing is overridden", m.ID, normalizeModelID(m.ID))
 		return c
 	}
 	// The columns stay narrow enough to survive a narrow terminal; the rest of
 	// the provenance is on the note, which costs a line only while the row is
 	// highlighted.
-	c.detail = padTo(window, 14, 1) + faint("  %s", prof.Family)
-	c.note = fmt.Sprintf("matched %q · temperature %s · top_p %s · tools and reasoning are probed after the picks",
+	c.detail = bar + window + faint("  %s", prof.Family)
+	c.note = fmt.Sprintf("matched %q"+gSep+"temperature %s"+gSep+"top_p %s"+gSep+"tools and reasoning are probed after the picks",
 		prof.Key, srcFloat(prof.Temperature, prof.Src.Temperature), srcFloat(prof.TopP, prof.Src.TopP))
 	return c
 }
@@ -661,7 +722,7 @@ func (r *Repl) setupTeam(p *setupPlan) error {
 			cs = append(cs, c)
 		}
 		i, err := pickOne(r.in, cs, pickOpts{title: "setup",
-			detail: faint("%s · %s — %s", p.stepLabel(), role, roleWhat[role])})
+			detail: faint("%s"+gSep+"%s — %s", p.stepLabel(), role, roleWhat[role])})
 		if err != nil {
 			return err
 		}
@@ -674,7 +735,7 @@ func (r *Repl) setupTeam(p *setupPlan) error {
 			continue
 		}
 		p.chains[role] = chainFor(p.picked, cs[i].id)
-		row(role, strings.Join(p.chains[role], faint(" → ")))
+		row(role, strings.Join(p.chains[role], faint(" %s ", gFlow)))
 		if w := sameFamilyWarning(p.roles["coder"], p.roles["reviewer"]); role == "reviewer" && w != "" {
 			warnLine("%s", w)
 		}
@@ -785,7 +846,7 @@ func (r *Repl) setupTiers(p *setupPlan) error {
 			cs = append(cs, modelChoice(infoFor(p.served, m), on))
 		}
 		idx, err := pick(r.in, cs, pickOpts{multi: true, title: "setup",
-			detail: faint("%s · %s", p.stepLabel(), tier)})
+			detail: faint("%s"+gSep+"%s", p.stepLabel(), tier)})
 		if err != nil {
 			return err
 		}
@@ -809,7 +870,7 @@ func (r *Repl) setupTiers(p *setupPlan) error {
 		}
 		p.tiers[tier] = chain
 		p.tierOrder = append(p.tierOrder, tier)
-		row(tier, strings.Join(chain, faint(" → ")))
+		row(tier, strings.Join(chain, faint(" %s ", gFlow)))
 	}
 	// ASKED, and defaulting to no. `tier:` and `models:` are mutually exclusive in
 	// the format — a role that declares a tier has its chain replaced at load — so
@@ -828,7 +889,7 @@ func (r *Repl) setupTiers(p *setupPlan) error {
 		if yes {
 			p.tierRole = p.tierOrder[len(p.tierOrder)-1]
 		} else {
-			hint("lead and coder keep their picks · the tiers stay in the file for a role that asks for one")
+			hint("%s", "lead and coder keep their picks"+gSep+"the tiers stay in the file for a role that asks for one")
 		}
 	}
 	return nil
@@ -911,9 +972,9 @@ func (r *Repl) setupWrite(p *setupPlan) error {
 	// "reached", lower case: statusText upper-cases its word, and a shouted REACHED
 	// sat next to a sentence-case "never answered" in a program that is sentence-case
 	// everywhere else.
-	reach := cGreen + gUp + cReset + " reached" + faint(" · %d models", len(p.served))
+	reach := cGreen + gUp + cReset + " reached" + faint(gSep+"%d models", len(p.served))
 	if !p.reached {
-		reach = cYellow + gPartial + cReset + " never answered" + faint(" · writing it anyway")
+		reach = cYellow + gPartial + cReset + " never answered" + faint("%s", gSep+"writing it anyway")
 	}
 	row("endpoint", p.endpoint+"  "+reach)
 	switch {
@@ -923,7 +984,7 @@ func (r *Repl) setupWrite(p *setupPlan) error {
 		row("key", warn("written into the file in plain text"))
 	case p.keepKey != "":
 		// "none" while leaving api_key_env in the file is not what the file will say.
-		row("key", faint("unchanged · api_key_env: %s from %s", p.keepKey, prettyPath(r.orch.fc.From["api_key_env"], root)))
+		row("key", faint("unchanged"+gSep+"api_key_env: %s from %s", p.keepKey, prettyPath(r.orch.fc.From["api_key_env"], root)))
 	default:
 		row("key", faint("none"))
 	}
@@ -941,21 +1002,21 @@ func (r *Repl) setupWrite(p *setupPlan) error {
 		}
 		detail := windowText(infoFor(p.served, firstOf(a.Models)), true)
 		if a.Tier != "" {
-			detail = "tier " + a.Tier + faint(" · %s", detail)
+			detail = "tier " + a.Tier + faint(gSep+"%s", detail)
 		}
 		if role == "coder" && p.check != "" {
-			detail += faint(" · check %s", p.check)
+			detail += faint(gSep+"check %s", p.check)
 		}
-		row(role, strings.Join(a.Models, faint(" → "))+faint("  %s", detail))
+		row(role, strings.Join(a.Models, faint(" %s ", gFlow))+faint("  %s", detail))
 	}
 	// One row for all the tiers: row()'s label field is 9 characters, so "tier
 	// premium" overran it and lost the value column's alignment.
 	if len(p.tierOrder) > 0 {
 		var ts []string
 		for _, t := range p.tierOrder {
-			ts = append(ts, t+faint(" → ")+strings.Join(p.tiers[t], faint(" → ")))
+			ts = append(ts, t+faint(" %s ", gFlow)+strings.Join(p.tiers[t], faint(" %s ", gFlow)))
 		}
-		row("tiers", strings.Join(ts, faint("  ·  "))+faint("  /tier switches"))
+		row("tiers", strings.Join(ts, faint("%s", " "+gSep+" "))+faint("  /tier switches"))
 	}
 	row("sandbox", faint("%s", strings.Join(p.allow, " ")))
 	if len(p.probes) > 0 {
@@ -967,13 +1028,13 @@ func (r *Repl) setupWrite(p *setupPlan) error {
 				failN++
 			}
 		}
-		row("probes", faint("%d ok · %d failed", okN, failN))
+		row("probes", faint("%d ok"+gSep+"%d failed", okN, failN))
 		for _, id := range p.picked {
 			pr, ok := p.probes[id]
 			if !ok || pr.status == "ok" {
 				continue
 			}
-			errLine("%s · %s", id, pr.detail)
+			errLine("%s"+gSep+"%s", id, pr.detail)
 			if pr.fix != "" {
 				hint("%s", pr.fix)
 			}
@@ -1015,10 +1076,10 @@ func (r *Repl) setupWrite(p *setupPlan) error {
 		errLine("%v", err)
 		return fmt.Errorf("nothing was changed — both files were left as they were")
 	}
-	okLine("wrote %s", strings.Join(written, faint(" · ")))
+	okLine("wrote %s", strings.Join(written, faint("%s", gSep)))
 	if err := r.reload("setup"); err != nil {
 		errLine("the files are written, but this session could not adopt them: %v", err)
-		hint("restart lca to pick them up · /config shows what is in force now")
+		hint("%s", "restart lca to pick them up"+gSep+"/config shows what is in force now")
 		return nil
 	}
 	okLine("the team is live in this session — /agents shows it, /doctor checks it")

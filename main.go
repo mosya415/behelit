@@ -11,7 +11,12 @@ import (
 )
 
 func main() {
+	// The theme is resolved before anything can print. usage() and fatal() write
+	// chrome to stderr and can fire before the config is read, and a run whose
+	// stdout is a pipe must not have put an escape in it by then.
+	applyTheme("")
 	cfg, _, cfgSrc := loadConfigWithSources()
+	applyTheme(cfg.Theme) // now the `theme` key and LCA_THEME get their say
 	if cfg.CmdTimeout > 0 {
 		cmdTimeout = time.Duration(cfg.CmdTimeout) * time.Second
 	}
@@ -137,7 +142,11 @@ func main() {
 // not the model, decides success.
 func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []string) int {
 	for _, n := range notes {
-		fmt.Fprintln(os.Stderr, n)
+		// reconcileModel() hands these back pre-coloured for the banner's
+		// contValue() rows, so they are stripped on the way to a stderr that may
+		// well be a file. The theme already makes a piped run plain; this is the
+		// case it cannot see, a terminal stdout with stderr redirected.
+		fmt.Fprintln(os.Stderr, stripANSI(n))
 	}
 	orch.rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
 	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: prompt})
@@ -153,7 +162,7 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []st
 	v := sess.RunVerified(context.Background(), check, orch.verifyAttempts())
 	sess.traceTask(prompt, v, check, 0, 0, false, nil, start, "")
 	sess.saveTranscript()
-	fmt.Fprintf(os.Stderr, "\n%s  %s\n", statusWord(v.Status), faint("%s · %s", check, plural(v.Attempts, "attempt", "attempts")))
+	fmt.Fprintf(os.Stderr, "\n%s  %s\n", statusWord(v.Status), faint("%s"+gSep+"%s", check, plural(v.Attempts, "attempt", "attempts")))
 	if v.Status != "passed" {
 		if v.Tail != "" {
 			fmt.Fprintln(os.Stderr, v.Tail)
@@ -166,7 +175,7 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []st
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, cRed+gDown+cReset+" "+err.Error())
 	if h := errorHint(err); h != "" {
-		fmt.Fprintln(os.Stderr, cFaint+"↳ "+h+cReset)
+		fmt.Fprintln(os.Stderr, cFaint+gHint+" "+h+cReset)
 	}
 	os.Exit(1)
 }

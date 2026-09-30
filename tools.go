@@ -275,8 +275,12 @@ func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Du
 	var buf bytes.Buffer
 	var pw *prefixWriter
 	if live != nil {
-		fmt.Fprintln(live, " "+faint("%s $ %s   %s", gNone, cmdline, faint("(Ctrl-C to interrupt)")))
-		pw = &prefixWriter{w: live, prefix: "   " + cFaint + "│ " + cReset}
+		// The command is a trap you set yourself: ^ in the gutter, the verb in
+		// stone, and then the command's own bytes verbatim — never re-cased, never
+		// re-coloured, because that line is what you would paste into a shell.
+		fmt.Fprintln(live, " "+cYellow+gCmd+cReset+" "+cDim+padTo("run", 8, 0)+cReset+
+			" $ "+cmdline+"   "+faint("(Ctrl-C to interrupt)"))
+		pw = &prefixWriter{w: live, prefix: "   " + cFaint + gVBar + " " + cReset}
 		mw := io.MultiWriter(&buf, pw)
 		cmd.Stdout = mw
 		cmd.Stderr = mw // same writer ⇒ os/exec serializes the two streams for us
@@ -316,20 +320,20 @@ func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Du
 	res := headTail(buf.String(), maxCmdOutput)
 	switch {
 	case userInt.Load() || parent.Err() != nil:
-		say("   " + warn("%s interrupted", gDown))
+		say("     " + cYellow + gPartial + cReset + faint(" interrupted"))
 		return res + "\n(interrupted by user)"
 	case ctx.Err() == context.DeadlineExceeded:
-		say("   " + warn("%s timed out after %s", gDown, timeout))
+		say("     " + cYellow + gPartial + cReset + faint(" timed out after %s", timeout))
 		return fmt.Sprintf("error: the command timed out after %s — retry with a larger timeout if it is expected to take longer\n", timeout) + res
 	case err != nil:
 		_, desc := exitInfo(err)
-		say("   " + cRed + gDown + cReset + faint(" %s", desc))
+		say("     " + cRed + gDown + cReset + faint(" %s", desc))
 		if strings.TrimSpace(res) == "" {
 			return "(no output, " + desc + ")"
 		}
 		return res + "\n(" + desc + ")"
 	default:
-		say("   " + cGreen + gUp + cReset + faint(" exit 0"))
+		say("     " + cGreen + gUp + cReset + faint(" exit 0"))
 		if strings.TrimSpace(res) == "" {
 			return "(no output, exit 0)"
 		}

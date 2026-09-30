@@ -561,6 +561,15 @@ func (s *Session) budget() int {
 	return ctxBudget(s.orch.cfg.CtxTokens, s.client.CtxLen())
 }
 
+// budgetKnown reports whether budget() came from a real window — a role's
+// context:, LCA_CTX_TOKENS, or what the deployment reports — rather than
+// ctxBudget()'s placeholder. Only the screens that would draw a bar ask: a gauge
+// whose denominator was invented is a lie in picture form, and a picture is
+// believed before it is read.
+func (s *Session) budgetKnown() bool {
+	return s.agent.Context > 0 || s.orch.cfg.CtxTokens > 0 || s.client.CtxLen() > 0
+}
+
 // rules is the permission stack for this session, lowest precedence first
 // (last match wins): defaults, built-in agent rules, the user's global
 // permission config, the agent definition's own rules, session restrictions.
@@ -863,7 +872,7 @@ func (s *Session) Run(ctx context.Context) error {
 				calls = nil
 			}
 			s.traceTurn(step, res, fallbacks, turnStart, nil, nil)
-			s.view.Warn(fmt.Sprintf("%s STOPPED — hit %d-step cap", gPartial, maxSteps))
+			s.view.Warn(fmt.Sprintf("STOPPED — hit %d-step cap", maxSteps))
 			s.event("step_cap", map[string]any{"steps": maxSteps})
 			s.saveTranscript()
 			return nil

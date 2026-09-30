@@ -109,7 +109,13 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 	defer a.promptMu.Unlock()
 	header = humanHeader(header)
 	if a.Trusts(kind) {
-		if !a.quiet {
+		// Silent for the two classes the transcript already draws a gutter line for
+		// with the same target on it: an auto-approved edit printed "/ edit sum.go"
+		// and then "· edit sum.go (auto-approved)", and an auto-approved command
+		// printed the pair the other way round. Two rows per action for one fact, in
+		// the transcript the gutter exists to make scannable. The posture itself is
+		// on the status line, in the banner and in the audit log.
+		if !a.quiet && classOf(kind) != "edit" && classOf(kind) != "run" {
 			sayLine(fmt.Sprintf(" %s%s %s  %s(auto-approved)%s", cFaint, gNone, header, cFaint, cReset))
 		}
 		return true, true
@@ -119,12 +125,36 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 	outMu.Lock()
 	defer outMu.Unlock()
 
-	fmt.Printf("\n %s%s%s %s%s%s\n", cYellow, gUp, cReset, cBold, header, cReset)
-	if preview != "" {
-		fmt.Println(preview)
+	// A door: the one frame on the screen that is lit, because it is the one thing
+	// on the screen that is waiting for you. The permission class and its target
+	// are humanHeader()'s output verbatim — "edit sum.go", "run" — and the asker's
+	// own bracketed tag, when a subagent is the one knocking, goes to the right so
+	// the question reads the same whoever asked it.
+	tag, detail := splitAsker(header)
+	pnl := newPanel("a door", detail).door()
+	if tag != "" {
+		pnl.tag(tag)
 	}
-	fmt.Print("   allow?  " + cBold + "y" + cReset + cFaint + " yes · " + cReset + cBold + "n" + cReset + cFaint + " no · " + cReset +
-		cBold + "a" + cReset + cFaint + " yes to everything this session" + cReset + "  " + cFaint + "›" + cReset + " ")
+	// The target is the whole question, and fitTop gives the title course up before
+	// it gives up the frame — so a long path or a URL was silently ellipsized there.
+	// For read, list, glob, grep, webfetch, skill and edit there is no second copy
+	// of it on the screen: webfetch passes an EMPTY preview and edit's preview is a
+	// diff with no filename in it, so a cut header is somebody typing y without
+	// having seen what they agreed to. When it does not fit the course WHOLE it
+	// comes out of the course and goes on the first content line instead, where
+	// panelSplit hard-splits it and never loses a byte.
+	if _, fits, _ := pnl.fitTop(pnl.width()); fits != detail {
+		pnl.detail = ""
+		pnl.needs(visibleWidth(detail))
+		pnl.Line("%s%s%s", cBold, detail, cReset)
+	}
+	for _, l := range previewLines(preview) {
+		pnl.Line("%s", l)
+	}
+	fmt.Println()
+	pnl.Print()
+	fmt.Print("   open it?  " + cBold + "y" + cReset + cFaint + " yes" + gSep + cReset + cBold + "n" + cReset + cFaint + " no" + gSep + cReset +
+		cBold + "a" + cReset + cFaint + " yes to everything this session" + cReset + "  " + cFaint + gPrompt + cReset + " ")
 
 	// The terminal has to be the ordinary one for a question: under the turn mode
 	// the agent's input capture installs, a read returns nothing at once and the
@@ -177,6 +207,41 @@ func (a *Approver) ModeShort() string {
 	default:
 		return "auto:" + strings.Join(cs, ",")
 	}
+}
+
+// splitAsker pulls a subagent's "[coder t2]" tag off the front of a header, so
+// the frame can put WHO is asking at the far end of its top course and leave the
+// question itself reading the same whoever asked it.
+func splitAsker(h string) (tag, rest string) {
+	if strings.HasPrefix(h, "[") {
+		if i := strings.IndexByte(h, ']'); i > 0 {
+			return h[:i+1], strings.TrimSpace(h[i+1:])
+		}
+	}
+	return "", h
+}
+
+// previewLines colours the two signs a diff preview carries and nothing else.
+// The signs are conventional data — everyone reads unified-diff notation, and
+// edit.go hands the same ones to the model — so they are tinted and never
+// renamed, and every other line of a preview is left exactly as its caller built
+// it, because a write preview's body is the file.
+func previewLines(preview string) []string {
+	if preview == "" {
+		return nil
+	}
+	var out []string
+	for _, l := range strings.Split(strings.TrimRight(preview, "\n"), "\n") {
+		switch t := strings.TrimLeft(l, " "); {
+		case strings.HasPrefix(t, "- "):
+			out = append(out, cRed+l+cReset)
+		case strings.HasPrefix(t, "+ "):
+			out = append(out, cGreen+l+cReset)
+		default:
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // humanHeader turns a tool's approval header ("EDIT a.go", "[coder t2] RUN")

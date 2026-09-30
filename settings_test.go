@@ -213,7 +213,9 @@ func TestSetRejectsUnknownAndBadValues(t *testing.T) {
 	target := filepath.Join(h.orch.jl.Root, ".lca", "config.json")
 	for _, arg := range []string{"nope 1", "transport sideways", "temperature hot", "context -3", "steps 0"} {
 		out := captureStdout(t, func() { r.cmdSet(arg) })
-		if !strings.Contains(out, "✕") {
+		// the refusal must be MARKED as a failure, not merely mentioned — but the
+		// mark is the theme's, so the theme's own glyph is what is looked for
+		if !strings.Contains(stripANSI(out), gDown+" ") {
 			t.Errorf("/set %s was accepted:\n%s", arg, out)
 		}
 		if _, err := os.Stat(target); err == nil {

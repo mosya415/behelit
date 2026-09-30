@@ -92,32 +92,57 @@ func handleCustomCommand(line string, sess *Session, rec *Recorder) (bool, strin
 // much of the prompt the gateway served from cache.
 func (r *Repl) cmdStats(string) bool {
 	st := r.sess.stats
-	section("this session")
-	row("turns", fmt.Sprintf("%d model calls · %s", st.Turns, plural(st.Compactions, "compaction", "compactions")))
-	row("tokens", fmt.Sprintf("%s in · %s out", kfmt(st.PromptTokens), kfmt(st.OutputTokens)))
-	cache := "—"
+	// THE SHEET: the session's own numbers. Both gauges have real denominators —
+	// the prompt that was actually sent, and the calls that were actually made —
+	// so both are allowed to be pictures, and both print their number beside them.
+	pnl := newPanel("the sheet", "this session")
+	pnl.Row("turns", fmt.Sprintf("%d model calls"+gSep+"%s", st.Turns, plural(st.Compactions, "compaction", "compactions")))
+	pnl.Row("tokens", fmt.Sprintf("%s in"+gSep+"%s out", kfmt(st.PromptTokens), kfmt(st.OutputTokens)))
+	cache := gNil
 	if st.PromptTokens > 0 {
 		cache = fmt.Sprintf("%d%%", st.CachedTokens*100/st.PromptTokens)
 	}
-	row("cache", cache+faint(" of the prompt served from the gateway's KV cache"))
+	cacheRow := cache + faint(" of the prompt served from the KV cache")
+	if g := gaugePct(st.CachedTokens, st.PromptTokens, gaugeCells, cGreen); g != "" {
+		cacheRow = g + "  " + cacheRow
+	}
+	pnl.Row("cache", cacheRow)
 	rate := "0%"
 	if st.ToolCalls+st.InvalidCalls > 0 {
 		rate = fmt.Sprintf("%.1f%%", float64(st.InvalidCalls)*100/float64(st.ToolCalls+st.InvalidCalls))
 	}
-	line := fmt.Sprintf("%d calls · %d didn't parse (%s) · %d returned an error", st.ToolCalls, st.InvalidCalls, rate, st.ToolErrors)
+	line := fmt.Sprintf("%d calls"+gSep+"%d didn't parse (%s)", st.ToolCalls, st.InvalidCalls, rate)
 	if st.InvalidCalls > 0 {
 		line = cYellow + gPartial + cReset + " " + line
 	}
-	row("tools", line)
+	// the one two-tone bar: what parsed and what did not, in the same track, with
+	// the failed fraction never rounded down to nothing
+	if g := gaugeSplit(st.ToolCalls, st.InvalidCalls, gaugeCells, cGreen, cRed); g != "" {
+		line = g + "  " + line
+	}
+	pnl.Row("tools", line)
+	// The error count is a second sentence about the same calls, so it goes on its
+	// own line under them rather than pushing the parse rate off the frame — and it
+	// is printed WITH its zero, like the parse count one line above it. Gated on
+	// being non-zero, the reader could not tell "none returned an error" from "this
+	// build does not report it", and two adjacent counts on one row followed two
+	// different rules.
+	pnl.Line("%-10s%d returned an error", "", st.ToolErrors)
 	if st.Fallbacks > 0 {
-		row("gateway", fmt.Sprintf("%s (model switches, waits, repeated turns)", plural(st.Fallbacks, "event", "events")))
+		pnl.Row("gateway", fmt.Sprintf("%s (model switches, waits, repeated turns)", plural(st.Fallbacks, "event", "events")))
 	}
 	if st.VerifyRuns > 0 {
-		row("verify", plural(st.VerifyRuns, "check run", "check runs"))
+		pnl.Row("verify", plural(st.VerifyRuns, "check run", "check runs"))
 	}
-	row("trace", faint("%s", shortDir(r.orch.tracer.Path)))
+	pnl.Row("trace", faint("%s", shortDir(r.orch.tracer.Path)))
+	fmt.Println()
+	pnl.Print()
 	if st.InvalidCalls > 0 {
-		hint("a parse failure rate above a fraction of a percent is the harness or the server, not the model — the raw text is in the trace (\"raw\")")
+		// two short hints rather than one long one: a hint is not wrapped (see
+		// ui.go), so a sentence that does not fit at 80 columns is a sentence that
+		// has to be two
+		hint("above a fraction of a percent, that is the harness or the server")
+		hint("the raw text of each failed call is in the trace, under \"raw\"")
 	}
 	return false
 }
@@ -197,15 +222,15 @@ func probeMembers(ctx context.Context, o *Orchestrator, names []string) map[stri
 func memberSandbox(o *Orchestrator, m *Member) string {
 	j := o.policyOf(m)
 	if j == nil {
-		return "—"
+		return gNil
 	}
 	switch {
 	case j.Unsafe:
 		return "unsafe"
 	case m != nil && m.Allow != nil:
-		return fmt.Sprintf("%d own%s", len(m.Allow), map[bool]string{true: " · sh", false: ""}[j.Shell])
+		return fmt.Sprintf("%d own%s", len(m.Allow), map[bool]string{true: gSep + "sh", false: ""}[j.Shell])
 	}
-	return fmt.Sprintf("%d team%s", len(j.Allowed), map[bool]string{true: " · sh", false: ""}[j.Shell])
+	return fmt.Sprintf("%d team%s", len(j.Allowed), map[bool]string{true: gSep + "sh", false: ""}[j.Shell])
 }
 
 func (r *Repl) cmdMembers(string) bool {
@@ -244,7 +269,7 @@ func (r *Repl) cmdMembers(string) bool {
 	for _, f := range fixes {
 		errLine("%s", f)
 	}
-	hint("pin a role with member: <name> in roles.yaml · a step's member: overrides it")
+	hint("%s", "pin a role with member: <name> in roles.yaml"+gSep+"a step's member: overrides it")
 	if o.legacyFleet() {
 		hint("member remote comes from the old remote: block — delegate is off there; move it into members: for cross-machine worktrees")
 	}

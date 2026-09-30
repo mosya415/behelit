@@ -362,7 +362,7 @@ func (r *Remote) execT(ctx context.Context, cmd string, timeout time.Duration, s
 	var buf bytes.Buffer
 	var w io.Writer = &buf
 	if live != nil {
-		pw := &prefixWriter{w: live, prefix: "   " + cFaint + "│ " + cReset}
+		pw := &prefixWriter{w: live, prefix: "   " + cFaint + gVBar + " " + cReset}
 		w = io.MultiWriter(&buf, pw)
 		defer pw.flush()
 	}

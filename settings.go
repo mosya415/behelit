@@ -92,6 +92,8 @@ var settings = []setting{
 		Help: "show the model's reasoning in full instead of one status line"},
 	{Key: "loop", JSON: "loop", Env: "LCA_LOOP", Group: "modes", Kind: kBool, Live: true,
 		Help: "keep working until the task reports itself done"},
+	{Key: "theme", JSON: "theme", Env: "LCA_THEME", Group: "modes", Kind: kEnum, Enum: []string{"dungeon", "plain", "auto"}, Live: true,
+		Help: "how the screen is drawn; auto goes plain off a terminal, under NO_COLOR or on a dumb TERM"},
 
 	{Key: "allow", JSON: "allow", Env: "LCA_ALLOW", Group: "sandbox", Kind: kList,
 		Help: "the command allowlist (roles.yaml sandbox.allow overrides it)"},
@@ -302,6 +304,13 @@ func applySetting(c *Config, key, raw string) error {
 		c.ShowThinking, _ = parseBool(v)
 	case "loop":
 		c.Loop, _ = parseBool(v)
+	case "theme":
+		// "auto" is stored as the absence of a preference, so the file says
+		// nothing rather than pinning today's detection into tomorrow's terminal.
+		if v == themeAuto {
+			v = ""
+		}
+		c.Theme = v
 	case "allow":
 		if list := splitFields(v); len(list) > 0 {
 			c.Allowed = list
@@ -348,17 +357,17 @@ func readSetting(c Config, ap *Approver, key string) string {
 		return orElse(c.Tools, "as the provider or roles.yaml says")
 	case "temperature":
 		if c.Temperature < 0 {
-			return faint("unset · the profile decides")
+			return faint("%s", "unset"+gSep+"the profile decides")
 		}
 		return strconv.FormatFloat(c.Temperature, 'f', -1, 64)
 	case "context":
 		if c.CtxTokens <= 0 {
-			return faint("auto · from the model's window")
+			return faint("%s", "auto"+gSep+"from the model's window")
 		}
 		return kfmt(c.CtxTokens)
 	case "max_tokens":
 		if c.MaxTokens <= 0 {
-			return faint("auto · the server decides")
+			return faint("%s", "auto"+gSep+"the server decides")
 		}
 		return kfmt(c.MaxTokens)
 	case "steps":
@@ -378,6 +387,17 @@ func readSetting(c Config, ap *Approver, key string) string {
 		return onOff(c.ShowThinking)
 	case "loop":
 		return onOff(c.Loop)
+	case "theme":
+		// what is actually on the screen, not only what was asked for: a pin this
+		// terminal cannot honour is the one case where the setting and the screen
+		// disagree, and /config is where that has to be visible.
+		switch {
+		case c.Theme == "":
+			return faint("auto"+gSep+"%s", activeTheme.Name)
+		case c.Theme != activeTheme.Name:
+			return c.Theme + faint(gSep+"%s here (%s)", activeTheme.Name, activeTheme.Why)
+		}
+		return c.Theme
 	case "allow":
 		return strings.Join(c.Allowed, " ")
 	case "root":
@@ -401,15 +421,15 @@ func maskKey(key, fromEnv string) string {
 		// api_key_env naming a variable nobody exported is how an operator gets a 401
 		// having been told twice that the key is fine. The NAME is not a secret, so it
 		// is printed: it is the whole of what has to be fixed.
-		return faint("unset · $%s names it, but it is not set in this shell", fromEnv)
+		return faint("unset"+gSep+"$%s names it, but it is not set in this shell", fromEnv)
 	case key == "":
 		return faint("unset")
 	case fromEnv != "":
-		return "set " + faint("· from $%s", fromEnv)
+		return "set" + faint("%s from $%s", gSep, fromEnv)
 	case key == noAuthKey:
-		return faint("none · the gateway needs none")
+		return faint("%s", "none"+gSep+"the gateway needs none")
 	case len(key) <= 8:
-		return "set " + faint("· %d chars", len(key))
+		return "set" + faint("%s%d chars", gSep, len(key))
 	}
 	return key[:3] + faint("…") + key[len(key)-3:] + faint(" (%d chars)", len(key))
 }
@@ -447,7 +467,7 @@ func normalizeEndpoint(v string) (string, string) {
 		v += "/v1"
 		notes = append(notes, "the API base path matters — appended /v1")
 	}
-	return v, strings.Join(notes, " · ")
+	return v, strings.Join(notes, gSep)
 }
 
 func containsStr(xs []string, v string) bool {
@@ -557,6 +577,11 @@ func jsonValueOf(c Config, key string) (any, error) {
 		return c.ShowThinking, nil
 	case "loop":
 		return c.Loop, nil
+	case "theme":
+		if c.Theme == "" {
+			return nil, nil // nil deletes the key: "auto" is the absence of a pin
+		}
+		return c.Theme, nil
 	case "allow":
 		return c.Allowed, nil
 	}

@@ -99,7 +99,7 @@ func lineDiff(a, b string) (added, removed int, rendered string) {
 	for idx, o := range ops {
 		if o.kind == ' ' && !keep[idx] {
 			if !collapsed {
-				sb.WriteString(cFaint + "     ⋮" + cReset + "\n")
+				sb.WriteString(cFaint + "     " + gCollapse + cReset + "\n")
 				collapsed = true
 			}
 			continue

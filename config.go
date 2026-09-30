@@ -41,6 +41,7 @@ type Config struct {
 	Tier         string   // active model tier (-tier / LCA_TIER); remaps every role that names one
 	APIKeyEnv    string   // the NAME of the variable APIKey was read from (config.json api_key_env)
 	Approve      string   // approval posture: off | run | edit | web | all (config.json approve)
+	Theme        string   // dungeon | plain | auto — "" and "auto" both mean detect (config.json theme)
 
 	TransportOverride string // force a tool transport for the whole run (eval -transport)
 }

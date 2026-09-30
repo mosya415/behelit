@@ -232,10 +232,10 @@ func runEval(ctx context.Context, cfg Config, args []string) int {
 				}
 				label := t.Name
 				if tier != "" {
-					label += faint(" · %s", tier)
+					label += faint(gSep+"%s", tier)
 				}
 				if mode != "" {
-					label += faint(" · %s", mode)
+					label += faint(gSep+"%s", mode)
 				}
 				fmt.Printf("  %s  %s\n", padTo(statusWord(res.Status), 14, 0), label+faint("  %s", fmtDurShort(time.Duration(res.DurationMs)*time.Millisecond)))
 				if res.Error != "" {
@@ -248,7 +248,7 @@ func runEval(ctx context.Context, cfg Config, args []string) int {
 	section("results")
 	var rows [][]string
 	for _, r := range all {
-		cached := "—"
+		cached := gNil
 		if r.PromptTokens > 0 {
 			cached = fmt.Sprintf("%d%%", int(r.CacheRatio*100))
 		}
@@ -292,7 +292,7 @@ func runEval(ctx context.Context, cfg Config, args []string) int {
 	} else {
 		errLine("%d/%d passed", passed, total)
 	}
-	hint("per-task results: %s · traces next to them", shortDir(resultsPath))
+	hint("per-task results: %s"+gSep+"traces next to them", shortDir(resultsPath))
 	if passed != total {
 		return 1
 	}

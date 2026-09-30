@@ -76,7 +76,7 @@ func runInit(cfg Config, args []string) int {
 	}
 	if _, err := os.Stat(path); err == nil && !*force {
 		errLine("%s already exists", prettyPath(path, cfg.Root))
-		hint("lca init -force overwrites it · lca doctor checks it")
+		hint("%s", "lca init -force overwrites it"+gSep+"lca doctor checks it")
 		return 1
 	}
 
@@ -189,17 +189,17 @@ roles:
 	section("lca init")
 	okLine("wrote %s", prettyPath(path, cfg.Root))
 	for _, m := range members.list {
-		row("member", m.name+faint(" · %s:%s", m.host, m.dir))
+		row("member", m.name+faint(gSep+"%s:%s", m.host, m.dir))
 	}
 	if len(members.list) > 1 {
 		hint("pin a role with \"member: <name>\" under it")
 	}
 	rows := [][]string{
-		{"lead", strings.Join(lead, faint(" → ")), faint("—")},
-		{"coder", strings.Join(coder, faint(" → ")), faint("%s", firstNonEmpty(check, "— add check_cmd"))},
+		{"lead", strings.Join(lead, faint(" %s ", gFlow)), faint("%s", gNil)},
+		{"coder", strings.Join(coder, faint(" %s ", gFlow)), faint("%s", firstNonEmpty(check, "— add check_cmd"))},
 	}
 	if cheap != "" {
-		rows = append(rows, []string{"cheap", cheap, faint("—")})
+		rows = append(rows, []string{"cheap", cheap, faint("%s", gNil)})
 	}
 	table([]string{"role", "models", "check"}, rows)
 	if cheap == "" {
@@ -207,7 +207,7 @@ roles:
 	}
 	row("sandbox", faint("%s", strings.Join(allow, " ")))
 	if *remote != "" {
-		row("remote", *remote+faint(" · files and commands go there over ssh"))
+		row("remote", *remote+faint("%s", gSep+"files and commands go there over ssh"))
 	}
 	fmt.Println()
 	hint("next: lca doctor — the gateway, the roles and one real tool call per role (-all: every model)")
@@ -400,7 +400,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 		for _, m := range models {
 			served[m.ID] = m
 		}
-		okLine("up · %s listed", plural(len(models), "model", "models"))
+		okLine("up"+gSep+"%s listed", plural(len(models), "model", "models"))
 	}
 	if len(served) > 0 {
 		reportProfiles(cfg, served)
@@ -413,7 +413,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 		fail("%v", rerr)
 	case len(roles.Roles) == 0:
 		warnLine("no roles.yaml — single-agent mode")
-		hint("in a session: /setup picks the models and gives them roles · from the shell: lca init")
+		hint("%s", "in a session: /setup picks the models and gives them roles"+gSep+"from the shell: lca init")
 	default:
 		row("files", faint("%s", strings.Join(func() []string {
 			var ps []string
@@ -519,7 +519,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 			temp := sampleSrc(r.Temperature, optTemp(opts), prof.Temperature, prof.Src.Temperature)
 			topP := sampleSrc(r.TopP, optTopP(opts), prof.TopP, prof.Src.TopP)
 			effort := firstNonEmpty(r.Thinking, optEffort(opts), "provider default")
-			rows = append(rows, []string{r.Name, orDash(r.Tier), strings.Join(chain, faint(" → ")),
+			rows = append(rows, []string{r.Name, orDash(r.Tier), strings.Join(chain, faint(" %s ", gFlow)),
 				temp, topP, effort, ctxfmt(budget) + faint(" (%s)", bsrc), replayName(prof.Replay)})
 		}
 		table([]string{"role", "tier", "models", "temp", "top_p", "effort", "context", "reasoning"}, rows)
@@ -645,7 +645,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 					continue // the workspace section below is this machine's
 				}
 				rem := m.Rem
-				row("member", n+faint(" · %s", rem.Label()))
+				row("member", n+faint(gSep+"%s", rem.Label()))
 				if err := reach[n]; err != nil {
 					fail("%s", err.Error())
 					if memberDirMissing(err) {
@@ -657,7 +657,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 					}
 					continue
 				}
-				okLine("ssh works · %s exists", rem.Dir)
+				okLine("ssh works"+gSep+"%s exists", rem.Dir)
 				if _, e := rem.run(context.Background(), "command -v git >/dev/null", 20*time.Second, nil, nil); e != 0 {
 					fail("git is not installed on %s — a delegation there cannot create a worktree", rem.Where())
 					hint("install git on %s, or run that role on another member", rem.Where())
@@ -732,7 +732,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 		for _, wf := range wfs {
 			steps := plural(len(wf.Steps), "step", "steps")
 			if orch == nil || roles == nil || len(roles.Roles) == 0 {
-				okLine("%s · %s%s", wf.Name, steps, faint(" (parsed; a prompt or delegate step needs a roles.yaml)"))
+				okLine("%s"+gSep+"%s%s", wf.Name, steps, faint(" (parsed; a prompt or delegate step needs a roles.yaml)"))
 				continue
 			}
 			// A declared variable with no value is supplied with -var at run time,
@@ -747,7 +747,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 				fail("%v", err)
 				continue
 			}
-			okLine("%s · %s", wf.Name, steps)
+			okLine("%s"+gSep+"%s", wf.Name, steps)
 		}
 	}
 
@@ -802,7 +802,7 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 	// is broken" into a line an operator can paste into the launch command — but
 	// only when a probe actually failed: advice next to a green line is noise.
 	prof := lookupProfile(model)
-	toolFix := "vLLM: --enable-auto-tool-choice --tool-call-parser <family> · SGLang: --tool-call-parser <family>"
+	toolFix := "vLLM: --enable-auto-tool-choice --tool-call-parser <family>" + gSep + "SGLang: --tool-call-parser <family>"
 	if prof.ToolParser != "" {
 		toolFix = "vLLM: --enable-auto-tool-choice --tool-call-parser " + prof.ToolParser +
 			faint(" (the flag %s's vendor documents)", prof.Key)
@@ -868,7 +868,7 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 		case strings.Contains(out.Content, "ping") && strings.Contains(out.Content, "{"):
 			res.status = "fail"
 			res.detail = "the call came back as text, not tool_calls — the engine's tool-call parser is off or wrong for this model"
-			res.fix = toolFix + " · or models." + model + ".transport: text"
+			res.fix = toolFix + gSep + "or models." + model + ".transport: text"
 			return res
 		default:
 			res.status = "warn"
@@ -898,13 +898,13 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 		parts = append(parts, "first token "+fmtDurShort(out.Usage.TTFT))
 	}
 	parts = append(parts, "total "+fmtDurShort(took))
-	res.detail = strings.Join(parts, " · ")
+	res.detail = strings.Join(parts, gSep)
 	if c.Native() {
 		probeParser(ctx, &c, &res)
 	}
 	probeReplay(ctx, &c, roles, &res)
 	if len(res.notes) > 0 {
-		res.detail += " · " + strings.Join(res.notes, " · ")
+		res.detail += gSep + "" + strings.Join(res.notes, gSep)
 	}
 	return res
 }
@@ -980,7 +980,7 @@ func probeReplay(ctx context.Context, c *Client, roles *RolesConfig, res *probeR
 	var ae *APIError
 	if errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500 {
 		res.status = "fail"
-		res.detail += " · the server rejected the model's own reasoning in the history: " + shortErr(err)
+		res.detail += gSep + "the server rejected the model's own reasoning in the history: " + shortErr(err)
 		res.fix = "set models." + c.model + ".reasoning_replay: off (the model then loses its plan between steps — better: fix the server's chat template)"
 		return
 	}
@@ -1056,8 +1056,8 @@ func reportProfiles(cfg Config, served map[string]ModelInfo) {
 			reportReplyBudget(cfg, id, info)
 			continue
 		}
-		okLine("%s %s", label, faint("· %s · matched %q", prof.Family, prof.Key))
-		row("sends", faint("temperature %s · top_p %s · top_k %s · max output %s",
+		okLine("%s %s", label, faint("%s%s"+gSep+"matched %q", gSep, prof.Family, prof.Key))
+		row("sends", faint("temperature %s"+gSep+"top_p %s"+gSep+"top_k %s"+gSep+"max output %s",
 			srcFloat(prof.Temperature, prof.Src.Temperature), srcFloat(prof.TopP, prof.Src.TopP),
 			srcNum(prof.TopK, prof.Src.TopK), srcNum(prof.Output, prof.Src.Output)+" capped at "+kfmt(outputTokenMax)))
 		effort := "nothing recorded — no level is sent"
@@ -1067,12 +1067,12 @@ func reportProfiles(cfg Config, served map[string]ModelInfo) {
 		case len(prof.EffortsLocal) > 0:
 			// The gateway is self-hosted, so quote the list the template accepts:
 			// the wider one is the hosted API resolving its own aliases.
-			effort = strings.Join(prof.EffortsLocal, "|") + " · default " + prof.EffortOn +
+			effort = strings.Join(prof.EffortsLocal, "|") + gSep + "default " + prof.EffortOn +
 				faint(" (self-hosted vocabulary; the hosted API also resolves %s)", strings.Join(prof.Efforts, "|"))
 		case len(prof.Efforts) > 0:
-			effort = strings.Join(prof.Efforts, "|") + " · default " + prof.EffortOn
+			effort = strings.Join(prof.Efforts, "|") + gSep + "default " + prof.EffortOn
 		}
-		row("thinking", faint("%s · replay %s · effort %s", reasoningSwitchName(prof), replayName(prof.Replay), effort))
+		row("thinking", faint("%s"+gSep+"replay %s"+gSep+"effort %s", reasoningSwitchName(prof), replayName(prof.Replay), effort))
 		if prof.Note != "" {
 			row("caveat", faint("%s", prof.Note))
 		}

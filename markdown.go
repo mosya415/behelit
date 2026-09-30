@@ -36,7 +36,7 @@ func renderMarkdownLine(line string) string {
 
 	switch {
 	case reHr.MatchString(body):
-		return lead + cFaint + strings.Repeat("─", 24) + cReset
+		return lead + cFaint + strings.Repeat(gRule, 24) + cReset
 	case reHeading.MatchString(body):
 		m := reHeading.FindStringSubmatch(body)
 		return lead + cBold + renderInline(m[2]) + cReset
@@ -45,10 +45,10 @@ func renderMarkdownLine(line string) string {
 		return lead + cFaint + m[1] + "." + cReset + " " + renderInline(m[2])
 	case reList.MatchString(body):
 		m := reList.FindStringSubmatch(body)
-		return lead + cFaint + "•" + cReset + " " + renderInline(m[1])
+		return lead + cFaint + gBullet + cReset + " " + renderInline(m[1])
 	case reQuote.MatchString(body):
 		m := reQuote.FindStringSubmatch(body)
-		return lead + cFaint + "▏ " + cReset + renderInline(m[1])
+		return lead + cFaint + gQuote + " " + cReset + renderInline(m[1])
 	default:
 		return lead + renderInline(body)
 	}
@@ -74,8 +74,10 @@ func renderInline(s string) string {
 
 func inlineEmph(s string) string {
 	s = renderMathSpans(s)
-	s = reBold.ReplaceAllString(s, "\033[1m$1\033[22m")   // **bold**
-	s = reItalic.ReplaceAllString(s, "\033[3m$1\033[23m") // *italic*
+	// the *off* codes, not cReset: emphasis inside a coloured line must give
+	// the colour back, not end it.
+	s = reBold.ReplaceAllString(s, cBold+"$1"+cBoldOff)
+	s = reItalic.ReplaceAllString(s, cItalic+"$1"+cItalicOff)
 	return s
 }
 
@@ -193,12 +195,12 @@ func renderMarkdownTable(rows []string) []string {
 	hc := make([]string, ncols)
 	total := 0
 	for j := 0; j < ncols; j++ {
-		hc[j] = "\033[1m" + padTo(rHeader[j], width[j], align(j)) + "\033[22m"
+		hc[j] = cBold + padTo(rHeader[j], width[j], align(j)) + cBoldOff
 		total += width[j]
 	}
 	total += 2 * (ncols - 1)
 	out = append(out, strings.Join(hc, "  "))
-	out = append(out, cFaint+strings.Repeat("─", total)+cReset)
+	out = append(out, cFaint+strings.Repeat(gRule, total)+cReset)
 	for _, d := range rData {
 		for j := 0; j < ncols; j++ {
 			d[j] = padTo(d[j], width[j], align(j))

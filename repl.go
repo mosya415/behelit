@@ -122,6 +122,7 @@ func replRegistry() []replCmd {
 		{name: "/think", args: "[on|off|last]", desc: "show the model's reasoning", group: "modes", run: (*Repl).cmdThink},
 		{name: "/loop", args: "[on|off]", desc: "keep working until the task is done", group: "modes", run: (*Repl).cmdLoop},
 		{name: "/unsafe", args: "[on|off]", desc: "lift the sandbox (any path, any command)", group: "modes", run: (*Repl).cmdUnsafe},
+		{name: "/theme", args: "[dungeon|plain|auto]", desc: "how the screen is drawn", group: "modes", run: (*Repl).cmdTheme},
 
 		{name: "/model", args: "[<name>]", desc: "show or switch the model", group: "model", run: (*Repl).cmdModel},
 		{name: "/tier", args: "[<name>]", desc: "show or switch the active model tier", group: "model", show: hasTiers, run: (*Repl).cmdTier},
@@ -190,7 +191,7 @@ func (r *Repl) Loop() {
 		fmt.Print("\n")
 		prefill := r.prefill
 		r.prefill = ""
-		line, err := r.ed.ReadLine(" "+cFaint+"›"+cReset+" ", prefill)
+		line, err := r.ed.ReadLine(" "+cDim+gMe+cReset+" "+cFaint+gPrompt+cReset+" ", prefill)
 		if err == errLineCancel {
 			continue
 		}
@@ -199,7 +200,7 @@ func (r *Repl) Loop() {
 		}
 		// A line ending in \ continues on the next, for long prompts.
 		for strings.HasSuffix(line, "\\") {
-			cont, err := r.ed.ReadLine("   "+cFaint+"…"+cReset+" ", "")
+			cont, err := r.ed.ReadLine("   "+cFaint+gEllipsis+cReset+" ", "")
 			if err != nil {
 				break
 			}
@@ -273,12 +274,72 @@ func (r *Repl) statusLine() string {
 	if n := s.BackgroundRunning(); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d running in background", n))
 	}
+	where := shortDir(s.jail().Root)
 	if rem := s.remote(); rem != nil {
-		parts = append(parts, s.memberName()+" · "+rem.Host+":"+path.Base(rem.Dir))
-	} else {
-		parts = append(parts, shortDir(s.jail().Root))
+		where = s.memberName() + gSep + "" + rem.Host + ":" + path.Base(rem.Dir)
 	}
-	return strings.Join(parts, " · ")
+	// The status line lives inside the line editor's repainted region, so it must
+	// not be able to wrap: a wrapped status line puts the "\033[<n>A" walk-back one
+	// row out and the next repaint's "\r\033[J" then erases the line above it.
+	// Room is given up from the right, and the path — the longest and the least
+	// surprising field — is middle-ellipsized into whatever is left before the
+	// gauge is dropped, so the role and the model never move.
+	room := termWidth() - 4 - visibleWidth(strings.Join(parts, gSep)) - 3
+	ctx := ""
+	if bar, pct, ok := r.ctxGauge(10); ok {
+		// the whole line is wrapped in cFaint by the editor, so anything that
+		// resets has to hand the faint back before the next field
+		// The bar is empty in the plain theme (no block art), and "CTX  0%" with the
+		// hole where it was reads like something failed to draw.
+		ctx = "CTX " + bar + cFaint + fmt.Sprintf(" %d%%", pct)
+		if bar == "" {
+			ctx = cFaint + fmt.Sprintf("CTX %d%%", pct)
+		}
+		if n := visibleWidth(stripANSI(ctx)) + 3; room-n >= 12 {
+			room -= n
+		} else {
+			ctx = ""
+		}
+	}
+	switch {
+	case room >= visibleWidth(where):
+		parts = append(parts, where)
+	case room >= 12:
+		parts = append(parts, ellipsizeMiddle(where, room))
+	}
+	if ctx != "" {
+		parts = append(parts, ctx)
+	}
+	// And the clamp finishes what it started. Only `where` and `ctx` were ever
+	// droppable; `parts` — role, model id, posture, loop, unsafe, background count —
+	// is not, and a long model id with three postures beside it is 104 columns on
+	// its own. Giving up the two optional fields then still wrapping leaves the
+	// editor's walk-back one row out, which is the failure the comment above
+	// describes, so the joined line is cut to the room there actually is.
+	line := strings.Join(parts, gSep)
+	if room := termWidth() - 4; room > 20 && visibleWidth(line) > room {
+		line = ellipsize(stripANSI(line), room)
+	}
+	return line
+}
+
+// ctxGauge is how full the context is, as a bar and as the number printed beside
+// it. It is the same two functions /context uses, so the status line and the
+// panel can never disagree — and it returns false, drawing nothing at all, when
+// budget() fell back to a placeholder.
+func (r *Repl) ctxGauge(cells int) (bar string, pct int, ok bool) {
+	s := r.sess
+	budget := s.budget()
+	if budget <= 0 || !s.budgetKnown() {
+		return "", 0, false
+	}
+	tok := estimateTokens(s.Msgs)
+	// gaugeFracFloor without the floor, because the percentage beside the bar is
+	// TRUNCATED: against a 786k window one turn is 0.1%, and the floor drew a
+	// visible half cell next to a printed 0%. The bar and its own number are the
+	// one pair on the screen that can never disagree, so both come from this
+	// fraction and round the same way.
+	return gaugeFracFloor(float64(tok)/float64(budget), cells, cYellow, false), min(tok*100/budget, 100), true
 }
 
 func approvalShort(ap *Approver) string {
@@ -313,6 +374,12 @@ func (r *Repl) Banner() {
 	printBehelit()
 	fmt.Println()
 
+	// THE HOLD: where you stand. The frame and the title are the dungeon; every
+	// row label inside it is the same ordinary English it always was, because
+	// "project" and "gateway" are what the operator acts on and a renamed label is
+	// a lie about what a thing is.
+	hold := newPanel("the hold", "where you stand")
+
 	root := o.jl.Root
 	proj := cBold + filepath.Base(root) + cReset + "  " + faint("%s", ellipsizeMiddle(shortDir(filepath.Dir(root))+"/", 48))
 	var facts []string
@@ -323,22 +390,22 @@ func (r *Repl) Banner() {
 		facts = append(facts, name)
 	}
 	if len(facts) > 0 {
-		proj += faint(" · %s", strings.Join(facts, " · "))
+		proj += faint(gSep+"%s", strings.Join(facts, gSep))
 	}
 	if rem := s.remote(); rem != nil {
-		proj = cBold + path.Base(rem.Dir) + cReset + "  " + faint("%s · %s on %s · over ssh", s.memberName(), ellipsizeMiddle(rem.Dir, 40), rem.Host)
+		proj = cBold + path.Base(rem.Dir) + cReset + "  " + faint("%s"+gSep+"%s on %s"+gSep+"over ssh", s.memberName(), ellipsizeMiddle(rem.Dir, 40), rem.Host)
 	}
-	row("project", proj)
+	hold.Row("project", proj)
 
 	chain := s.client.Model()
 	if len(s.models) > 1 {
-		chain = strings.Join(s.models[s.modelIdx:], faint(" → "))
+		chain = strings.Join(s.models[s.modelIdx:], faint(" %s ", gFlow))
 	}
 	roleLine := cBold + s.agent.Name + cReset + "  " + chain
 	if s.agent.Thinking != "" {
-		roleLine += faint(" · effort %s", s.agent.Thinking)
+		roleLine += faint(gSep+"effort %s", s.agent.Thinking)
 	}
-	row("role", roleLine)
+	hold.Row("role", roleLine)
 
 	if r.teamMode() {
 		var team []string
@@ -346,38 +413,38 @@ func (r *Repl) Banner() {
 			team = append(team, a.Name)
 		}
 		if len(team) > 0 {
-			row("team", strings.Join(team, faint(" · ")))
+			hold.Row("team", strings.Join(team, faint("%s", gSep)))
 		}
 		gw := hostOf(r.local.Endpoint())
 		switch {
 		case o.gatewayModels > 0:
-			gw += "  " + statusText(cGreen, gUp, "up") + faint(" · %d models", o.gatewayModels)
+			gw += "  " + statusText(cGreen, gUp, "up") + faint(gSep+"%d models", o.gatewayModels)
 		case o.gatewayModels == 0:
-			gw += "  " + statusText(cRed, gDown, "unreachable") + faint(" · lca doctor")
+			gw += "  " + statusText(cRed, gDown, "unreachable") + faint("%s", gSep+"lca doctor")
 		}
-		gw += faint(" · %s tools", transportName(s.client))
-		row("gateway", gw)
+		gw += faint(gSep+"%s tools", transportName(s.client))
+		hold.Row("gateway", gw)
 	} else {
 		subs := []string{}
 		for _, a := range o.subagentsFor(s) {
 			subs = append(subs, a.Name)
 		}
 		if len(subs) > 0 {
-			row("helpers", strings.Join(subs, faint(" · ")))
+			hold.Row("helpers", strings.Join(subs, faint("%s", gSep)))
 		}
-		row("endpoint", hostOf(s.client.Endpoint())+faint(" · %s tools", transportName(s.client)))
+		hold.Row("endpoint", hostOf(s.client.Endpoint())+faint(gSep+"%s tools", transportName(s.client)))
 		for _, n := range r.notes {
-			contValue(n)
+			hold.Line("%-9s %s", "", n)
 		}
 	}
 
 	mode := approvalPhrase(o.ap)
 	if s.Loop {
-		mode += faint(" · loop")
+		mode += faint("%s", gSep+"loop")
 	}
-	row("mode", mode)
+	hold.Row("mode", mode)
 	if s.jail().Unsafe {
-		row("", cBlood+"⚠ unsafe: sandbox off — any path, any command"+cReset)
+		hold.Row("", cBlood+gWarning+" unsafe: sandbox off — any path, any command"+cReset)
 	}
 	var cfgs []string
 	if o.roles != nil {
@@ -389,18 +456,21 @@ func (r *Repl) Banner() {
 		cfgs = append(cfgs, prettyPath(p, root))
 	}
 	if len(cfgs) > 0 {
-		row("config", faint("%s", strings.Join(cfgs, ", ")))
+		hold.Row("config", faint("%s", strings.Join(cfgs, ", ")))
 	}
 	for _, w := range o.warnings {
-		fmt.Println("  " + cYellow + gPartial + cReset + " " + faint("%s", w))
+		hold.Line("%s%s%s %s", cYellow, gPartial, cReset, faint("%s", w))
 	}
+	hold.Print()
 	fmt.Println()
+	// two lines, not one: the single line was 85 columns and wrapped at 80, which
+	// put "Ctrl-C interrupts" on a line of its own with no lead-in
+	fmt.Println(" " + faint("%s", "Type a task to start. /help for commands"+gSep+"@file attaches a file"))
 	if !r.teamMode() && o.gatewayModels < 0 {
-		fmt.Println(" " + faint("Type a task to start. /help for commands · @file attaches a file · Ctrl-C interrupts"))
-		fmt.Println(" " + faint("/setup picks the models and gives them roles — or lca init from the shell"))
+		fmt.Println(" " + faint("%s", "Ctrl-C interrupts"+gSep+"/setup picks the models and gives them roles"+gSep+"lca init does it from the shell"))
 		return
 	}
-	fmt.Println(" " + faint("Type a task to start. /help for commands · @file attaches a file · Ctrl-C interrupts"))
+	fmt.Println(" " + faint("%s", "Ctrl-C interrupts"+gSep+"/setup re-picks the models"+gSep+"/agents lists the roles"))
 }
 
 // ── session ─────────────────────────────────────────────────────────────────
@@ -417,7 +487,7 @@ func (r *Repl) cmdHelp(arg string) bool {
 			for _, c := range sortedCommands(r.orch.commands) {
 				desc := firstNonEmpty(c.Description, "custom command")
 				if c.Agent != "" {
-					desc += faint(" → %s", c.Agent)
+					desc += faint(" %s %s", gFlow, c.Agent)
 				}
 				rows = append(rows, []string{"/" + c.Name + faint(" [args]"), faint("%s", desc)})
 			}
@@ -459,8 +529,8 @@ func (r *Repl) cmdHelp(arg string) bool {
 		}
 	}
 	fmt.Println()
-	fmt.Println("  " + faint("keys   Enter send · \\ at line end continues · ↑/↓ history · Tab completes · Ctrl-C interrupts · Ctrl-D quits"))
-	fmt.Println("  " + faint("input  @path attaches a file · /name runs a command"))
+	fmt.Println("  " + faint("%s", "keys   Enter send"+gSep+"\\ at line end continues"+gSep+"arrow keys for history"+gSep+"Tab completes"+gSep+"Ctrl-C interrupts"+gSep+"Ctrl-D quits"))
+	fmt.Println("  " + faint("%s", "input  @path attaches a file"+gSep+"/name runs a command"))
 	if !all {
 		hint("/help all also lists commands hidden in this setup")
 	}
@@ -503,7 +573,7 @@ func (r *Repl) cmdResume(arg string) bool {
 	}
 	r.orch.rec.Event("resume", map[string]any{"from": sessions[idx].id, "messages": restored})
 	r.sess.saveTranscript()
-	okLine("resumed %s %s", sessionWhen(sessions[idx].id), faint("· %d messages", restored))
+	okLine("resumed %s %s", sessionWhen(sessions[idx].id), faint("%s%d messages", gSep, restored))
 	return false
 }
 
@@ -534,10 +604,10 @@ func (r *Repl) cmdAgent(arg string) bool {
 			if a == r.sess.agent {
 				mark = cGreen + gUp + cReset
 			}
-			rows = append(rows, []string{mark, a.Name, faint("%s", firstNonEmpty(a.Description, "—"))})
+			rows = append(rows, []string{mark, a.Name, faint("%s", firstNonEmpty(a.Description, gNil))})
 		}
 		table(nil, rows)
-		hint("/agent <name> switches · /agents shows the whole team")
+		hint("%s", "/agent <name> switches"+gSep+"/agents shows the whole team")
 		return false
 	}
 	prev := r.sess.agent.Name
@@ -547,7 +617,7 @@ func (r *Repl) cmdAgent(arg string) bool {
 		return false
 	}
 	r.orch.rec.Event("agent_change", map[string]any{"from": prev, "to": arg})
-	okLine("now %s %s", cBold+arg+cReset, faint("· %s", r.sess.client.Model()))
+	okLine("now %s %s", cBold+arg+cReset, faint("%s%s", gSep, r.sess.client.Model()))
 	return false
 }
 
@@ -561,7 +631,7 @@ func (r *Repl) cmdAgents(string) bool {
 		}
 		what := strings.Join(ps, ", ")
 		if t := o.activeTier(); t != "" {
-			what += " · tier " + t
+			what += gSep + "tier " + t
 		}
 		section("team", faint("%s", what))
 		// The member column appears only on a fleet, so a single-machine team's
@@ -577,11 +647,11 @@ func (r *Repl) cmdAgents(string) bool {
 			if a.ToolsSet {
 				tools = strconv.Itoa(len(a.Tools))
 			}
-			ctx := "—"
+			ctx := gNil
 			if a.Context > 0 {
 				ctx = kfmt(a.Context)
 			}
-			cols := []string{name, orDash(a.Tier), strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))}
+			cols := []string{name, orDash(a.Tier), strings.Join(a.Models, faint(" %s ", gFlow)), firstNonEmpty(a.Thinking, gNil), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, gNil))}
 			if fleet {
 				cols = append(cols, o.memberFor(a).MemberName())
 			}
@@ -612,13 +682,13 @@ func (r *Repl) cmdAgents(string) bool {
 		if a.Model != "" {
 			model = a.Model
 		}
-		rows = append(rows, []string{a.Name, faint("%s", kind), model, faint("%s", firstNonEmpty(a.Description, "—"))})
+		rows = append(rows, []string{a.Name, faint("%s", kind), model, faint("%s", firstNonEmpty(a.Description, gNil))})
 	}
 	table([]string{"agent", "kind", "model", "what it does"}, rows)
 	if o.roles != nil {
-		hint("delegate(role, task) sends a change to a role · task(agent, …) asks a helper")
+		hint("%s", "delegate(role, task) sends a change to a role"+gSep+"task(agent, …) asks a helper")
 	}
-	hint("add agents in .lca/agents/<name>.md · roles in .lca/roles.yaml")
+	hint("%s", "add agents in .lca/agents/<name>.md"+gSep+"roles in .lca/roles.yaml")
 	return false
 }
 
@@ -674,7 +744,7 @@ func (r *Repl) cmdTasks(arg string) bool {
 	section("subagent runs")
 	var rows [][]string
 	for _, h := range hist {
-		dur := "…"
+		dur := gEllipsis
 		if h.Duration > 0 {
 			dur = fmtDurShort(h.Duration)
 		}
@@ -713,7 +783,7 @@ func (r *Repl) cmdSkills(string) bool {
 	var rows [][]string
 	for _, n := range sortedKeys(r.orch.skills) {
 		sk := r.orch.skills[n]
-		rows = append(rows, []string{n, faint("%s", firstNonEmpty(sk.Description, "—"))})
+		rows = append(rows, []string{n, faint("%s", firstNonEmpty(sk.Description, gNil))})
 	}
 	table(nil, rows)
 	return false
@@ -781,19 +851,39 @@ func (r *Repl) cmdUndo(string) bool {
 func (r *Repl) cmdContext(string) bool {
 	msgs, budget := r.sess.Msgs, r.sess.budget()
 	tok := estimateTokens(msgs)
-	section("context")
 	pct := 0
 	if budget > 0 {
 		pct = tok * 100 / budget
 	}
-	row("used", fmt.Sprintf("~%s of ~%s tokens %s", kfmt(tok), kfmt(budget), faint("(%d%%, %d messages)", pct, len(msgs))))
-	if budget <= 0 || tok <= budget {
-		row("cache", statusText(cGreen, gUp, "aligned")+faint(" — the prefix is sent unchanged, so the server's KV cache keeps hitting"))
+	// The budget is named on the frame, and named as a placeholder when that is
+	// what it is: the whole panel is percentages of this one number, so a reader
+	// who cannot see where it came from cannot judge any of them.
+	pnl := newPanel("the load", "context")
+	if r.sess.budgetKnown() {
+		pnl.tag("budget " + kfmt(budget))
 	} else {
-		row("cache", statusText(cYellow, gPartial, "compressing")+faint(" — over budget; old tool output is trimmed"))
+		pnl.tag("budget ~" + kfmt(budget) + ", a placeholder")
+	}
+	// bar, then the number the bar is drawing, then the denominator, then the count.
+	// The percentage was last on the row, faint, inside parentheses, behind two
+	// token counts and the word "tokens" — while the status line puts the same
+	// number immediately after the same bar, so the two screens showing it
+	// disagreed about where to look. Fixed-width, so the token figures stay in one
+	// column as the session fills.
+	used := fmt.Sprintf("~%s of ~%s tokens", kfmt(tok), kfmt(budget)) + faint(gSep+"%s", plural(len(msgs), "message", "messages"))
+	if bar, gpct, ok := r.ctxGauge(20); ok {
+		used = bar + faint("  %3d%%  ", gpct) + used
+	} else {
+		used += faint(gSep+"%d%%", pct)
+	}
+	pnl.Row("used", used)
+	if budget <= 0 || tok <= budget {
+		pnl.Row("cache", statusText(cGreen, gUp, "aligned")+faint("%sthe prefix is sent unchanged, so the KV cache hits", gDash))
+	} else {
+		pnl.Row("cache", statusText(cYellow, gPartial, "compressing")+faint("%sover budget; old tool output is trimmed", gDash))
 	}
 	if u := r.sess.lastUsage; u.PromptTokens > 0 {
-		row("last", fmt.Sprintf("%s in · %d%% cached", kfmt(u.PromptTokens), u.CacheHitPct()))
+		pnl.Row("last", fmt.Sprintf("%s in"+gSep+"%d%% cached", kfmt(u.PromptTokens), u.CacheHitPct()))
 	}
 	type item struct {
 		label string
@@ -807,8 +897,7 @@ func (r *Repl) cmdContext(string) bool {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].bytes > items[j].bytes })
 	if len(items) > 0 {
-		fmt.Println()
-		fmt.Println("  " + faint("largest tool outputs"))
+		pnl.Div("largest tool outputs")
 		var rows [][]string
 		for i, it := range items {
 			if i == 5 {
@@ -816,8 +905,10 @@ func (r *Repl) cmdContext(string) bool {
 			}
 			rows = append(rows, []string{faint("%s", byteCount(it.bytes)), it.label})
 		}
-		table(nil, rows)
+		pnl.Table(nil, rows, pnl.width()-4)
 	}
+	fmt.Println()
+	pnl.Print()
 	hint("/compact summarizes the conversation to free space")
 	return false
 }
@@ -837,7 +928,7 @@ func (r *Repl) cmdApprove(arg string) bool {
 		ap.Trust("edit")
 	case "", "status":
 		row("approve", approvalPhrase(ap))
-		hint("/approve on · off · run · edit")
+		hint("%s", "/approve on"+gSep+"off"+gSep+"run"+gSep+"edit")
 		return false
 	default:
 		errLine("usage: /approve [on|off|run|edit]")
@@ -912,6 +1003,40 @@ func (r *Repl) cmdLoop(arg string) bool {
 	return false
 }
 
+// cmdTheme shows or switches the look. The switch is live — the next thing
+// printed is already in the new theme — and it is remembered the way every other
+// mood is: a session change, one faint line, and /save if it should outlive the
+// session. "auto" is not a third look; it is handing the decision back to the
+// terminal.
+func (r *Repl) cmdTheme(arg string) bool {
+	a := strings.ToLower(strings.TrimSpace(arg))
+	if a == "" {
+		row("theme", activeTheme.Name+faint(gSep+"%s", themeDetail(activeTheme)))
+		hint("%s", "/theme dungeon"+gSep+"/theme plain"+gSep+"/theme auto lets the terminal decide")
+		return false
+	}
+	if !containsStr([]string{themeDungeon, themePlain, themeAuto}, a) {
+		errLine("usage: /theme [dungeon|plain|auto]")
+		return false
+	}
+	pref := a
+	if pref == themeAuto {
+		pref = "" // the absence of a preference, which is what detection means
+	}
+	t := applyTheme(pref)
+	r.cfg.Theme = pref
+	r.syncCfg()
+	r.orch.rec.Event("theme", map[string]any{"asked": a, "theme": t.Name, "why": t.Why})
+	okLine("theme %s %s", t.Name, faint("%s%s", gSep, themeDetail(t)))
+	if a == themeDungeon && !t.Colour {
+		// asked for and not delivered is the one case that needs saying out loud,
+		// or the operator retypes it and blames the command.
+		hint("this terminal will not carry it — %s", t.Why)
+	}
+	r.noteChange("theme", "/theme")
+	return false
+}
+
 func (r *Repl) cmdUnsafe(arg string) bool {
 	// The team's jail, not this session's view of it: a member that scopes its
 	// own allowlist gets a COPY of o.jl rebuilt per call, so lifting the sandbox
@@ -926,7 +1051,7 @@ func (r *Repl) cmdUnsafe(arg string) bool {
 	r.sess.RefreshSystem() // the environment section describes the sandbox
 	r.orch.rec.Event("unsafe_mode", map[string]any{"on": v})
 	if v {
-		fmt.Println("  " + cBlood + "⚠ unsafe on" + cReset + faint(" — sandbox off: any path, any command through sh (GPU policy still holds)"))
+		fmt.Println("  " + cBlood + gWarning + " unsafe on" + cReset + faint(" — sandbox off: any path, any command through sh (GPU policy still holds)"))
 	} else {
 		okLine("sandbox back on")
 	}
@@ -941,10 +1066,10 @@ func (r *Repl) cmdModel(arg string) bool {
 		section("model")
 		chain := s.client.Model()
 		if len(s.models) > 1 {
-			chain = strings.Join(s.models, faint(" → "))
+			chain = strings.Join(s.models, faint(" %s ", gFlow))
 		}
 		row("current", chain)
-		row("via", hostOf(s.client.Endpoint())+faint(" · %s tools", transportName(s.client)))
+		row("via", hostOf(s.client.Endpoint())+faint(gSep+"%s tools", transportName(s.client)))
 		if s.agent.Tier != "" {
 			// The declared tier and the one actually in force, because a -tier
 			// run answers "which models am I on?" differently from the file.
@@ -959,21 +1084,21 @@ func (r *Repl) cmdModel(arg string) bool {
 		// labelled, and only one of them is worth trusting.
 		p := s.client.Profile()
 		if p.Family != "" {
-			row("profile", faint("%s · matched %q", p.Family, p.Key))
+			row("profile", faint("%s"+gSep+"matched %q", p.Family, p.Key))
 		} else {
 			row("profile", faint("no profile for %q (normalised %q) — nothing is overridden", s.client.Model(), normalizeModelID(s.client.Model())))
 		}
-		row("context", faint("%s · budget %s", srcNum(s.client.CtxLen(), s.client.CtxSrc()), kfmt(s.budget())))
+		row("context", faint("%s"+gSep+"budget %s", srcNum(s.client.CtxLen(), s.client.CtxSrc()), kfmt(s.budget())))
 		// What this client will actually put in max_tokens, with the reason: the
 		// window clamp can rewrite a configured budget, and a number that is
 		// rewritten has to name its source like every other number here.
 		if n, why := s.client.replyCeiling(0); n > 0 {
-			row("output", faint("max %s · this client sends %s — %s", srcNum(p.Output, p.Src.Output), kfmt(n), why))
+			row("output", faint("max %s"+gSep+"this client sends %s — %s", srcNum(p.Output, p.Src.Output), kfmt(n), why))
 		} else {
-			row("output", faint("max %s · %s", srcNum(p.Output, p.Src.Output), why))
+			row("output", faint("max %s"+gSep+"%s", srcNum(p.Output, p.Src.Output), why))
 		}
 		temp, topP, effort := s.sampling()
-		row("sampling", faint("temperature %s · top_p %s · top_k %s · effort %s",
+		row("sampling", faint("temperature %s"+gSep+"top_p %s"+gSep+"top_k %s"+gSep+"effort %s",
 			temp, topP, srcNum(p.TopK, p.Src.TopK), effort))
 		if p.Note != "" {
 			row("caveat", faint("%s", p.Note))
@@ -992,7 +1117,7 @@ func (r *Repl) cmdModel(arg string) bool {
 		} else if refs := r.orch.providers.Refs(); len(refs) > 0 {
 			hint("hosted: %s", strings.Join(refs, ", "))
 		} else {
-			hint("/model <name> sets the endpoint's model · /model <provider>/<model> uses a hosted API (/providers)")
+			hint("%s", "/model <name> sets the endpoint's model"+gSep+"/model <provider>/<model> uses a hosted API (/providers)")
 		}
 		if r.cfg.Discover {
 			if models, err := local.ListModels(); err == nil {
@@ -1013,10 +1138,11 @@ func (r *Repl) cmdModel(arg string) bool {
 			return false
 		}
 		var cs []choice
+		scale := windowScale(served)
 		for _, m := range served {
-			cs = append(cs, modelChoice(m, m.ID == s.client.Model()))
+			cs = append(cs, modelChoice(m, m.ID == s.client.Model(), scale))
 		}
-		i, perr := pickOne(r.in, cs, pickOpts{title: "model", detail: faint("%d served at %s · enter keeps the current one", len(cs), hostOf(local.Endpoint()))})
+		i, perr := pickOne(r.in, cs, pickOpts{title: "model", detail: faint("%d served at %s"+gSep+"enter keeps the current one", len(cs), hostOf(local.Endpoint()))})
 		if perr != nil || i < 0 || cs[i].id == s.client.Model() {
 			return false
 		}
@@ -1078,7 +1204,7 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 		for i, e := range eps {
 			mark := " "
 			if e == client.Endpoint() {
-				mark = cBold + "→" + cReset
+				mark = cBold + gFlow + cReset
 			}
 			rows = append(rows, []string{mark, faint("%d", i+1), probes[i].glyph(), e, probes[i].detail(e == client.Endpoint(), client.Model())})
 		}
@@ -1087,7 +1213,7 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 		// A one-row picker under a one-row table cannot change anything, so it is
 		// two screens of chrome asking a question with one answer.
 		if len(eps) < 2 {
-			hint("/set endpoints <url>,<url> adds more · /set endpoint <url> moves this one")
+			hint("%s", "/set endpoints <url>,<url> adds more"+gSep+"/set endpoint <url> moves this one")
 			return false
 		}
 		if !r.in.IsTTY() {
@@ -1186,13 +1312,13 @@ func (r *Repl) cmdDiscover(string) bool {
 		idx++
 		detail := m.display()
 		if m.Engine != "" {
-			detail += faint(" · %s", m.Engine)
+			detail += faint(gSep+"%s", m.Engine)
 		}
 		if m.MaxModelLen > 0 {
-			detail += faint(" · ctx %s", kfmt(m.MaxModelLen))
+			detail += faint(gSep+"ctx %s", kfmt(m.MaxModelLen))
 		}
 		if m.GpuCount > 0 {
-			detail += faint(" · %d gpu", m.GpuCount)
+			detail += faint(gSep+"%d gpu", m.GpuCount)
 		}
 		rows = append(rows, []string{healthGlyph(m.Health), faint("%d", idx), fmt.Sprintf("%s:%d", m.Node, m.Port), detail})
 	}

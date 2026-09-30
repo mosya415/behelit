@@ -50,6 +50,8 @@ var errNoTTY = errors.New("no terminal")
 // pick() draws it and feeds it keys and does nothing else, so the behaviour is
 // tested without a tty and the drawing code holds no decisions.
 type pickState struct {
+	title    string // the panel's own title; "" draws no frame at all
+	detail   string
 	rows     []choice
 	view     []int // indices matching filter, in row order
 	cur, top int   // cur indexes view, not rows
@@ -63,7 +65,7 @@ type pickState struct {
 }
 
 func newPickState(cs []choice, o pickOpts) *pickState {
-	p := &pickState{rows: cs, multi: o.multi, height: o.height, hintText: o.hint, sel: map[int]bool{}}
+	p := &pickState{title: o.title, detail: o.detail, rows: cs, multi: o.multi, height: o.height, hintText: o.hint, sel: map[int]bool{}}
 	if p.height <= 0 {
 		p.height = pickHeight()
 	}
@@ -87,14 +89,29 @@ func newPickState(cs []choice, o pickOpts) *pickState {
 	return p
 }
 
-// pickHeight is the viewport: whatever the terminal has minus the chrome around
-// it, and a sane middle when there is no terminal to ask.
+// pickChrome is how many lines lines() draws that are NOT rows: the two courses
+// of the frame, up to two wrapped legend lines, and the "… n more" tail.
+//
+// It has to be paid for. The reserve below was tuned for the old layout, where
+// section() printed the title ABOVE the repainted block and outside it; the frame
+// is built inside lines() now, so every repaint is two lines taller than it was.
+// At ten rows the region became taller than the screen, which scrolls before the
+// "\033[<n>A" executes — the walk-back then lands above where the menu now is and
+// the next repaint's "\r\033[J" erases whatever was there.
+// It counts only the chrome that is ALWAYS there. The highlighted row's own note
+// and warning are extra — up to two wrapped lines each, and only ever on one row
+// — which is why the reserve below keeps four more rows spare on top of it.
+const pickChrome = 5
+
+// pickHeight is the viewport: whatever the terminal has, minus the chrome lines
+// lines() is known to add and the four it may add for the highlighted row's note
+// — and a sane middle when there is no terminal to ask.
 func pickHeight() int {
 	_, rows := osTermSize()
 	if rows <= 0 {
 		return 12
 	}
-	return min(max(rows-8, 5), 20)
+	return min(max(rows-pickChrome-4, 3), 20)
 }
 
 // refilter rebuilds the visible rows and keeps the cursor on the row it was on
@@ -253,7 +270,18 @@ func (p *pickState) lines() []string {
 	// and a served id like qwen3-coder-480b-a35b-instruct plus its window does not
 	// fit in 76. Ellipsizing here is only to stop a wrap, which would desynchronise
 	// the "\033[<n>A" walk-back.
+	// The frame is built INSIDE this function and never around it: pick() walks the
+	// cursor back by exactly len(lines())-1, so the top and bottom courses have to
+	// be lines this function counted, and every row has to be measured against the
+	// frame's inner width rather than the terminal's. A row that wraps
+	// desynchronises the walk-back and the next repaint's "\r\033[J" then erases
+	// whatever was above the menu.
+	framed := p.title != ""
+	pnl := newPanel(p.title, p.detail)
 	w := termWidth()
+	if framed {
+		w = min(termWidth()-2, 76) - 4
+	}
 	labelW := 0
 	for _, i := range p.window() {
 		labelW = max(labelW, visibleWidth(p.rows[i].label))
@@ -261,54 +289,81 @@ func (p *pickState) lines() []string {
 	labelW = min(labelW, 40)
 	var out []string
 	add := func(s string) {
+		// Cut from the RIGHT, not the middle. A row reads left to right in priority
+		// order — the model id, then its window gauge, then the number, then where
+		// the number came from — and middle-ellipsizing took the bite out of the
+		// window column, which is the one thing on the row an operator cannot
+		// guess. What is lost from the right is the family and any annotation, and
+		// the highlighted row's note carries those anyway.
 		if visibleWidth(s) > w {
-			s = ellipsizeMiddle(stripANSI(s), w)
+			s = ellipsize(stripANSI(s), w)
+		}
+		if framed {
+			pnl.Line("%s", s)
+			return
 		}
 		out = append(out, s)
 	}
+	// inside a frame the rows keep their own indent but lose the outer one the
+	// frame now provides
+	lead := "   "
+	if framed {
+		lead = ""
+	}
 	if len(p.view) == 0 {
-		add("   " + faint("nothing matches %q", p.filter))
+		add(lead + faint("nothing matches %q", p.filter))
 	}
 	for _, i := range p.window() {
 		c := p.rows[i]
-		tick := faint("%s", gNone)
+		// [ ] and [*] rather than a bare dot: a tick has to be readable as a tick
+		// with no colour, and a bracket is the only thing that says "this is a box
+		// that is empty" once the green is gone.
+		tick := cFaint + "[ ]" + cReset
 		if p.multi && p.sel[i] || !p.multi && c.on {
-			tick = cGreen + gUp + cReset
+			tick = cGreen + "[" + gUp + "]" + cReset
 		}
 		cursor := " "
 		here := p.cur < len(p.view) && p.view[p.cur] == i
+		label := padTo(c.label, labelW, 0)
 		if here {
-			cursor = cBold + "▸" + cReset
+			// the cursor row's own label is lit too, so "here" is stated twice: with
+			// no colour at all ▸ is the only signal, and with colour the row the keys
+			// will act on should be the row the eye lands on
+			cursor = cYellow + cBold + gCursor + cReset
+			label = cBold + padTo(c.label, labelW, 0) + cReset
 		}
-		add("   " + tick + "  " + cursor + " " + padTo(c.label, labelW, 0) + "  " + c.detail)
+		add(lead + tick + " " + cursor + " " + label + "  " + c.detail)
 		// A note is a sentence, and a sentence cut in the middle is unreadable, so
 		// it WRAPS onto known extra lines instead of being ellipsized like a row.
 		// The line count stays known either way, which is what the walk-back needs.
 		if here && c.note != "" {
-			for i, l := range wrapTo(c.note, w-10) {
-				out = append(out, "        "+faint("%s%s", map[bool]string{true: "↳ ", false: "  "}[i == 0], l))
+			for i, l := range wrapTo(c.note, w-12) {
+				add(lead + "     " + faint("%s%s", map[bool]string{true: gHint + " ", false: strings.Repeat(" ", visibleWidth(gHint)+1)}[i == 0], l))
 			}
 		}
 		if here && c.warn != "" {
-			for i, l := range wrapTo(c.warn, w-10) {
-				lead := "        " + cYellow + gPartial + cReset + " "
+			for i, l := range wrapTo(c.warn, w-12) {
+				mark := cYellow + gPartial + cReset + " "
 				if i > 0 {
-					lead = "          "
+					mark = strings.Repeat(" ", visibleWidth(gPartial)+1)
 				}
-				out = append(out, lead+faint("%s", l))
+				add(lead + "     " + mark + faint("%s", l))
 			}
 		}
 	}
 	if n := len(p.view) - (p.top + p.height); n > 0 {
-		add("   " + faint("… %d more", n))
+		add(lead + faint("%s %d more", gEllipsis, n))
+	}
+	if framed {
+		out = append(out, pnl.Lines()...)
 	}
 	// The legend WRAPS and is never ellipsized: at 80 columns "^a all · ^n none ·
 	// type to filter" was being cut to "^a a…", so the two keys that make a
 	// sixty-model gateway pickable — select-all and the filter — were invisible on
 	// exactly the screens that need them. The line count stays known either way,
 	// which is all the walk-back needs.
-	for i, l := range wrapTo(p.legend(), w-5) {
-		lead := "   " + faint("↳ ")
+	for i, l := range wrapTo(p.legend(), termWidth()-5) {
+		lead := "   " + faint("%s ", gHint)
 		if i > 0 {
 			lead = "     "
 		}
@@ -356,14 +411,17 @@ func (p *pickState) legend() string {
 	}
 	var parts []string
 	if p.filter != "" {
-		parts = append(parts, fmt.Sprintf("filter %q · ⌫ narrows back · ^u clears", p.filter))
+		parts = append(parts, fmt.Sprintf("filter %q"+gSep+"%s narrows back"+gSep+"^u clears", p.filter, gBack))
 	}
-	parts = append(parts, "↑↓ move")
+	// "arrow keys move", not "↑↓ move": the legend is the only place these keys are
+	// documented, and on a locale that never said UTF-8 the two arrows arrive as
+	// mojibake — while a rune swap reads as "updn move", which is worse than both.
+	parts = append(parts, "arrow keys move")
 	if p.multi {
-		parts = append(parts, fmt.Sprintf("space ticks · %d chosen", len(p.result())), "^a all", "^n none")
+		parts = append(parts, fmt.Sprintf("space ticks"+gSep+"%d chosen", len(p.result())), "^a all", "^n none")
 	}
 	parts = append(parts, "type to filter", "enter confirms", "ctrl-c aborts")
-	return strings.Join(parts, " · ")
+	return strings.Join(parts, gSep)
 }
 
 // keyName turns one byte (reading more when it is ESC) into pickState's key
@@ -445,9 +503,10 @@ func pick(in *Input, cs []choice, o pickOpts) ([]int, error) {
 	if !in.IsTTY() {
 		return nil, errNoTTY
 	}
-	if o.title != "" {
-		section(o.title, o.detail)
-	}
+	// no section() here any more: the title is set into the panel's own top course
+	// by pickState.lines(), so it repaints with the rows instead of sitting above
+	// them at a different width
+	fmt.Println()
 	p := newPickState(cs, o)
 	// A scripted Input has no terminal discipline to switch off, so raw mode is
 	// neither possible nor needed; a real one that refuses it (Windows) gets the
@@ -489,6 +548,11 @@ func pick(in *Input, cs []choice, o pickOpts) ([]int, error) {
 // It exists so the non-unix build stays usable and so a terminal that refuses
 // raw mode gets an answer instead of a hang.
 func pickCooked(in *Input, p *pickState) ([]int, error) {
+	// the cooked path scrolls, so it gets the lintel and not a frame: a frame
+	// reprinted on every bad answer would stack boxes down the screen
+	if p.title != "" {
+		section(p.title, p.detail)
+	}
 	for {
 		for i, c := range p.rows {
 			mark := " "
@@ -498,11 +562,11 @@ func pickCooked(in *Input, p *pickState) ([]int, error) {
 			fmt.Printf("   %s %2d  %s  %s\n", mark, i+1, c.label, c.detail)
 		}
 		if p.multi {
-			hint("numbers, comma-separated (e.g. 1,3) · empty keeps the marked ones")
+			hint("%s", "numbers, comma-separated (e.g. 1,3)"+gSep+"empty keeps the marked ones")
 		} else {
-			hint("one number · empty keeps the marked one")
+			hint("%s", "one number"+gSep+"empty keeps the marked one")
 		}
-		fmt.Print("  " + cFaint + "›" + cReset + " ")
+		fmt.Print("  " + cFaint + gPrompt + cReset + " ")
 		line, err := in.ReadString('\n')
 		if err != nil && strings.TrimSpace(line) == "" {
 			return nil, errPickCancel
@@ -560,7 +624,7 @@ func pickOne(in *Input, cs []choice, o pickOpts) (int, error) {
 func askSecret(in *Input, prompt string) (string, error) {
 	ed := NewLineEditor(in)
 	ed.bare, ed.noHistory, ed.secret = true, true, true
-	line, err := ed.ReadLine("  "+cFaint+"›"+cReset+" "+prompt, "")
+	line, err := ed.ReadLine("  "+cFaint+gPrompt+cReset+" "+prompt, "")
 	if err != nil {
 		return "", err
 	}
@@ -573,7 +637,7 @@ func ask(in *Input, ed *LineEditor, prompt, cur string) (string, error) {
 	if ed == nil {
 		ed = NewLineEditor(in)
 	}
-	line, err := ed.ReadLine("  "+cFaint+"›"+cReset+" "+prompt, cur)
+	line, err := ed.ReadLine("  "+cFaint+gPrompt+cReset+" "+prompt, cur)
 	if err != nil {
 		return "", err
 	}
@@ -601,7 +665,7 @@ func confirm(in *Input, question string, def bool) (bool, error) {
 	if def {
 		legend = "[Y/n]"
 	}
-	fmt.Printf("\n  %s %s%s%s %s›%s ", question, cFaint, legend, cReset, cFaint, cReset)
+	fmt.Printf("\n  %s %s%s%s %s%s%s ", question, cFaint, legend, cReset, cFaint, gPrompt, cReset)
 	// Anything typed before the question appeared is not an answer to it: set it
 	// aside and give it back afterwards, exactly as Approver.Confirm does. With no
 	// terminal behind the Input there is no "before" — a scripted session's buffer

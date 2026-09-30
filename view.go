@@ -29,15 +29,21 @@ type View interface {
 	Check(cmd string, exit int, d time.Duration, attempt, attempts int) // a verifier run
 }
 
-// checkLine renders one verifier run: ✓ go test ./...  1.2s
+// checkText renders one verifier run: go test ./...  PASS  1.2s
+//
+// The verdict is a WORD now. ✓ and ✗ were two more runes for an idea the tree
+// already had two of, both charged a column they do not occupy, and neither
+// survives a locale that never said UTF-8 — while PASS and FAIL are what an
+// operator reads out loud, and the command they belong to is printed verbatim
+// before them because the verifier, not the model, is what decided.
 func checkText(cmd string, exit int, d time.Duration, attempt, attempts int) string {
 	switch {
 	case exit == 0:
-		return cGreen + "✓" + cReset + " " + cmd + "  " + faint("%s", fmtDurShort(d))
+		return cmd + "  " + cGreen + cBold + "PASS" + cReset + faint("  %s", fmtDurShort(d))
 	case attempt < attempts:
-		return cRed + "✗" + cReset + " " + cmd + "  " + faint("exit %d · %s · output sent back, attempt %d/%d", exit, fmtDurShort(d), attempt+1, attempts)
+		return cmd + "  " + cRed + cBold + "FAIL" + cReset + faint("  exit %d"+gSep+"%s"+gSep+"output sent back, attempt %d/%d", exit, fmtDurShort(d), attempt+1, attempts)
 	default:
-		return cRed + "✗" + cReset + " " + cmd + "  " + faint("exit %d · %s", exit, fmtDurShort(d))
+		return cmd + "  " + cRed + cBold + "FAIL" + cReset + faint("  exit %d"+gSep+"%s", exit, fmtDurShort(d))
 	}
 }
 
@@ -88,8 +94,8 @@ func (v *termView) Stream() StreamView {
 
 func (v *termView) ToolStart(name, summary string) {
 	switch name {
-	case "edit", "write", "run_command":
-		return // the approval prompt / live output stands in for a marker
+	case "run_command":
+		return // runCommand prints its own ^ header with the command on it
 	case "todowrite":
 		return // the list itself is printed on update
 	}
@@ -136,7 +142,7 @@ func (v *termView) ToolDone(name string, args Args, res string) {
 		}
 		switch r.Status {
 		case "passed":
-			toolOK(fmt.Sprintf("verified and applied %s", plural(files, "file", "files")))
+			toolLoot(fmt.Sprintf("verified and applied %s", plural(files, "file", "files")))
 		case "unverified":
 			toolInfo(fmt.Sprintf("%s changed, not applied — no check_cmd to verify it", plural(files, "file", "files")))
 		case "not_applied":
@@ -156,16 +162,45 @@ func (v *termView) ToolDone(name string, args Args, res string) {
 	}
 }
 
-func (v *termView) Note(text string) { sayLine(" " + faint("%s %s", gNone, text)) }
-func (v *termView) Warn(text string) { sayLine(" " + warn("%s", text)) }
+// Note, Warn and Error each take the row back from a live waiting marker before
+// they print. A gateway retry or a fallback fires exactly while the model is
+// being waited on, and appended to the flame's row it put two class glyphs on one
+// line — which is the one line on the screen where the left column is not a map.
+// markerRowLead erases that row; the spinner redraws itself one row down on its
+// next tick, so the hazard line keeps the gutter to itself.
+func (v *termView) Note(text string) { sayLine(markerRowLead() + " " + faint("%s %s", gNone, text)) }
+
+// Warn carries the partial glyph, so "being handled" is distinguishable from
+// "bookkeeping" (Note) and from "over" (Error) with no colour at all.
+func (v *termView) Warn(text string) {
+	sayLine(markerRowLead() + " " + cYellow + gPartial + " " + text + cReset)
+}
 
 // Error prints the failure in red and any following lines as hints.
 func (v *termView) Error(text string) {
 	first, rest, _ := strings.Cut(text, "\n")
-	out := " " + cRed + gDown + " " + first + cReset
+	out := markerRowLead() + " " + cRed + gDown + " " + first + cReset
+	// The hint lines DO wrap, unlike hint() itself: these are hints.go's sentences
+	// about what to do next, and the longest of them is 109 columns, so the one
+	// screen that only ever appears when something has already gone wrong was also
+	// the one that spilled. They are sentences and not commands to paste, so a line
+	// break inside one costs nothing; the ↳ stays on the first row and the rest is
+	// indented under it.
+	room := termWidth() - 5
 	for _, h := range strings.Split(rest, "\n") {
-		if h != "" {
-			out += "\n   " + faint("↳ %s", h)
+		if h == "" {
+			continue
+		}
+		ls := []string{h}
+		if room > 24 && visibleWidth(h) > room {
+			ls = wrapTo(h, room)
+		}
+		for i, l := range ls {
+			mark := gHint + " "
+			if i > 0 {
+				mark = strings.Repeat(" ", visibleWidth(gHint)+1)
+			}
+			out += "\n   " + faint("%s%s", mark, l)
 		}
 	}
 	sayLine(out)
@@ -181,7 +216,7 @@ func (v *termView) Todos(t []Todo) {
 	printTodos(t)
 }
 func (v *termView) Check(cmd string, exit int, d time.Duration, attempt, attempts int) {
-	sayLine(" " + faint("%s verify", gNone) + "   " + checkText(cmd, exit, d, attempt, attempts))
+	sayLine(markerRowLead() + " " + cDim + gGate + cReset + " " + cDim + padTo("verify", 8, 0) + cReset + " " + checkText(cmd, exit, d, attempt, attempts))
 }
 func (v *termView) Live() io.Writer                      { return lockedWriter{os.Stdout} }
 func (v *termView) Begin()                               {}
@@ -202,13 +237,13 @@ func printTodos(t []Todo) {
 	for _, x := range t {
 		switch x.Status {
 		case "completed":
-			fmt.Println("   " + cGreen + "✓" + cReset + " " + faint("%s", x.Content))
+			fmt.Println("   " + cGreen + gUp + cReset + " " + faint("%s", x.Content))
 		case "in_progress":
-			fmt.Println("   " + cYellow + "▸" + cReset + " " + cBold + x.Content + cReset)
+			fmt.Println("   " + cYellow + gCursor + cReset + " " + cBold + x.Content + cReset)
 		case "cancelled":
-			fmt.Println("   " + faint("✕ %s", x.Content))
+			fmt.Println("   " + faint("%s %s", gDown, x.Content))
 		default:
-			fmt.Println("   " + faint("○") + " " + x.Content)
+			fmt.Println("   " + faint("%s", gPending) + " " + x.Content)
 		}
 	}
 }
@@ -230,11 +265,11 @@ func (nullStream) End() []string    { return nil }
 
 // Subagent output is a small tree under the call that started it:
 //
-//	┌ coder · t1 · qwen3-coder-480b-a35b-instruct
-//	│ Sum in sum.go skips negative numbers; make it add all of them.
-//	│ read    sum.go
-//	│ ✓ go test ./...  1.2s
-//	└ ● passed · 2.9s
+//	> ┌ coder · t1 · qwen3-coder-480b-a35b-instruct
+//	  │ t1 Sum in sum.go skips negative numbers; make it add all of them.
+//	  │ t1 . read    sum.go
+//	  = t1 go test ./...  PASS  1.2s
+//	< └ t1 ● passed · 2.9s
 //
 // Parallel subagents interleave by line; the id on the frame lines and the
 // tag on each inner line tell them apart.
@@ -242,12 +277,18 @@ func (v *childView) tag() string {
 	return cFaint + v.s.ID + cReset + " "
 }
 
-func (v *childView) line(glyph, text string) {
+func (v *childView) line(glyph, text string) { v.markLine(" ", glyph, text) }
+
+// markLine is line with the outer map column filled in: > going down into the
+// passage, < coming back out, blank while we are inside it. The spine itself
+// stays a spine and is never boxed — a parallel subagent's first line would cut
+// a box in half and it would never close.
+func (v *childView) markLine(mark, glyph, text string) {
 	w := termWidth() - 10
 	if w > 20 && visibleWidth(text) > w {
 		text = ellipsize(stripANSI(text), w)
 	}
-	sayLine("   " + cFaint + glyph + cReset + " " + text)
+	sayLine(" " + cYellow + mark + cReset + " " + cFaint + glyph + cReset + " " + text)
 }
 
 func (v *childView) Stream() StreamView { return nullStream{} }
@@ -256,40 +297,40 @@ func (v *childView) ToolStart(name, summary string) {
 	if v.quiet {
 		return
 	}
-	v.line("│", v.tag()+faint("%-7s", toolVerb(name))+" "+summary)
+	v.line(gVBar, v.tag()+toolGutterTone(name)+toolGutter(name)+cReset+" "+faint("%-7s", toolVerb(name))+" "+summary)
 }
 
 func (v *childView) ToolDone(name string, args Args, res string) {
 	if strings.HasPrefix(res, "error:") && !v.quiet {
-		v.line("│", v.tag()+cRed+gDown+cReset+" "+faint("%s", summarize(strings.TrimSpace(strings.TrimPrefix(res, "error:")))))
+		v.line(gVBar, v.tag()+cRed+gDown+cReset+" "+faint("%s", summarize(strings.TrimSpace(strings.TrimPrefix(res, "error:")))))
 	}
 }
 
 func (v *childView) Note(text string) {
 	if !v.quiet {
-		v.line("│", v.tag()+faint("%s", text))
+		v.line(gVBar, v.tag()+faint("%s", text))
 	}
 }
-func (v *childView) Warn(text string)  { v.line("│", v.tag()+warn("%s", text)) }
-func (v *childView) Error(text string) { v.line("│", v.tag()+cRed+text+cReset) }
+func (v *childView) Warn(text string)  { v.line(gVBar, v.tag()+warn("%s", text)) }
+func (v *childView) Error(text string) { v.line(gVBar, v.tag()+cRed+text+cReset) }
 func (v *childView) Check(cmd string, exit int, d time.Duration, attempt, attempts int) {
-	v.line("│", v.tag()+checkText(cmd, exit, d, attempt, attempts))
+	v.line(gGate, v.tag()+checkText(cmd, exit, d, attempt, attempts))
 }
 func (v *childView) Perf(u Usage)    {}
 func (v *childView) Todos(t []Todo)  {}
 func (v *childView) Live() io.Writer { return nil }
 
 func (v *childView) Begin() {
-	head := cDim + v.s.agent.Name + cReset + faint(" · %s · %s", v.s.ID, v.s.client.Model())
+	head := cDim + v.s.agent.Name + cReset + faint(gSep+"%s"+gSep+"%s", v.s.ID, v.s.client.Model())
 	if v.quiet {
-		head += faint(" · background")
+		head += faint("%s", gSep+"background")
 	}
-	v.line("┌", head)
+	v.markLine(gDeeper, gFrameTop, head)
 	if v.quiet && v.s.title != "" { // a foreground call already showed its task on the line above
-		v.line("│", v.tag()+faint("%s", v.s.title))
+		v.line(gVBar, v.tag()+faint("%s", v.s.title))
 	}
 }
 
 func (v *childView) Finish(state string, d time.Duration) {
-	v.line("└", v.tag()+statusWord(state)+faint(" · %s", fmtDurShort(d)))
+	v.markLine(gOut, gFrameBot, v.tag()+statusWord(state)+faint(gSep+"%s", fmtDurShort(d)))
 }

@@ -844,10 +844,15 @@ func TestSetupConfiguresADownGatewayByHand(t *testing.T) {
 // run: an anonymous gateway went 1/7 → 3/7, `/setup models` opened on 3/7, and
 // 7/7 was followed by two more screens.
 func TestSetupStepNumbersMatchTheStepsThatRun(t *testing.T) {
+	// A screen title is chrome and the stone around it belongs to the theme: the
+	// lintel spells it "══ SETUP  3/6 …" and a framed screen "╔═ SETUP ═ 3/6 …".
+	// The TITLE and its numbers are the meaning, so that is what is matched and the
+	// frame is allowed to be whatever is drawn.
+	reHead := regexp.MustCompile(`^[^A-Za-z0-9]*SETUP\b`)
 	headers := func(out string) []string {
 		var hs []string
 		for _, l := range strings.Split(stripANSI(out), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(l), "── SETUP") {
+			if reHead.MatchString(strings.TrimSpace(l)) {
 				hs = append(hs, strings.TrimSpace(l))
 			}
 		}

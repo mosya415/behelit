@@ -2879,7 +2879,7 @@ func TestModelPickerFallsBackWithoutTTY(t *testing.T) {
 			t.Errorf("/model lost its %s row off a terminal:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "↑↓ move") || strings.Contains(out, "enter confirms") {
+	if strings.Contains(out, "arrow keys move") || strings.Contains(out, "enter confirms") {
 		t.Errorf("/model drew a picker with no terminal:\n%s", out)
 	}
 	if h.sess.client.Model() != before {

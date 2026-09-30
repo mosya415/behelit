@@ -40,7 +40,7 @@ func (r *Repl) cmdRole(arg string) bool {
 		if len(fields) > 2 {
 			return r.cmdRole(strings.Join(append([]string{name}, fields[2:]...), " "))
 		}
-		hint("/role %s model <name[,fallback]> gives it a model · /role save writes roles.yaml", name)
+		hint("/role %s model <name[,fallback]> gives it a model"+gSep+"/role save writes roles.yaml", name)
 		return false
 	}
 
@@ -48,7 +48,7 @@ func (r *Repl) cmdRole(arg string) bool {
 	a := o.agents[name]
 	if a == nil {
 		errLine("no role or agent %q", name)
-		hint("/role lists them · /role new %s creates one", name)
+		hint("/role lists them"+gSep+"/role new %s creates one", name)
 		return false
 	}
 	if len(fields) == 1 {
@@ -202,7 +202,7 @@ func (r *Repl) cmdRole(arg string) bool {
 		a.Tools, a.ToolsSet = tools, true
 	default:
 		errLine("don't know how to set %q", key)
-		hint("model · tier · effort · temperature · top_p · context · steps · check · review · fork · tools · use")
+		hint("%s", "model"+gSep+"tier"+gSep+"effort"+gSep+"temperature"+gSep+"top_p"+gSep+"context"+gSep+"steps"+gSep+"check"+gSep+"review"+gSep+"fork"+gSep+"tools"+gSep+"use")
 		return false
 	}
 	// the running session picks the change up immediately
@@ -215,8 +215,8 @@ func (r *Repl) cmdRole(arg string) bool {
 		r.sess.RefreshSystem()
 	}
 	o.rec.Event("role_change", map[string]any{"role": name, "key": key, "value": value})
-	okLine("%s · %s = %s", name, key, value)
-	hint("/role %s shows it · /role save keeps it in roles.yaml", name)
+	okLine("%s"+gSep+"%s = %s", name, key, value)
+	hint("/role %s shows it"+gSep+"/role save keeps it in roles.yaml", name)
 	return false
 }
 
@@ -243,21 +243,21 @@ func (r *Repl) showRoles() bool {
 		if a.ToolsSet {
 			tools = strconv.Itoa(len(a.Tools))
 		}
-		ctx := "—"
+		ctx := gNil
 		if a.Context > 0 {
 			ctx = kfmt(a.Context)
 		}
-		rows = append(rows, []string{mark, a.Name, strings.Join(a.Models, faint(" → ")), firstNonEmpty(a.Thinking, "—"), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, "—"))})
+		rows = append(rows, []string{mark, a.Name, strings.Join(a.Models, faint(" %s ", gFlow)), firstNonEmpty(a.Thinking, gNil), ctx, tools, faint("%s", firstNonEmpty(a.CheckCmd, gNil))})
 	}
 	table([]string{"", "role", "models", "effort", "context", "tools", "check"}, rows)
-	hint("/role <name> <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value> — e.g. model <m1,m2> · effort high · check \"go test ./...\" · use")
-	hint("/role save writes the team to .lca/roles.yaml · /delegate <role> <task> hands one task over")
+	hint("%s", "/role <name> <model|tier|effort|temperature|top_p|context|steps|check|review|fork|tools|use> <value> — e.g. model <m1,m2>"+gSep+"effort high"+gSep+"check \"go test ./...\""+gSep+"use")
+	hint("%s", "/role save writes the team to .lca/roles.yaml"+gSep+"/delegate <role> <task> hands one task over")
 	return false
 }
 
 func (r *Repl) showRole(a *Agent) bool {
 	section("role", a.Name)
-	row("models", firstNonEmpty(strings.Join(a.Models, faint(" → ")), faint("inherits the caller's")))
+	row("models", firstNonEmpty(strings.Join(a.Models, faint(" %s ", gFlow)), faint("inherits the caller's")))
 	row("effort", firstNonEmpty(a.Thinking, faint("provider default")))
 	temp, topP := faint("model default"), faint("model default")
 	if a.Temperature != nil {
@@ -266,7 +266,7 @@ func (r *Repl) showRole(a *Agent) bool {
 	if a.TopP != nil {
 		topP = strconv.FormatFloat(*a.TopP, 'f', -1, 64)
 	}
-	row("sampling", fmt.Sprintf("temperature %s · top_p %s", temp, topP))
+	row("sampling", fmt.Sprintf("temperature %s"+gSep+"top_p %s", temp, topP))
 	if a.Context > 0 {
 		row("context", kfmt(a.Context))
 	}
@@ -346,7 +346,7 @@ func (r *Repl) offerRoleValue(a *Agent, key string) (string, bool) {
 		// a real no-op, and anything else says what it costs.
 		if a.Tier != "" {
 			cs = append(cs, choice{id: keepTierID + a.Tier, label: "keep tier " + a.Tier,
-				detail: strings.Join(r.orch.roles.Tiers[a.Tier], faint(" → ")), on: true, seq: 1})
+				detail: strings.Join(r.orch.roles.Tiers[a.Tier], faint(" %s ", gFlow)), on: true, seq: 1})
 		}
 		for _, m := range served {
 			c := modelChoice(m, a.Tier == "" && seq[m.ID] > 0)
@@ -382,7 +382,7 @@ func (r *Repl) offerRoleValue(a *Agent, key string) (string, bool) {
 		}
 		var cs []choice
 		for _, t := range o.roles.TierOrder {
-			cs = append(cs, choice{id: t, label: t, detail: strings.Join(o.roles.Tiers[t], faint(" → ")), on: t == a.Tier})
+			cs = append(cs, choice{id: t, label: t, detail: strings.Join(o.roles.Tiers[t], faint(" %s ", gFlow)), on: t == a.Tier})
 		}
 		i, err := pickOne(r.in, cs, pickOpts{title: "role " + a.Name, detail: faint("which tier's chain it runs")})
 		if err != nil || i < 0 {
@@ -407,7 +407,7 @@ func (r *Repl) cmdDelegate(arg string) bool {
 	role, task, _ := strings.Cut(strings.TrimSpace(arg), " ")
 	if role == "" || strings.TrimSpace(task) == "" {
 		errLine("usage: /delegate <role> <task>")
-		hint("/roles lists the roles · the role's check_cmd decides when it's done")
+		hint("%s", "/roles lists the roles"+gSep+"the role's check_cmd decides when it's done")
 		return false
 	}
 	if a := r.orch.agents[role]; a == nil || !a.IsRole {

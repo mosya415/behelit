@@ -828,7 +828,7 @@ func (wf *Workflow) plan() [][]string {
 		if s.Kind == stepDelegate && wf.attempts > 1 {
 			attempts = fmt.Sprintf("%d × %d = %d", s.Retries+1, wf.attempts, (s.Retries+1)*wf.attempts)
 		}
-		to := "—"
+		to := gNil
 		if s.Timeout > 0 {
 			to = s.Timeout.String() // a per-step bound is minutes, not milliseconds
 		}
@@ -838,7 +838,7 @@ func (wf *Workflow) plan() [][]string {
 		}
 		role := orDash(s.Role)
 		if s.reviewer != "" {
-			role += " → " + s.reviewer
+			role += " " + gFlow + " " + s.reviewer
 		}
 		// The member column is always present: -dry-run is where an operator reads
 		// what will run where.
@@ -858,7 +858,7 @@ func orTierNone(s string) string {
 
 func orDash(s string) string {
 	if s == "" {
-		return "—"
+		return gNil
 	}
 	return s
 }
@@ -1391,7 +1391,7 @@ func (r *wfRunner) Run(ctx context.Context) int {
 		}()
 	}
 
-	section("run", r.wf.Name+" · "+r.st.Run)
+	section("run", r.wf.Name+gSep+r.st.Run)
 	r.st.Status = "running"
 	r.save()
 
@@ -1402,7 +1402,7 @@ func (r *wfRunner) Run(ctx context.Context) int {
 			r.st.Cursor, r.st.Status, halted = i, "paused", "paused"
 			r.log.header("== paused before %s ==", s.Name)
 			r.save()
-			hint("paused before %s · resume: lca run %s -resume", s.Name, r.st.Run)
+			hint("paused before %s"+gSep+"resume: lca run %s -resume", s.Name, r.st.Run)
 			break
 		}
 		if r.stop.Load() || ctx.Err() != nil {
@@ -1500,7 +1500,7 @@ func (r *wfRunner) headline(s *WorkflowStep, cmd string) string {
 }
 
 func (r *wfRunner) announce(i int, s *WorkflowStep, detail string) {
-	fmt.Printf("  %s%s%s %s  %s %s %s\n", cYellow, "▸", cReset,
+	fmt.Printf("  %s%s%s %s  %s %s %s\n", cYellow, gCursor, cReset,
 		faint("%d/%d", i+1, len(r.wf.Steps)), padTo(s.Name, 12, 0), faint("%-8s", s.Kind), detail)
 }
 
@@ -1521,7 +1521,7 @@ func (r *wfRunner) report(s *WorkflowStep, o stepOutcome, d time.Duration) {
 	if det := firstLine(o.Detail); o.Status == stepFailed && det != "" {
 		bits = append(bits, truncate(det, 60))
 	}
-	fmt.Println(line + faint("%s", strings.Join(bits, " · ")))
+	fmt.Println(line + faint("%s", strings.Join(bits, gSep)))
 }
 
 // stepStatusWord is not statusWord (repl.go): that vocabulary is
@@ -1537,8 +1537,96 @@ func stepStatusWord(status string) string {
 	}
 }
 
+// mapStrip is the run as a corridor of rooms: one cell per step, in the order
+// they are attempted, with its COUNTS beside it. It is drawn from r.st.Steps and
+// makes no claim the table below it does not already make — it only makes the
+// shape of the run visible without counting rows.
+//
+// The counts are not optional and the key is gone. A gauge may not be a picture
+// with no number, and a row of unexplained brackets is exactly that: the key used
+// to be dropped first, which meant it appeared and disappeared with the
+// workflow's length and was unreachable from four steps up, while the counts —
+// the part that actually says something — were never printed at all. The key's
+// glyphs are the same ones the status column below uses, so the table is its key.
+//
+// Width is given up in this order: the corridors between the rooms, then the
+// strip folds onto as many whole-cell rows as it needs. What never happens is a
+// "[" on one row and its "]" on the next, which is what panelSplit did to it from
+// thirteen steps up: a map that cuts a room in half is not a map.
+func (r *wfRunner) mapStrip(width int) []string {
+	var cells []string
+	ok, failed, skipped, unentered := 0, 0, 0, 0
+	for i := range r.wf.Steps {
+		status := ""
+		if i < len(r.st.Steps) {
+			status = r.st.Steps[i].Status
+		}
+		switch status {
+		case stepOK:
+			ok++
+			cells = append(cells, cGreen+"["+gUp+"]"+cReset)
+		case stepSkipped:
+			skipped++
+			cells = append(cells, cFaint+"["+gNone+"]"+cReset)
+		case "":
+			unentered++
+			cells = append(cells, cFaint+"[ ]"+cReset)
+		default:
+			failed++
+			cells = append(cells, cRed+"["+gDown+"]"+cReset)
+		}
+	}
+	if len(cells) == 0 {
+		return nil
+	}
+	// Only the categories that happened, in the tally's own words and order: a zero
+	// is not news, and the shorter the counts the more room is left for the
+	// corridors between the rooms. A completed run reads "5 ok".
+	parts := []string{fmt.Sprintf("%d ok", ok)}
+	for _, c := range []struct {
+		n    int
+		word string
+	}{{failed, "failed"}, {skipped, "skipped"}, {unentered, "not entered"}} {
+		if c.n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", c.n, c.word))
+		}
+	}
+	counts := faint("%s", strings.Join(parts, gSep))
+	tail := "   " + counts
+	room := width - visibleWidth(counts) - 3
+	corridor := cFaint + strings.Repeat(gRule, 2) + cReset
+	for _, joiner := range []string{corridor, ""} {
+		strip := strings.Join(cells, joiner)
+		if visibleWidth(strip) <= room {
+			return []string{strip + tail}
+		}
+	}
+	// Still too wide: the counts take the first row on their own and the rooms
+	// follow, three columns each, as many per row as the frame holds.
+	per := max(1, width/3)
+	out := []string{strings.TrimSpace(counts)}
+	for i := 0; i < len(cells); i += per {
+		out = append(out, strings.Join(cells[i:min(i+per, len(cells))], ""))
+	}
+	return out
+}
+
 func (r *wfRunner) summary() {
-	section("steps")
+	pnl := newPanel("steps")
+	pnl.tag(r.st.Run)
+	// No map where there is no screen: `lca run nightly | head` is a machine path,
+	// and a corridor of block-bracketed rooms in it is new decoration. The table
+	// below states every one of the same facts in words.
+	if activeTheme.Frames {
+		for i, l := range r.mapStrip(nominalContent() - 10) {
+			if i == 0 {
+				pnl.Row("map", l)
+			} else {
+				pnl.Line("%-10s%s", "", l)
+			}
+		}
+	}
+	pnl.Div("")
 	rows := [][]string{}
 	ok, failed, skipped := 0, 0, 0
 	for _, ss := range r.st.Steps {
@@ -1553,13 +1641,15 @@ func (r *wfRunner) summary() {
 		rows = append(rows, []string{ss.Name, ss.Kind, orDash(ss.Role), stepStatusWord(ss.Status),
 			fmtDurShort(time.Duration(ss.DurationMs) * time.Millisecond), strconv.Itoa(ss.Attempts), truncate(firstLine(ss.Detail), 40)})
 	}
-	table([]string{"step", "kind", "role", "status", "time", "tries", "detail"}, rows)
+	pnl.Table([]string{"step", "kind", "role", "status", "time", "tries", "detail"}, rows, pnl.width()-4)
+	fmt.Println()
+	pnl.Print()
 	tally := fmt.Sprintf("%d/%d ok", ok, len(r.wf.Steps))
 	if failed > 0 {
-		tally += fmt.Sprintf(" · %d failed", failed)
+		tally += fmt.Sprintf(gSep+"%d failed", failed)
 	}
 	if skipped > 0 {
-		tally += fmt.Sprintf(" · %d skipped", skipped)
+		tally += fmt.Sprintf(gSep+"%d skipped", skipped)
 	}
 	if failed > 0 || r.st.Status == "interrupted" {
 		errLine("%s", tally)
@@ -2308,7 +2398,7 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 
 	if *dry {
-		section("plan", wf.Name+" · "+shortDir(wf.Path))
+		section("plan", wf.Name+gSep+shortDir(wf.Path))
 		if wf.Desc != "" {
 			row("about", wf.Desc)
 		}
@@ -2478,7 +2568,7 @@ func printWorkflows(cfg Config) {
 			rows = append(rows, []string{wf.Name, plural(len(wf.Steps), "step", "steps"), shortDir(filepath.Dir(wf.Path)), wf.Desc})
 		}
 		table([]string{"name", "steps", "from", "description"}, rows)
-		hint("lca run <name> [-var k=v …] · -dry-run prints the plan")
+		hint("%s", "lca run <name> [-var k=v …]"+gSep+"-dry-run prints the plan")
 	}
 	for _, w := range warns {
 		warnLine("%s", w)
@@ -2505,5 +2595,5 @@ func printRuns(cfg Config) {
 	for _, w := range warns {
 		warnLine("%s", w)
 	}
-	hint("resume one: lca run <runid> -resume · pause: lca run <runid> -pause")
+	hint("%s", "resume one: lca run <runid> -resume"+gSep+"pause: lca run <runid> -pause")
 }

@@ -101,7 +101,7 @@ func (r *Repl) cmdConfig(arg string) bool {
 			if s.Kind == kLocator {
 				src += "  (read-only)"
 			} else if _, ok := r.unsaved[s.Key]; ok {
-				src += " · unsaved"
+				src += gSep + "unsaved"
 			}
 			rows = append(rows, crow{g, s.Key, r.shownSetting(s.Key), src})
 			keyW, srcW = max(keyW, visibleWidth(s.Key)), max(srcW, visibleWidth(src))
@@ -133,12 +133,12 @@ func (r *Repl) cmdConfig(arg string) bool {
 		}
 	}
 	fmt.Println()
-	hint("/set <key> <value> writes %s · /set -user … writes %s",
+	hint("/set <key> <value> writes %s"+gSep+"/set -user … writes %s",
 		prettyPath(r.projectConfigPath(), r.orch.jl.Root), prettyPath(r.userConfigPath(), r.orch.jl.Root))
 	if n := len(r.unsaved); n > 0 {
-		hint("/save keeps this session's %s · an env var overrides a file for one run", plural(n, "unsaved change", "unsaved changes"))
+		hint("/save keeps this session's %s"+gSep+"an env var overrides a file for one run", plural(n, "unsaved change", "unsaved changes"))
 	} else {
-		hint("an env var overrides a file for one run · /setup rebuilds the whole team")
+		hint("%s", "an env var overrides a file for one run"+gSep+"/setup rebuilds the whole team")
 	}
 	return false
 }
@@ -160,7 +160,7 @@ func (r *Repl) shownSetting(key string) string {
 	switch key {
 	case "model":
 		if a != nil && len(a.Models) > 0 {
-			return strings.Join(a.Models, faint(" → "))
+			return strings.Join(a.Models, faint(" %s ", gFlow))
 		}
 	case "tier":
 		if t := r.sess.tier(); t != "" {
@@ -215,7 +215,7 @@ func (r *Repl) explainSetting(key string) bool {
 	s := findSetting(key)
 	if s == nil {
 		errLine("don't know the setting %q", key)
-		hint("%s", strings.Join(settingKeys(), " · "))
+		hint("%s", strings.Join(settingKeys(), gSep))
 		return false
 	}
 	section("setting", s.Key)
@@ -252,13 +252,13 @@ func (r *Repl) explainSetting(key string) bool {
 func (s setting) accepts() string {
 	switch s.Kind {
 	case kEnum:
-		return strings.Join(s.Enum, " · ")
+		return strings.Join(s.Enum, gSep)
 	case kInt:
 		return "a whole number"
 	case kFloat:
 		return "a number 0…2, or \"unset\""
 	case kBool:
-		return "on · off"
+		return "on" + gSep + "off"
 	case kList:
 		return "names, comma-separated"
 	case kSecret:
@@ -296,7 +296,7 @@ func (r *Repl) cmdSet(arg string) bool {
 	s := findSetting(name)
 	if s == nil {
 		errLine("don't know the setting %q", name)
-		hint("%s", strings.Join(settingKeys(), " · "))
+		hint("%s", strings.Join(settingKeys(), gSep))
 		return false
 	}
 	if len(rest) == 1 {
@@ -357,7 +357,7 @@ func (r *Repl) cmdSet(arg string) bool {
 	okLine("wrote %s   %s", prettyPath(written, r.orch.jl.Root), faint("%s", s.JSON))
 	hint("rewritten as canonical JSON — key order and spacing change, values do not")
 	if s.Kind == kSecret {
-		warnLine("wrote api_key to %s in plain text · mode 0600", prettyPath(written, r.orch.jl.Root))
+		warnLine("wrote api_key to %s in plain text"+gSep+"mode 0600", prettyPath(written, r.orch.jl.Root))
 		warnLine("anything that can read that file can read the key, and it will show in `git diff`")
 		// Both files, because the backup written beside it carries the same key and is
 		// the one an operator never thinks to ignore.
@@ -482,6 +482,8 @@ func (r *Repl) applyLive(s *setting, value string) error {
 		r.orch.jl.SetAllowed(next.Allowed)
 	case "cmd_timeout":
 		cmdTimeout = time.Duration(next.CmdTimeout) * time.Second
+	case "theme":
+		applyTheme(next.Theme)
 	}
 	r.cfg = next
 	r.syncCfg()
@@ -561,7 +563,7 @@ func (r *Repl) cmdSave(arg string) bool {
 		s := findSetting(k)
 		if s == nil {
 			errLine("don't know the setting %q — nothing was written", k)
-			hint("%s", strings.Join(settingKeys(), " · "))
+			hint("%s", strings.Join(settingKeys(), gSep))
 			return false
 		}
 		if s.JSON == "" {
@@ -662,7 +664,7 @@ func (r *Repl) cmdTier(arg string) bool {
 	o := r.orch
 	if o.roles == nil || len(o.roles.TierOrder) == 0 {
 		errLine("this team declares no tiers")
-		hint("tiers: in .lca/roles.yaml names model chains roles can share · /setup offers them")
+		hint("%s", "tiers: in .lca/roles.yaml names model chains roles can share"+gSep+"/setup offers them")
 		return false
 	}
 	name := strings.TrimSpace(arg)
@@ -674,14 +676,14 @@ func (r *Repl) cmdTier(arg string) bool {
 				if t == o.roles.Tier {
 					mark = cGreen + gUp + cReset
 				}
-				fmt.Printf("  %s %s  %s\n", mark, t, faint("%s", strings.Join(o.roles.Tiers[t], " → ")))
+				fmt.Printf("  %s %s  %s\n", mark, t, faint("%s", strings.Join(o.roles.Tiers[t], " "+gFlow+" ")))
 			}
-			hint("/tier <name> switches · tiers: %s", o.roles.tierList())
+			hint("/tier <name> switches"+gSep+"tiers: %s", o.roles.tierList())
 			return false
 		}
 		cs := []choice{{id: "", label: "none", detail: faint("each role runs the tier it declares"), on: o.roles.Tier == ""}}
 		for _, t := range o.roles.TierOrder {
-			cs = append(cs, choice{id: t, label: t, detail: strings.Join(o.roles.Tiers[t], faint(" → ")), on: t == o.roles.Tier})
+			cs = append(cs, choice{id: t, label: t, detail: strings.Join(o.roles.Tiers[t], faint(" %s ", gFlow)), on: t == o.roles.Tier})
 		}
 		i, err := pickOne(r.in, cs, pickOpts{title: "tier", detail: faint("every tier-declaring role runs this chain")})
 		if err != nil || i < 0 {

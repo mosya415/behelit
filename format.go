@@ -141,7 +141,7 @@ func modelTable(ms []ModelInfo, current string) []string {
 	for _, m := range ms {
 		mark := " "
 		if m.ID == current {
-			mark = cBold + "→" + cReset
+			mark = cBold + gFlow + cReset
 		}
 		line := fmt.Sprintf("  %s%s%s %s %s", cGreen, gUp, cReset, mark, m.ID)
 		if d := describeModel(m); d != "" {
@@ -233,6 +233,19 @@ func printPerf(u Usage) {
 		s := kfmt(u.PromptTokens) + " in"
 		if u.CachedTokens > 0 {
 			s += fmt.Sprintf(" (%d%% cached)", u.CacheHitPct())
+			// The cache gauge has a real denominator — the prompt this turn actually
+			// sent — so it is allowed to be a picture, and its number is already the
+			// parenthesis in front of it.
+			//
+			// It is INLINE and not a second row, which is where the mockup drew it,
+			// because printPerf runs once per model CALL and not once per turn: a
+			// five-call turn was spending ten rows on accounting around four rows of
+			// work. And it is drawn only where there is a screen — a redirected
+			// one-shot's payload gained twelve block runes per call, which is new
+			// decoration in the one path the brief says must stay clean.
+			if g := gaugePct(u.CachedTokens, u.PromptTokens, 12, cGreen); g != "" {
+				s += " " + g
+			}
 		}
 		parts = append(parts, s)
 	}
@@ -246,7 +259,9 @@ func printPerf(u Usage) {
 	if u.TTFT >= 50*time.Millisecond {
 		parts = append(parts, "first token "+fmtDurShort(u.TTFT))
 	}
-	fmt.Println("   " + faint("%s", strings.Join(parts, " · ")))
+	// The cost line opens with the map's cost glyph, so a turn's price is findable
+	// by scanning one column instead of reading every line.
+	fmt.Println(" " + cDim + gCost + cReset + " " + faint("%s", strings.Join(parts, gSep)))
 }
 
 // kfmt formats a token count compactly: 873, 12.3k, 128k.
