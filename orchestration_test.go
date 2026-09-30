@@ -1232,3 +1232,123 @@ func TestAgentWithEmptyToolListHasNoTools(t *testing.T) {
 		}
 	}
 }
+
+// An interrupt must be written into the transcript, not only printed. Ctrl-C used
+// to leave the model's own "I'll continue reading the files" and its todo list as
+// the last thing in the conversation, so the operator's next message — even
+// "hello" — made it resume the abandoned work, on whatever endpoint was current
+// by then. That burned a production model's capacity for real.
+func TestInterruptIsWrittenIntoTheTranscript(t *testing.T) {
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		return fakeReply{content: "I'll read the rest of the files now.",
+			calls: []ToolCall{call("c1", "run_command", map[string]any{"command": "sleep 5"})}}
+	})
+	h := newHarness(t, fs.URL, "native", true)
+	h.orch.jl.Allowed = append(h.orch.jl.Allowed, "sleep")
+	h.orch.jl, _ = NewJail(h.root, append(h.orch.jl.Allowed, "sleep"), false)
+
+	h.sess.Msgs = append(h.sess.Msgs, Message{Role: "user", Content: "read everything"})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel() // the operator's Ctrl-C
+	}()
+	if err := h.sess.Run(ctx); err == nil {
+		t.Fatal("an interrupted run returns context.Canceled")
+	}
+
+	last := h.sess.Msgs[len(h.sess.Msgs)-1]
+	if last.Role != "user" || !strings.Contains(last.Content, "ABANDONED") {
+		t.Fatalf("the transcript does not record the interrupt; it ends with %s: %q",
+			last.Role, truncate(last.Content, 80))
+	}
+	// and it tells the model the three ways "continue anyway" happens
+	for _, want := range []string{"plan", "todo", "tool calls"} {
+		if !strings.Contains(last.Content, want) {
+			t.Errorf("the note does not mention the %s", want)
+		}
+	}
+}
+
+// A working directory that disappeared under a running session ends the turn with
+// one message. It used to be rediscovered by every tool the model tried: read,
+// list, then `ls`, then `go version`, each failing with its own ENOENT.
+func TestVanishedRootEndsTheTurnOnce(t *testing.T) {
+	root := t.TempDir()
+	gone := filepath.Join(root, "project")
+	os.MkdirAll(gone, 0o755)
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply {
+		if n == 1 {
+			return fakeReply{content: "looking", calls: []ToolCall{
+				call("c1", "read_file", map[string]any{"path": "a.txt"}),
+				call("c2", "list_dir", map[string]any{"path": "."}),
+			}}
+		}
+		return fakeReply{content: "done"}
+	})
+	h := newHarness(t, fs.URL, "native", true)
+	h.orch.jl.Root = gone // the session's tree…
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	} // …and it is gone
+
+	h.sess.Msgs = append(h.sess.Msgs, Message{Role: "user", Content: "read a.txt"})
+	if err := h.sess.Run(context.Background()); err != nil {
+		t.Fatalf("the turn should end cleanly, not error: %v", err)
+	}
+	var told int
+	for _, m := range h.sess.Msgs {
+		if m.Role == "tool" && strings.Contains(m.Content, "no longer exists") {
+			told++
+		}
+	}
+	if told == 0 {
+		t.Fatal("the model was never told the directory is gone")
+	}
+	if n := len(fs.reqs()); n > 2 {
+		t.Errorf("the turn kept going: %d requests, want the turn to stop", n)
+	}
+}
+
+// Ctrl-C at an approval question means "stop", not "kill lca" and not "no to this
+// one". The prompt runs with the ordinary terminal discipline so the answer is
+// readable and echoed, which leaves ISIG live — and before this an unhandled
+// SIGINT ended the process where the operator only wanted to abandon a command.
+func TestCtrlCAtTheApprovalDoorEndsTheTurn(t *testing.T) {
+	ap := NewApprover(newStringInput(""))
+	ap.interrupted.Store(true) // as the signal handler does
+	if !ap.TakeInterrupt() {
+		t.Fatal("the interrupt must be readable by the loop")
+	}
+	if ap.TakeInterrupt() {
+		t.Fatal("and readable exactly once, or every later denial looks like a Ctrl-C")
+	}
+}
+
+// Switching endpoints carries the whole conversation to the new deployment. When
+// it holds an abandoned turn, the operator has to be told: this is how a stopped
+// task got resumed on a different production model.
+func TestEndpointSwitchWarnsAboutAnAbandonedTurn(t *testing.T) {
+	fs := newFakeServer(t, func(req fakeRequest, n int) fakeReply { return fakeReply{content: "ok"} })
+	h := newHarness(t, fs.URL, "native", true)
+	r := &Repl{cfg: h.orch.cfg, orch: h.orch, sess: h.sess, local: h.orch.providers.local, in: newStringInput("")}
+
+	h.sess.Msgs = append(h.sess.Msgs,
+		Message{Role: "user", Content: "read everything"},
+		Message{Role: "assistant", Content: "I'll continue reading the files."},
+		Message{Role: "user", Content: interruptNote})
+	out := stripANSI(captureStdout(t, func() { r.noteCarriedConversation(fs.URL) }))
+	if !strings.Contains(out, "conversation moves with you") {
+		t.Errorf("the operator is not told the transcript travels:\n%s", out)
+	}
+	if !strings.Contains(out, "interrupted") {
+		t.Errorf("the abandoned turn is not mentioned:\n%s", out)
+	}
+
+	// A message of their own after the interrupt means they moved on: no warning.
+	h.sess.Msgs = append(h.sess.Msgs, Message{Role: "user", Content: "now do something else"})
+	out = stripANSI(captureStdout(t, func() { r.noteCarriedConversation(fs.URL) }))
+	if strings.Contains(out, "interrupted") {
+		t.Errorf("stale warning after the operator moved on:\n%s", out)
+	}
+}

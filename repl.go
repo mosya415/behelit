@@ -1277,6 +1277,7 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 		client.SetModel(m)
 		row("model", m)
 	}
+	r.noteCarriedConversation(prev)
 	if r.cfg.Discover {
 		for _, n := range reconcileModel(r.orch.providers, client, r.orch.rec) {
 			fmt.Println("  " + n)
@@ -1287,6 +1288,35 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 		relearnCtxLen(client)
 	}
 	return false
+}
+
+// noteCarriedConversation says what a new endpoint inherits. Switching the
+// endpoint does not start a new conversation: the whole transcript goes to the
+// new deployment, whose prefix cache is cold, and an abandoned turn inside it
+// will be resumed by the next model that reads it. That has cost an operator a
+// production model's capacity: they stopped a task, moved the endpoint, typed
+// "hello", and the new model carried on with the old plan.
+func (r *Repl) noteCarriedConversation(prev string) {
+	turns := 0
+	abandoned := false
+	for _, m := range r.sess.Msgs {
+		if m.Role == "assistant" {
+			turns++
+		}
+		if m.Role == "user" && m.Content == interruptNote {
+			abandoned = true
+		} else if m.Role == "user" && !strings.HasPrefix(m.Content, "[") {
+			abandoned = false // a later message of their own: they moved on
+		}
+	}
+	if turns == 0 {
+		return
+	}
+	hint("the conversation moves with you: %s, ~%s — the new endpoint's prefix cache is cold",
+		plural(turns, "reply", "replies"), kfmt(estimateTokens(r.sess.Msgs)))
+	if abandoned {
+		warnLine("it still holds a turn you interrupted — /reset before your next message, or the new model may pick it up")
+	}
 }
 
 // relearnCtxLen asks the current endpoint what window it serves the current model

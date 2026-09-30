@@ -231,16 +231,17 @@ type Session struct {
 	LastReason string // reasoning captured in the last run (/think last)
 	title      string // subagent: the task description
 
-	mu         sync.Mutex
-	todos      []Todo
-	inbox      []string // results of finished background subagents
-	bgRunning  int
-	wake       chan struct{}
-	recent     []string // signatures of recent tool calls (doom-loop detection)
-	stats      SessionStats
-	running    atomic.Bool
-	background bool // runs detached from the terminal: can't prompt for approval
-	lastUsage  Usage
+	mu                sync.Mutex
+	todos             []Todo
+	inbox             []string // results of finished background subagents
+	bgRunning         int
+	wake              chan struct{}
+	recent            []string // signatures of recent tool calls (doom-loop detection)
+	stats             SessionStats
+	running           atomic.Bool
+	interruptedAtDoor atomic.Bool // Ctrl-C answered an approval question
+	background        bool        // runs detached from the terminal: can't prompt for approval
+	lastUsage         Usage
 }
 
 // NewPrimary creates the REPL / one-shot session.
@@ -838,6 +839,12 @@ func (s *Session) Run(ctx context.Context) error {
 			if n := len(s.Msgs); n > 0 && s.Msgs[n-1].Role == "assistant" {
 				s.Msgs[n-1].ToolCalls = nil
 			}
+			// Ctrl-C used to leave the abandoned work standing in the transcript: the
+			// model's own "I'll continue reading the files" and its todo list were the
+			// last thing in the conversation, so the operator's NEXT message — even
+			// "hello" — made it resume, on whatever endpoint was current by then. The
+			// stop has to be written down, not only printed.
+			s.noteInterrupted()
 			s.view.Note("interrupted")
 			s.traceTurn(step, res, fallbacks, turnStart, nil, context.Canceled)
 			s.event("interrupt", map[string]any{"partial_bytes": len(res.Content)})
@@ -947,6 +954,8 @@ func (s *Session) Run(ctx context.Context) error {
 			if n := s.BackgroundRunning(); n > 0 {
 				s.view.Note(fmt.Sprintf("waiting for %d background subagent(s)…", n))
 				if !s.waitBackground(ctx) {
+					s.noteInterrupted()
+					s.saveTranscript()
 					return context.Canceled
 				}
 				step-- // waiting isn't a model step
@@ -969,10 +978,20 @@ func (s *Session) Run(ctx context.Context) error {
 		}
 		s.traceTurn(step, res, fallbacks, turnStart, calls, nil)
 		s.appendResults(calls, results)
-		s.saveTranscript()
+		if s.interruptedAtDoor.Swap(false) {
+			s.noteInterrupted()
+			s.view.Note("interrupted")
+			s.saveTranscript()
+			return context.Canceled
+		}
 		if ctx.Err() != nil {
+			// Stopped while a tool was running — the commonest Ctrl-C of all, and the
+			// one that left the abandoned plan standing.
+			s.noteInterrupted()
+			s.saveTranscript()
 			return ctx.Err()
 		}
+		s.saveTranscript()
 	}
 	s.saveTranscript()
 	return nil
@@ -1090,6 +1109,23 @@ func (s *Session) extractCalls(m Message) []pendingCall {
 
 const malformedPrefix = "[protocol error]"
 
+// noteInterrupted writes the stop into the transcript, once. Idempotent because
+// two exits can both be reached on the way out of one turn.
+func (s *Session) noteInterrupted() {
+	if n := len(s.Msgs); n > 0 && s.Msgs[n-1].Role == "user" && s.Msgs[n-1].Content == interruptNote {
+		return
+	}
+	s.Msgs = append(s.Msgs, Message{Role: "user", Content: interruptNote})
+}
+
+// interruptNote is what the transcript says where the turn stopped. It is
+// addressed to the model, so it names every way "continue anyway" tends to
+// happen: the plan, the todo list, and the tool call that was about to run.
+const interruptNote = "[The user pressed Ctrl-C and stopped the turn above. That work is ABANDONED. " +
+	"Do not resume it, do not carry on with its plan or its todo list, and do not make the tool calls it was " +
+	"about to make. Answer the user's next message on its own terms; if they want the abandoned work continued, " +
+	"they will ask for it.]"
+
 // countToolTagOpens counts lines that open a tool tag (the parser's view of
 // the text, reasoning stripped).
 func countToolTagOpens(text string) int {
@@ -1113,6 +1149,22 @@ func countToolTagOpens(text string) int {
 // execCalls runs a reply's tool calls. If every call is parallel-safe (reads,
 // searches, subagents) they run concurrently; otherwise in order, so approvals
 // and side effects stay sequential. Results keep the call order.
+// rootGone reports the working directory having disappeared under a running
+// session — the project deleted or moved, a mount lost — as one message for the
+// model and the operator. Only local trees: a member's directory is probed by
+// the member's own gate, which says which machine it was.
+func (s *Session) rootGone() string {
+	if s.remote() != nil {
+		return ""
+	}
+	root := s.jail().Root
+	if st, err := os.Stat(root); err == nil && st.IsDir() {
+		return ""
+	}
+	return fmt.Sprintf("error: the working directory %s no longer exists — nothing can run here. "+
+		"Start lca again from a directory that exists; this session's transcript is saved.", root)
+}
+
 func (s *Session) execCalls(ctx context.Context, calls []pendingCall, stop *atomic.Bool) []string {
 	results := make([]string, len(calls))
 	parallel := len(calls) > 1
@@ -1124,6 +1176,18 @@ func (s *Session) execCalls(ctx context.Context, calls []pendingCall, stop *atom
 		if c.def != nil && c.def.Name == "task" {
 			hasTask = true
 		}
+	}
+	// A vanished working directory is not a per-tool failure: without it nothing
+	// can run, and a model told "no such file" five times will keep inventing new
+	// ways to look. One honest error, and the turn ends.
+	if msg := s.rootGone(); msg != "" {
+		for i := range calls {
+			results[i] = msg
+			calls[i].failed, calls[i].errText = true, msg
+		}
+		s.view.Error(strings.TrimPrefix(msg, "error: "))
+		stop.Store(true)
+		return results
 	}
 	// Subagents run for a while: let Ctrl-C cancel them (and this turn).
 	batchCtx, cancel := context.WithCancel(ctx)
@@ -1300,6 +1364,12 @@ func (tc *ToolCtx) Ask(permission, pattern, header, preview string) (string, boo
 		s.event("auto_approve", map[string]any{"permission": permission, "pattern": pattern})
 	}
 	if !ok {
+		if s.orch.ap.TakeInterrupt() {
+			// Ctrl-C at the door is "stop", not "no to this one": end the turn the way
+			// any other interrupt does, with the abandonment written down.
+			s.interruptedAtDoor.Store(true)
+			return "error: [interrupted by the user at the approval prompt — nothing ran]", false
+		}
 		return "user denied this action (" + header + ")", false
 	}
 	return "", true

@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // The soft gate. Permission rules (permission.go) decide allow / deny / ask;
@@ -60,7 +63,15 @@ type Approver struct {
 	trusted  map[string]bool // trusted classes: "edit", "run", "web", …
 	all      bool            // "a" / -y: trust every class, including ones not listed
 	quiet    bool            // don't print auto-approvals (unattended runs: eval)
+	// interrupted: Ctrl-C was pressed at a question. The turn ends; the loop takes
+	// this with TakeInterrupt.
+	interrupted atomic.Bool
 }
+
+// TakeInterrupt reports (once) that the operator pressed Ctrl-C at a question.
+// The loop reads it to end the turn: answering "no" to one command and stopping
+// the whole turn are different intentions, and Ctrl-C is the second.
+func (a *Approver) TakeInterrupt() bool { return a.interrupted.Swap(false) }
 
 func NewApprover(in *Input) *Approver {
 	return &Approver{in: in, trusted: map[string]bool{}}
@@ -196,9 +207,33 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 	a.in.Drain()
 	stashed := a.in.TakePending()
 	defer a.in.Put(stashed)
-	line, err := a.in.ReadString('\n')
-	if err != nil {
+	// Ctrl-C while the question is open means "stop", not "kill the program". The
+	// prompt runs with the ordinary terminal discipline (that is what makes the
+	// answer readable and echoed), so ISIG is live and an unhandled SIGINT would
+	// end the process where the operator expected to abandon one command.
+	sigch := make(chan os.Signal, 1)
+	signal.Notify(sigch, os.Interrupt)
+	defer signal.Stop(sigch)
+	type answer struct {
+		line string
+		err  error
+	}
+	got := make(chan answer, 1)
+	go func() {
+		l, e := a.in.ReadString('\n')
+		got <- answer{l, e}
+	}()
+	var line string
+	select {
+	case <-sigch:
+		a.interrupted.Store(true)
+		fmt.Println("   " + warn("%s interrupted — nothing ran", gDown))
 		return false, false
+	case res := <-got:
+		if res.err != nil {
+			return false, false
+		}
+		line = res.line
 	}
 	approved, trustAll, note := doorAnswer(line, writeDoor)
 	if trustAll {
