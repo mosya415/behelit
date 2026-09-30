@@ -132,6 +132,25 @@ func (r *Repl) cmdConfig(arg string) bool {
 			hint("%s says %s = %s — the environment wins", prettyPath(path, r.orch.jl.Root), s.Key, s.showFileValue(fileVal))
 		}
 	}
+	// The mcp credentials, by NAME and by whether they are exported. Nothing else on
+	// this screen mentions them, so the only way to learn a token was missing was to
+	// make the model try — and the answer is one row of the screen the operator is
+	// already reading. The value is never printed, because there is nowhere in this
+	// program a token is printed.
+	if r.orch.mcp.configured() {
+		fmt.Printf("  %s%s%s\n", cDim, "MCP", cReset)
+		for _, name := range r.orch.mcp.order {
+			sv := r.orch.mcp.servers[name]
+			for _, h := range append(append([]MCPHeader(nil), sv.Headers...), sv.Env...) {
+				state := cRed + "NOT SET" + cReset
+				if h.set() {
+					state = "set"
+				}
+				fmt.Printf("  %s  %s  %s\n", padTo("token", keyW, 0),
+					padTo(fmt.Sprintf("$%s → %s", h.EnvVar, state), valW, 0), faint("%s", name))
+			}
+		}
+	}
 	fmt.Println()
 	hint("/set <key> <value> writes %s"+gSep+"/set -user … writes %s",
 		prettyPath(r.projectConfigPath(), r.orch.jl.Root), prettyPath(r.userConfigPath(), r.orch.jl.Root))
@@ -204,6 +223,18 @@ func markRoleSources(srcs map[string]settingSource, root string, roles *RolesCon
 
 // fileValue is what the config files say about one JSON key, whatever is
 // actually in force.
+// mcpSettingHint answers "/set mcp jira" with a pointer instead of twenty scalar
+// names. An mcp server is not a setting — a server definition must not be
+// writable from one line at a prompt — but the operator who typed that was asking
+// a real question and the settings list does not answer it.
+func mcpSettingHint(key string) bool {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), "mcp") {
+		return false
+	}
+	hint("%s", "mcp servers are configured in the mcp block of .lca/config.json, not with /set"+gSep+"/mcp shows what is there")
+	return true
+}
+
 func (r *Repl) fileValue(jsonKey string) (string, string) {
 	if jsonKey == "" || r.orch.fc == nil {
 		return "", ""
@@ -215,6 +246,9 @@ func (r *Repl) explainSetting(key string) bool {
 	s := findSetting(key)
 	if s == nil {
 		errLine("don't know the setting %q", key)
+		if mcpSettingHint(key) {
+			return false
+		}
 		hint("%s", strings.Join(settingKeys(), gSep))
 		return false
 	}
@@ -296,6 +330,9 @@ func (r *Repl) cmdSet(arg string) bool {
 	s := findSetting(name)
 	if s == nil {
 		errLine("don't know the setting %q", name)
+		if mcpSettingHint(name) {
+			return false
+		}
 		hint("%s", strings.Join(settingKeys(), gSep))
 		return false
 	}
@@ -526,9 +563,13 @@ func applyApproveTo(ap *Approver, mode string) {
 		ap.TrustAll()
 	case "off":
 		ap.Clear()
-	case "run", "edit", "web":
+	case "run", "edit", "web", "mcp":
 		ap.Trust(mode)
 	}
+	// "mcp-write" is intentionally NOT a case here. A config file that could
+	// persist it would authorise ticket writes for every future run in that
+	// directory — the same foot-gun the settings table already refuses for unsafe.
+	// /approve mcp-write is typed at the terminal, for one session.
 }
 
 // ── /save ───────────────────────────────────────────────────────────────────

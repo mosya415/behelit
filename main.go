@@ -74,6 +74,9 @@ func main() {
 	}
 	defer orch.rec.Close()
 	defer orch.tracer.Close()
+	// A stdio MCP server is a child process of ours: reap it on the way out, the
+	// same way the recorder and the tracer are closed.
+	defer orch.CloseMCP()
 	local := orch.providers.local
 
 	// Model: -model > LCA_MODEL when it names a provider > config "model" > the
@@ -116,7 +119,16 @@ func main() {
 	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions)
 
 	if prompt != "" {
-		os.Exit(oneShot(orch, sess, prompt, *checkFlag, append(notes, orch.warnings...)))
+		code := oneShot(orch, sess, prompt, *checkFlag, append(notes, orch.warnings...))
+		// os.Exit runs no defers, and a one-shot has the same things to close as a
+		// session: the stdio MCP children first, because they are PROCESSES and a leaked
+		// one outlives lca along with its process group, then the trace and the audit
+		// log. Ctrl-C during a one-shot took this path too.
+		orch.rec.Event("session_end", nil)
+		orch.CloseMCP()
+		orch.tracer.Close()
+		orch.rec.Close()
+		os.Exit(code)
 	}
 
 	// roles.yaml owns the entry role's chain, its effort and the transport, and
@@ -212,6 +224,19 @@ func setupOrchestrator(cfg Config, ap *Approver, tracePath string) (*Orchestrato
 // ONE audit log and ONE trace: rotating them mid-session would make /report
 // render half a conversation.
 func buildOrchestrator(cfg Config, ap *Approver, rec *Recorder, tracer *Tracer) (*Orchestrator, error) {
+	// The config file is read FIRST, before the roles, because the mcp block lives
+	// in it and MCP tools have to be in toolRegistry before loadRoles runs:
+	// roles.yaml's tools: list is validated against the registry, so a role that
+	// names jira__issue_get needs the tool to exist by then. Registration is two
+	// file reads and no network, which is what makes that ordering affordable on
+	// every lca, lca doctor, lca run and every eval task.
+	fc, err := loadFileConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	mset, mcpWarns := loadMCP(cfg, fc)
+	mcpWarns = append(mcpWarns, registerMCPTools(mset)...)
+
 	roles, err := loadRoles(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("roles: %w", err)
@@ -226,10 +251,9 @@ func buildOrchestrator(cfg Config, ap *Approver, rec *Recorder, tracer *Tracer) 
 	if roles != nil && roles.Shell {
 		jail.Shell = true
 	}
-	fc, err := loadFileConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("config: %w", err)
-	}
+	// The jail is consulted only when a stdio server is spawned, which is why MCP
+	// could be registered before it existed.
+	mset.jl = jail
 	local := NewClient(cfg)
 	var warns []string
 	gwModels := -1
@@ -237,7 +261,9 @@ func buildOrchestrator(cfg Config, ap *Approver, rec *Recorder, tracer *Tracer) 
 		warns, gwModels = validateRoleModels(roles, local)
 	}
 	orch := NewOrchestrator(cfg, fc, jail, ap, rec, local, roles, tracer)
+	orch.mcp = mset
 	orch.gatewayModels = gwModels
+	warns = append(warns, mcpWarns...)
 	if roles != nil {
 		warns = append(warns, roles.Warnings...)
 	}

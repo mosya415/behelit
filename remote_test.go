@@ -94,6 +94,15 @@ func TestRemotePathStaysInProject(t *testing.T) {
 	}
 }
 
+// remoteRoles is testRoles pointed at a local directory as if it were remote,
+// with edit on the lead: these tests are about the remote file path, and the
+// role's own tools: list is a separate gate that would refuse the call first.
+func remoteRoles(proj string) string {
+	r := strings.Replace(testRoles, "sandbox:\n", "remote:\n  host: \"\"\n  dir: "+proj+"\n  ssh: [sh, -c]\nsandbox:\n", 1)
+	return strings.Replace(r, "tools: [read_file, grep, glob, list_dir, delegate, todowrite]",
+		"tools: [read_file, grep, glob, list_dir, delegate, todowrite, edit, write]", 1)
+}
+
 func TestRemoteSessionEditAndVerify(t *testing.T) {
 	proj := t.TempDir()
 	os.WriteFile(filepath.Join(proj, "sum.py"), []byte("def total(xs):\n    return sum(x for x in xs if x > 0)\n"), 0o644)
@@ -110,7 +119,10 @@ func TestRemoteSessionEditAndVerify(t *testing.T) {
 		return fakeReply{calls: []ToolCall{call("r", "read_file", map[string]any{"path": "sum.py"})}}
 	})
 	fs.models = allModels()
-	roles := strings.Replace(testRoles, "sandbox:\n", "remote:\n  host: \"\"\n  dir: "+proj+"\n  ssh: [sh, -c]\nsandbox:\n", 1)
+	// The lead has to be allowed to edit: a role's tools: list is enforced at the
+	// CALL and not only in the prefix, so a lead that does not name edit is refused
+	// before the remote path is reached.
+	roles := remoteRoles(proj)
 	h := newRoleHarness(t, fs, roles, true)
 	if h.orch.remote == nil || h.orch.remote.Dir != proj {
 		t.Fatalf("remote not configured: %+v", h.orch.remote)
@@ -147,7 +159,7 @@ func TestRemoteEditRequiresReadFirst(t *testing.T) {
 		return fakeReply{content: "ok"}
 	})
 	fs.models = allModels()
-	roles := strings.Replace(testRoles, "sandbox:\n", "remote:\n  host: \"\"\n  dir: "+proj+"\n  ssh: [sh, -c]\nsandbox:\n", 1)
+	roles := remoteRoles(proj)
 	h := newRoleHarness(t, fs, roles, true)
 	h.run(t, "edit it")
 	if b, _ := os.ReadFile(filepath.Join(proj, "a.txt")); string(b) != "one\n" {

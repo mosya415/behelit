@@ -294,6 +294,18 @@ func (o *Orchestrator) newChild(parent *Session, ag *Agent, desc string) (*Sessi
 	if !mentions(ag.Rules, "task") && !mentions(ag.BaseRules, "task") {
 		child.extra = append(child.extra, Rule{"task", "*", Deny})
 	}
+	// A write leaves this machine and lands in somebody's ticket. An overnight run
+	// must not be able to comment on one because a model thought it would help, and
+	// a background child cannot be asked. This is the single chokepoint — task,
+	// delegate, the delegate reviewer, custom commands and workflow prompt steps all
+	// come through newChild — and the denial is structural rather than a refusal:
+	// toolsFor drops a tool whose permission is Disabled, so an ungranted child
+	// never SEES a write schema, cannot emit a call, cannot be talked into one by
+	// injected ticket text, and costs fewer prefix tokens. The role grants it by
+	// naming the key; nothing else does.
+	if !mentions(ag.Rules, "mcp_write") && !mentions(ag.BaseRules, "mcp_write") {
+		child.extra = append(child.extra, Rule{"mcp_write", "*", Deny})
+	}
 	child.view = newChildView(child, false)
 	if ev, ok := parent.view.(*evalView); ok {
 		child.view = ev // eval output stays compact

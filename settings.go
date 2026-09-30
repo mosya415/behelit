@@ -86,7 +86,14 @@ var settings = []setting{
 
 	{Key: "agent", Aliases: []string{"role"}, JSON: "agent", Env: "LCA_AGENT", Group: "modes", Kind: kStr,
 		Help: "the primary agent or role a session starts as"},
-	{Key: "approve", JSON: "approve", Group: "modes", Kind: kEnum, Enum: []string{"off", "run", "edit", "web", "all"}, Live: true,
+	// "mcp" is CONNECTING to a configured internal server, not writing on one:
+	// mcp-write is terminal-only and deliberately absent here, so a config file
+	// cannot persist a posture that silently authorises ticket writes for every
+	// future run in a directory. There is also no row for the mcp BLOCK itself:
+	// findSetting("mcp") stays nil, loadFileConfig's scalar loop skips it, and
+	// /set mcp … is refused by this table — a server definition must not be
+	// half-written by a one-line command.
+	{Key: "approve", JSON: "approve", Group: "modes", Kind: kEnum, Enum: []string{"off", "run", "edit", "web", "mcp", "all"}, Live: true,
 		Help: "what runs without asking"},
 	{Key: "show_thinking", JSON: "show_thinking", Env: "LCA_SHOW_THINKING", Group: "modes", Kind: kBool, Live: true,
 		Help: "show the model's reasoning in full instead of one status line"},

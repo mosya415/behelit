@@ -375,6 +375,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	all := fs.Bool("all", false, "probe every model in every chain, not just the first of each role")
 	tierFlag := fs.String("tier", "", "run every tier-declaring role on that chain (roles.yaml tiers:)")
 	memberFlag := fs.String("member", "", "probe only this member (roles.yaml members:)")
+	mcpRefresh := fs.Bool("mcp-refresh", false, "rewrite .lca/mcp.lock.json from what each mcp server serves now")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -383,6 +384,28 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	cfg.Tier = firstNonEmpty(*tierFlag, cfg.Tier)
 	failed := false
 	fail := func(format string, a ...any) { failed = true; errLine(format, a...) }
+
+	// MCP first, before loadRoles below, for the same reason buildOrchestrator does
+	// it in that order: roles.yaml's tools: list is validated against toolRegistry,
+	// so a role naming jira__issue_get needs the tool to exist by then. It is two
+	// file reads and no network — -no-probe stays literally true.
+	var mset *MCPSet
+	var mcpWarns []string
+	dfc, derr := loadFileConfig(cfg)
+	if derr != nil {
+		// The error must not be dropped. Dropped, doctor printed no MCP section and no
+		// message at all for a typo in the mcp block — and then loadRoles ran with an
+		// empty registry, so every role naming an mcp tool failed below as "unknown
+		// tool" and sent the operator to roles.yaml for a mistake in config.json. This
+		// is the command whose job is saying exactly what to fix, and it comes first
+		// because everything after it is a consequence.
+		section("config")
+		fail("%v", derr)
+		hint("fix that first — until the file parses, no mcp tool is registered, so a role naming one fails as \"unknown tool\" below")
+	} else {
+		mset, mcpWarns = loadMCP(cfg, dfc)
+		mcpWarns = append(mcpWarns, registerMCPTools(mset)...)
+	}
 
 	section("gateway")
 	gw := NewClient(cfg)
@@ -531,7 +554,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	// The fleet as the runtime will resolve it, built once: the checks below all
 	// ask questions about a member, and two orchestrators could answer them
 	// differently.
-	orch := doctorOrchestrator(cfg, roles)
+	orch := doctorOrchestrator(cfg, roles, mset)
 
 	// A role's check_cmd meets the sandbox of the machine that role works on, not
 	// the team's: a verifier the allowlist refuses fails every delegation to that
@@ -712,6 +735,14 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 				hint("delegate is off on the old remote: block (its worktree would be local) — move it into members: for cross-machine worktrees")
 			}
 		}
+	}
+
+	// MCP. Skipped entirely when no mcp block exists, and it honours -no-probe: an
+	// operator who asked for configuration checks only must not have had a
+	// connection opened on their behalf, on a host whose security team watches for
+	// exactly that.
+	if orch != nil && mcpDoctor(ctx, orch, roles, mcpWarns, *noProbe, *mcpRefresh) {
+		failed = true
 	}
 
 	// Workflows. A file that does not parse, or whose steps name a role, a member,
@@ -1000,8 +1031,10 @@ func memberAllowlist(cfg Config, roles *RolesConfig, m *Member) []string {
 // doctorOrchestrator is the fleet as the runtime resolves it, without starting a
 // session: doctor must report the members that will actually be used (including
 // the one LCA_REMOTE alone defines), not just what roles.yaml spelled out.
-func doctorOrchestrator(cfg Config, roles *RolesConfig) *Orchestrator {
-	o := &Orchestrator{agents: map[string]*Agent{}}
+func doctorOrchestrator(cfg Config, roles *RolesConfig, mset *MCPSet) *Orchestrator {
+	// cfg, because with no roles.yaml doctor still has to name the one agent there is
+	// (cfg.Agent) when it reports what that agent's request prefix carries.
+	o := &Orchestrator{cfg: cfg, agents: map[string]*Agent{}, mcp: mset}
 	if roles != nil {
 		o.roles = roles
 		// Only the roles, not the markdown agents: what a workflow's steps name is
@@ -1019,6 +1052,9 @@ func doctorOrchestrator(cfg Config, roles *RolesConfig) *Orchestrator {
 		jl.Shell = true
 	}
 	o.jl = jl
+	if mset != nil {
+		mset.jl = jl // consulted only when a stdio server is spawned
+	}
 	return o
 }
 

@@ -26,6 +26,7 @@ trail come from the process (uid/gid) for free.
 - [Through the gateway](#through-the-gateway--gwpolicygo-chatgo) — the cacheable prefix, [failure policy](#gateway-failure-policy), transports, per-model settings
 - [Measuring runs](#measuring-runs--the-trace-lca-eval-lca-report) — the trace, `lca eval`, `lca report`
 - [The sandbox](#the-sandbox--jailgo-toolsgo) — allowlist, shell mode, the GPU policy
+- [Internal MCP servers](#internal-mcp-servers--mcpgo-mcpclientgo-mcpcmdgo) — the host allowlist, the pinned tool manifest, read vs. write, `/mcp`
 - [Deterministic workflows — `lca run`](#deterministic-workflows--lca-run-workflowgo)
 - [Working on other machines: the fleet](#working-on-other-machines-the-fleet--membersgo-remotego)
 - [Agents & orchestration](#agents--orchestration--agentsgo-enginego-taskgo) — agents, [`task` vs. `delegate`](#the-task-tool-vs-delegate), skills, commands, permissions
@@ -801,6 +802,150 @@ through the scheduler: `srun`/`sbatch`/`salloc`/`torchrun`/`deepspeed`/`accelera
 and `bsk gw` (gateway administration) is off-limits — in unsafe mode too, per
 chained command segment.
 
+## Internal MCP servers — `mcp.go`, `mcpclient.go`, `mcpcmd.go`
+
+Your own servers, on your own network: an internal Jira, an internal build
+service. No marketplace, no discovery, no `npx`. Two questions decide
+everything — **what can this reach** and **what can this change** — and both are
+answered in a reviewable file, enforced in one place each, and printed by `/mcp`.
+
+```json
+{
+  "mcp": {
+    "allow_hosts": ["jira.corp.example:443"],
+    "allow_cidrs": ["10.0.0.0/8"],
+    "stdio": "deny",
+    "trust_annotations": false,
+    "servers": {
+      "jira": {
+        "transport": "http",
+        "url": "https://jira.corp.example/mcp",
+        "headers": {"Authorization": "Bearer ${env:JIRA_MCP_TOKEN}"},
+        "ca_file": "/etc/corp/ca-root.pem",
+        "timeout": 20,
+        "expose":    ["issue_search", "issue_get", "issue_create", "issue_comment_add"],
+        "read_only": ["issue_search", "issue_get"]
+      }
+    }
+  },
+  "permission": {"mcp_write": {"*": "ask"}}
+}
+```
+
+Then, once: `/mcp refresh`. Tools appear as `jira__issue_get`, and a role names
+them in its `tools:` list like any other tool.
+
+**Nothing is discovered at startup.** The tool schemas come from
+`.lca/mcp.lock.json`, written only by `/mcp refresh` — the same house rule
+`delegate` already follows: *registration, never a network probe, because the
+tool schema is part of the cached prefix and must not depend on whether a host
+answered.* So a session opens no connection until the model wants one, `/mcp`
+opens none at all, and the request prefix is a function of committed files
+rather than of network weather. A server whose tools change mid-session fails
+its calls with a message naming `/mcp refresh`, and never changes the prefix.
+
+A `url:` may not carry a username or password: Go would send it as an
+`Authorization: Basic` header and `mcp.lock.json` would record it in the clear.
+Credentials live in `headers`, as `${env:VAR}` references, and nowhere else.
+
+**Reachability.** Only a host:port literally on `allow_hosts` may be contacted —
+no wildcards, `"*"` refused by name, an empty list meaning nothing is reachable.
+The resolved address is checked again in the dialer against `allow_cidrs`, with
+link-local (the metadata address), multicast and `0.0.0.0` always refused, and
+loopback refused unless *that* host:port is itself the loopback entry on the
+list. Without `allow_cidrs` the address check catches those cases and not a name
+that moved to some other routable address — which is what `allow_cidrs` is for,
+and `lca doctor` prints what each host resolves to. Every redirect is refused, including a same-host one, because Go would
+forward the `Authorization` header along it. There is no
+`insecure` / `skip_verify` knob at any level: point `ca_file` at your internal
+CA instead. `allow_hosts` governs MCP only — `webfetch` still reaches any host
+with one approval, and `lca doctor` says so out loud.
+
+**Secrets are references, enforced.** Every `headers`/`env` value must be
+`"<literal>${env:VAR}"`; a literal is refused at load. The struct that holds it
+has no field a token can live in, and everything leaving the layer is scrubbed,
+because a 401 body can echo a credential back.
+
+**Writes.** Three permission keys: `mcp` (opening a connection — **ask**, per
+server), `mcp_read` (**allow**), `mcp_write` (**ask**). Read vs. write is the
+operator's `read_only:`/`write:` lists first, then the server's own
+`readOnlyHint` **only** when `trust_annotations` is true (default false — the
+server is the component being guarded against), else a write. There are no name
+heuristics: a name is not a permission.
+
+`-y`, `a` and `approve: all` do **not** reach `mcp_write`; `/approve mcp-write`
+at the terminal is the only standing grant, and a config file cannot persist it.
+At an `mcp_write` door `a` is not even offered: it approves that one write and
+says so, because a keystroke answering a ticket question must not quietly trust
+every later edit and command. A subagent, a delegation, a delegate reviewer and a
+workflow `prompt:` step get `mcp_write: deny` unless the role names the key — so
+the write schema is not in their prefix at all and injected ticket text has
+nothing to aim at.
+
+A role names it in roles.yaml, and a workflow step may grant tools one by one:
+
+```yaml
+roles:
+  ticket-writer:
+    models: [lead-a]
+    mode: subagent
+    tools: [read_file, jira__issue_get, jira__issue_create]
+    permission:
+      mcp_write: ask          # without this key its children get deny
+```
+
+```yaml
+steps:
+  file-the-ticket:
+    prompt: "open one issue for the failure above"
+    role: ticket-writer
+    mcp_write: [jira__issue_create]   # this step only, this tool only
+```
+
+A step's grant is checked against the registry at load, so a typo fails the run
+instead of producing a permission nothing matches.
+
+**Keep it small.** `expose:` is mandatory — there is no "expose everything" —
+and a role's `jira__*` wildcard expands to that server's **read-only** tools
+only, so it can never hand a role the power to change a ticket. A role's `tools:`
+list is a capability and not only a prefix: a tool it does not name is refused at
+the call, not merely left unmentioned. Every exposed tool is another schema in the
+prefix and another chance for an open model to emit an invalid call, which
+`/stats` measures; `lca doctor` prints the schema count per role — in
+single-agent mode too — and warns above six MCP schemas.
+
+**Starting from nothing.** `/mcp` is listed before anything is configured and
+prints the block to write. Leave `"expose": []` until you know the tool names:
+the server loads, registers nothing, and `/mcp refresh` prints what it serves as
+a block to paste (every tool a write until you put it in `read_only:`).
+
+**Seeing it.** `/mcp` lists the servers, their transport and endpoint, the
+handshake result, the tool count and which tools are in *this* session's prefix
+and why not, opening no connections. `/mcp probe` and `lca doctor` are the
+explicit ways to contact one; `lca doctor` resolves each allowed host, checks the
+token's variable, handshakes, compares `tools/list` against the lock, and names
+the fix for each finding. `lca doctor -mcp-refresh` rewrites the lock.
+
+**Recorded.** An MCP call is an ordinary tool call in the trace: arguments
+truncated to 300 bytes, the result a byte count. The audit log gets argument
+**keys**, the host, the env var's **name** and whether it was approved — never a
+value and never the result, because the audit log outlives every transcript.
+Ticket text the model asked for does reach the transcript and the inference
+gateway; that is what asking a model about a ticket means, and `/mcp` says so.
+
+**stdio** is `"deny"` by default and should stay there on a monitored host. When
+allowed, `argv[0]` must be on the sandbox allowlist, there is never a shell, no
+shell metacharacter may appear in `args`, `cmd.Env` is built from scratch, the
+first spawn asks with the full argv, and the child runs in its own process group.
+It is still **not confinement**: `Jail` confines lca's own tools and cannot
+confine a program lca started, the check is on `argv[0]` and not on behaviour,
+and if `python3` or `sh` is on the allowlist a stdio entry is local code
+execution approved once. Run the internal server over HTTP.
+
+Not implemented, and deliberately: `resources/*`, `prompts/*`, sampling,
+elicitation, roots. lca advertises `capabilities: {}` and never opens the
+server's listening stream, so nothing can arrive unbidden.
+
 ## Deterministic workflows — `lca run`, `workflow.go`
 
 Explore with agents, operate with programs. A model is worth its tokens while
@@ -1558,6 +1703,16 @@ someone intends to build:
   whatever the gateway's KV cache gives a byte-stable prefix.
 - **No auth layer, by design.** The process's uid is the identity, the audit log
   is per user, and anyone who can run the binary can do what the sandbox allows.
+- **`read_only:` is an assertion, not a proof.** lca trusts your list above the
+  server's own annotations, so an MCP tool listed there that in fact mutates is
+  called with no approval. That is the point of the setting and also its exposure.
+  `mcp_read` being allow-by-default likewise means a read produces outbound
+  traffic with no prompt once the connection has been approved: injected ticket
+  text can drive further reads on that same allowlisted server. Writes are gated,
+  results are fenced as untrusted data, and `expose:` keeps the surface small —
+  but nothing here stops an agent reading more tickets. There is no certificate
+  pinning, so DNS pointing an allowlisted name at another machine inside an
+  allowed CIDR, with a valid internal certificate, is not detected.
 
 The verifier is a command, not a judge: `check_cmd` exit 0 is the whole definition
 of done, the [review](#cross-family-review) is what stands between that and a
@@ -1622,6 +1777,9 @@ verify.go     verifier loop: check_cmd decides done
 members.go    the fleet: members.yaml block, per-member sandbox, which machine a session uses
 remote.go     one member's transport: ssh reachability gate, remote file tools, remote commands
 workflow.go   lca run: the YAML program, bind-time validation, the runner, state/log/lock/resume
+mcp.go        internal MCP servers: config + validation, the pinned lock, registration, read vs. write
+mcpclient.go  JSON-RPC 2.0 over HTTP (SSE reply shape) and over a child's pipes; the egress chokepoint
+mcpcmd.go     /mcp, /mcp probe, /mcp refresh, and doctor's mcp section
 trace.go      JSONL trace: turns, task outcomes and workflow steps
 eval.go       lca eval: tasks/ runner scored by the verifier, metrics from the trace
 report.go     lca report: the trace as one self-contained HTML file (no JS, no network)

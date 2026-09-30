@@ -102,6 +102,13 @@ func replRegistry() []replCmd {
 		{name: "/tasks", args: "[<id>]", desc: "subagent runs and their results", group: "agents", run: (*Repl).cmdTasks},
 		{name: "/todo", aliases: []string{"/todos"}, desc: "the agent's todo list", group: "agents", run: (*Repl).cmdTodo},
 		{name: "/skills", desc: "skills agents can load", group: "agents", show: func(r *Repl) bool { return len(r.orch.skills) > 0 }, run: (*Repl).cmdSkills},
+		// Always listed, even with nothing configured: gated on configured() it was the
+		// one feature a session never mentioned, so the first step of setting up an
+		// internal server was leaving the product for the README. With no server its
+		// own output is the entry point, and the description doubles as the pointer.
+		{name: "/mcp", args: "[probe|refresh] [<server>]", group: "agents",
+			desc: "internal MCP servers (Jira and the like): the hosts they may reach and the tools this role can use",
+			run:  (*Repl).cmdMCP},
 
 		{name: "/retry", desc: "regenerate the last answer", group: "turn", run: (*Repl).cmdRetry},
 		{name: "/edit", desc: "edit and resend your last message", group: "turn", run: (*Repl).cmdEdit},
@@ -118,7 +125,7 @@ func replRegistry() []replCmd {
 		{name: "/report", args: "[<id>] [-open]", desc: "render this session's trace as one HTML file", group: "review", run: (*Repl).cmdReport},
 		{name: "/eval", args: "<dir> [flags]", desc: "run evaluation tasks", group: "review", run: (*Repl).cmdEval},
 
-		{name: "/approve", args: "[on|off|run|edit]", desc: "what runs without asking", group: "modes", run: (*Repl).cmdApprove},
+		{name: "/approve", args: "[on|off|run|edit|mcp]", desc: "what runs without asking", group: "modes", run: (*Repl).cmdApprove},
 		{name: "/think", args: "[on|off|last]", desc: "show the model's reasoning", group: "modes", run: (*Repl).cmdThink},
 		{name: "/loop", args: "[on|off]", desc: "keep working until the task is done", group: "modes", run: (*Repl).cmdLoop},
 		{name: "/unsafe", args: "[on|off]", desc: "lift the sandbox (any path, any command)", group: "modes", run: (*Repl).cmdUnsafe},
@@ -348,6 +355,10 @@ func approvalShort(ap *Approver) string {
 		return "asks first"
 	case "auto":
 		return "auto-approve"
+	case "auto+w":
+		// Everything including mcp writes, which only a typed /approve mcp-write can
+		// reach — so the status line spells it out rather than looking like "auto".
+		return "auto-approve +mcp writes"
 	default:
 		return "auto: " + strings.TrimPrefix(ap.ModeShort(), "auto:")
 	}
@@ -357,6 +368,10 @@ func approvalShort(ap *Approver) string {
 func approvalPhrase(ap *Approver) string {
 	cs := ap.TrustedClasses()
 	switch {
+	case ap.Trusts("*") && !ap.Trusts("mcp_write"):
+		// Everything except the one class -y does not reach, which has to be said
+		// rather than discovered when a write stops an unattended run.
+		return "auto-approves everything except mcp writes (sandbox and deny rules still apply)"
 	case ap.Trusts("*"):
 		return "auto-approves everything (sandbox and deny rules still apply)"
 	case len(cs) == 0:
@@ -926,12 +941,21 @@ func (r *Repl) cmdApprove(arg string) bool {
 		ap.Trust("run")
 	case "edit", "write":
 		ap.Trust("edit")
+	case "mcp":
+		ap.Trust("mcp")
+	case "mcp-write", "mcp_write":
+		// The one class -y, "a" and approve: all do not reach, so it is granted here
+		// and nowhere else — at this terminal, for this session.
+		ap.Trust("mcp_write")
+		r.orch.rec.Event("approve_mode", map[string]any{"trusted": ap.TrustedClasses()})
+		okLine("mcp writes are auto-approved for this session — /approve off undoes it")
+		return false
 	case "", "status":
 		row("approve", approvalPhrase(ap))
-		hint("%s", "/approve on"+gSep+"off"+gSep+"run"+gSep+"edit")
+		hint("%s", "/approve on"+gSep+"off"+gSep+"run"+gSep+"edit"+gSep+"mcp"+gSep+"mcp-write")
 		return false
 	default:
-		errLine("usage: /approve [on|off|run|edit]")
+		errLine("usage: /approve [on|off|run|edit|mcp|mcp-write]")
 		return false
 	}
 	r.orch.rec.Event("approve_mode", map[string]any{"trusted": ap.TrustedClasses()})

@@ -94,6 +94,11 @@ type WorkflowStep struct {
 	// bind to the resolved member name (as Role already is). Legal on all three
 	// kinds — a run step has no role but it does have a machine.
 	Member string
+	// MCPWrite names the mcp write tools this step may call. A step is a line in a
+	// committed file whose Sum the resume path already checks, so it is a review
+	// somebody signed — but it names tools one by one and never a blanket "on", so
+	// a workflow that may FILE a ticket still cannot transition or comment on one.
+	MCPWrite []string
 
 	reviewer string // the role that reviews this step's diff, resolved by bind
 }
@@ -227,7 +232,7 @@ var reWFBareRef = regexp.MustCompile(`^(vars|steps)\.([A-Za-z0-9_-]+)(?:\.([A-Za
 
 var wfTopKeys = []string{"name", "description", "role", "timeout", "vars", "steps"}
 
-var wfStepKeys = []string{"run", "prompt", "delegate", "role", "check", "retries", "timeout", "on_fail", "when", "review", "fork", "member"}
+var wfStepKeys = []string{"run", "prompt", "delegate", "role", "check", "retries", "timeout", "on_fail", "when", "review", "fork", "member", "mcp_write"}
 
 // wfFields are the placeholder fields each kind of step produces.
 var wfFields = map[string][]string{
@@ -369,6 +374,16 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 					return fail("step %s: member: is empty (want a member name, or local)", sn.Key)
 				}
 				s.Member = strings.TrimSpace(k.Value)
+			case "mcp_write":
+				for _, n := range listOrCSV(k) {
+					if _, _, ok := mcpSplit(n); !ok {
+						return fail("step %s: mcp_write: %q is not an mcp tool name (they look like server__tool)", sn.Key, n)
+					}
+					s.MCPWrite = append(s.MCPWrite, n)
+				}
+				if len(s.MCPWrite) == 0 {
+					return fail("step %s: mcp_write: is empty — name the tools this step may call, or drop the key", sn.Key)
+				}
 			case "fork":
 				switch strings.ToLower(strings.TrimSpace(k.Value)) {
 				case "true", "yes", "on":
@@ -395,6 +410,13 @@ func parseWorkflow(name, path, text string) (*Workflow, error) {
 		}
 		if s.Fork != "" && s.Kind != stepDelegate {
 			return fail("step %s: fork: on a %s step — only a delegate step inherits the caller's context", sn.Key, s.Kind)
+		}
+		// Only a prompt step's child is bound here, so a grant anywhere else would be
+		// silently ignored — and a grant that looks like one but is not is worse than
+		// no grant at all. A delegate step's subagent keeps newChild's deny; give the
+		// role itself the key if that is really what is wanted.
+		if len(s.MCPWrite) > 0 && s.Kind != stepPrompt {
+			return fail("step %s: mcp_write: on a %s step — only a prompt step's child is granted here; put permission: {mcp_write: ask} on the role instead", sn.Key, s.Kind)
 		}
 		if strings.TrimSpace(s.Cmd+s.Text) == "" {
 			return fail("step %s: %s: is empty", sn.Key, s.Kind)
@@ -709,6 +731,29 @@ func (wf *Workflow) bind(o *Orchestrator, lead string, vars map[string]string) e
 			}
 			if err := checkOn(jl, mem, line); err != nil {
 				return fail("step %s: %v", s.Name, err)
+			}
+		}
+		// The grant, against the registry and not only against the shape of a name.
+		// parseWorkflow can only check that it LOOKS like server__tool; here the tools
+		// exist, so a typo fails the run before it starts instead of producing a rule no
+		// registry name ever equals — the same hazard the mcp_write-on-a-run-step guard
+		// was added for, and the same didYouMean() message roles.yaml already gives.
+		for _, n := range s.MCPWrite {
+			mt := mcpTools[n]
+			if mt == nil {
+				if err := mcpToolNameError(n); err != nil {
+					return fail("step %s: mcp_write: %v", s.Name, err)
+				}
+				return fail("step %s: mcp_write: %q is not a registered tool", s.Name, n)
+			}
+			if !mt.Write {
+				return fail("step %s: mcp_write: %q is a read on mcp server %s — it needs no grant", s.Name, n, mt.Server.Name)
+			}
+			// A grant for a tool the role's own tools: list does not hold reaches nothing:
+			// toolsFor keeps the role's set exact, so the schema stays out of the prefix
+			// and execCall refuses the call by name.
+			if ag := o.agents[s.Role]; ag != nil && ag.ToolsSet && !contains(ag.Tools, n) {
+				return fail("step %s: mcp_write: %q is not in role %s's tools:, so the grant reaches nothing — add it there, or name a role that has it", s.Name, n, s.Role)
 			}
 		}
 		if s.Timeout == 0 {
@@ -1814,6 +1859,29 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 		return o
 	}
 	defer r.orch.forgetChild(child.ID) // a workflow must not leak children
+	// The step's mcp write grants, appended AFTER the Deny newChild just put in
+	// child.extra: rules() puts extra last and the last match wins, so exactly
+	// these names evaluate to Allow and every other write stays Deny.
+	//
+	// The precise cost, because it is easy to miss: Disabled() is per KEY, not per
+	// pattern, so once any mcp_write Allow is present, ALL of this role's write
+	// schemas return to the prefix and the ungranted ones hard-deny at call time.
+	// The mitigation is the role's own tools: list, which still decides which names
+	// exist at all — so a granting step should name a role whose tools: holds only
+	// what it needs. doctor prints the resulting schema count per role for exactly
+	// this reason.
+	for _, n := range s.MCPWrite {
+		child.extra = append(child.extra, Rule{"mcp_write", n, Allow})
+	}
+	// The grant has to reach the PREFIX, not only Evaluate(). newChild has already
+	// built Msgs[0] from child.systemPrompt(), which calls s.tools() and MEMOISES
+	// toolDefs/schemas with the Deny still in child.extra — so a grant appended
+	// afterwards evaluated to Allow at call time on a tool the model was never shown,
+	// and a step written to file a ticket reported that it could not. RefreshSystem
+	// drops the memo and rebuilds the system message; reviewDelegation does the same
+	// thing after it appends its Deny. Folded together with the member change below
+	// so the prompt is rebuilt at most once.
+	refresh := len(s.MCPWrite) > 0
 	// Under `lca run` the run's lead reads nothing — every model step happens in
 	// a child like this one — so the reads a later `fork: true` can inherit are
 	// the ones a prompt step made. The session outlives forgetChild; only its
@@ -1824,6 +1892,9 @@ func (r *wfRunner) promptStep(ctx context.Context, s *WorkflowStep, text, check 
 	// gateway caches.
 	if child.member != s.Member {
 		child.member = s.Member
+		refresh = true
+	}
+	if refresh {
 		child.RefreshSystem()
 	}
 	child.view = &workflowView{View: child.view, log: r.log, step: s.Name}
@@ -2362,6 +2433,9 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 	defer orch.rec.Close()
 	defer orch.tracer.Close()
+	// An overnight `lca run` that touched a stdio server used to leak one server
+	// process per run, because CloseMCP was deferred only in the REPL.
+	defer orch.CloseMCP()
 
 	entry := ""
 	if orch.roles != nil {

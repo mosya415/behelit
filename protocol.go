@@ -59,7 +59,10 @@ var (
 	// Matches an opening tag line: <name ...attrs...>  or self-closing <name .../>.
 	// Attribute values may be double- OR single-quoted, with optional spaces
 	// around "=", to tolerate models that don't emit the canonical form.
-	reOpen = regexp.MustCompile(`^<([a-z_]+)((?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(/?)>$`)
+	// The name class holds digits as well as letters, so an mcp tool registered as
+	// jira__issue_get2 parses. A prose line like <h1> still falls out one step
+	// later, at the existing blockNames[m[1]] check.
+	reOpen = regexp.MustCompile(`^<([a-z0-9_]+)((?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(/?)>$`)
 	reAttr = regexp.MustCompile(`([a-z_]+)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
 
 	// Reasoning tags to strip: <think>, <thinking>, and model-namespaced variants
@@ -70,10 +73,33 @@ var (
 
 	// A tool (or edit sub-) tag anywhere in the text — used only to re-separate
 	// tags that a model glued to surrounding text (it is NOT the block grammar).
-	toolTag      = `</?(?:read_file|grep|list_dir|glob|run_command|write|edit|search|replace|todowrite|task|delegate|skill|webfetch)(?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*/?>`
-	reGlueBefore = regexp.MustCompile(`([^\n])(` + toolTag + `)`)
-	reGlueAfter  = regexp.MustCompile(`(` + toolTag + `)([^\n])`)
+	toolTag      string
+	reGlueBefore *regexp.Regexp
+	reGlueAfter  *regexp.Regexp
 )
+
+// textTagNames is the alternation the three glue regexes are built from: the
+// builtin tags and their edit sub-tags, plus whatever registerMCPTools appended.
+// It is a slice and not a literal so that registration has ONE place to extend,
+// and the regexes are recompiled there and nowhere else.
+var textTagNames = []string{
+	"read_file", "grep", "list_dir", "glob", "run_command", "write", "edit",
+	"search", "replace", "todowrite", "task", "delegate", "skill", "webfetch",
+}
+
+// textTagBuiltins is the baseline registerMCPTools rebuilds from, so a reload
+// replaces the MCP names instead of accumulating them.
+var textTagBuiltins = append([]string(nil), textTagNames...)
+
+// rebuildToolTagRegexes recompiles the glue regexes from textTagNames. Called
+// from init(), and again by registerMCPTools before any session exists.
+func rebuildToolTagRegexes() {
+	toolTag = `</?(?:` + strings.Join(textTagNames, "|") + `)(?:\s+[a-z_]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*/?>`
+	reGlueBefore = regexp.MustCompile(`([^\n])(` + toolTag + `)`)
+	reGlueAfter = regexp.MustCompile(`(` + toolTag + `)([^\n])`)
+}
+
+func init() { rebuildToolTagRegexes() }
 
 // normalizeTags makes the line-anchored grammar tolerant of models that don't
 // put tags on their own line — MiniMax-M3, for instance, emits

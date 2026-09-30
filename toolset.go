@@ -31,13 +31,17 @@ type Param struct {
 }
 
 type ToolDef struct {
-	Name     string
-	Desc     string // native description
-	Params   []Param
-	Body     string // text protocol: which param is the tag body ("" → void tag)
-	TextDoc  string // text protocol usage example(s)
-	Parallel bool   // safe to run concurrently with other Parallel calls
-	Run      func(tc *ToolCtx, a Args) string
+	Name   string
+	Desc   string // native description
+	Params []Param
+	Body   string // text protocol: which param is the tag body ("" → void tag)
+	// RawParams is a JSON Schema handed to us whole, by an owner who is not this
+	// program: an MCP server's inputSchema. When it is set, Params is ignored and
+	// schema() passes these bytes through (see mcp.go).
+	RawParams map[string]any
+	TextDoc   string // text protocol usage example(s)
+	Parallel  bool   // safe to run concurrently with other Parallel calls
+	Run       func(tc *ToolCtx, a Args) string
 }
 
 // ToolCtx is what a running tool can reach: its session (jail, approver,
@@ -137,6 +141,15 @@ func contains(xs []string, x string) bool {
 
 // schemaFor renders a tool's JSON schema.
 func (t *ToolDef) schema() ToolSchema {
+	if t.RawParams != nil {
+		// An MCP server owns its own JSON Schema, so we hand it to the model
+		// byte-for-byte instead of rebuilding it out of Param: a schema we rebuilt
+		// is a schema we could get wrong, and the contract the model has to satisfy
+		// is the SERVER's. encoding/json sorts map keys, so the prefix bytes are
+		// canonical whatever order the server wrote them in.
+		return ToolSchema{Type: "function", Function: ToolSchemaFunc{
+			Name: t.Name, Description: t.Desc, Parameters: t.RawParams}}
+	}
 	props := map[string]any{}
 	var req []string
 	for _, p := range t.Params {

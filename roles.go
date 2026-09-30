@@ -552,6 +552,21 @@ func (rc *RolesConfig) tierList() string {
 	return strings.Join(rc.TierOrder, ", ")
 }
 
+// yKey quotes a mapping key that is not a bare word, so a pattern with a space or
+// a "*" in it survives the round trip through parseYAMLish's unquote().
+func yKey(k string) string {
+	for _, r := range k {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == '/' {
+			continue
+		}
+		return fmt.Sprintf("%q", k)
+	}
+	if k == "" {
+		return `""`
+	}
+	return k
+}
+
 func listOrCSV(n *yNode) []string {
 	items := n.List
 	if len(items) == 0 && n.Value != "" {
@@ -631,10 +646,31 @@ func applyRole(a *Agent, n *yNode, baseDir string) error {
 		a.Prompt = strings.TrimSpace(string(data))
 	}
 	if t := n.child("tools"); t != nil {
-		a.Tools = listOrCSV(t)
+		// MCP tools are ordinary registry entries by the time a role is read
+		// (registerMCPTools runs at the top of buildOrchestrator, before loadRoles),
+		// so the existing check below validates their names too and there is no
+		// second validator to keep in step. Two things are added: a server__*
+		// wildcard is expanded first, and a name holding "__" gets an error that
+		// names the server's tools instead of dumping the whole registry.
+		var names []string
+		for _, name := range listOrCSV(t) {
+			if _, tool, ok := mcpSplit(name); ok && tool == "*" {
+				expanded, err := mcpSet.expandRoleWildcard(name)
+				if err != nil {
+					return err
+				}
+				names = append(names, expanded...)
+				continue
+			}
+			names = append(names, name)
+		}
+		a.Tools = names
 		a.ToolsSet = true
 		for _, name := range a.Tools {
 			if toolRegistry[name] == nil {
+				if err := mcpToolNameError(name); err != nil {
+					return err
+				}
 				return fmt.Errorf("unknown tool %q (known: %s)", name, strings.Join(sortedKeys(toolRegistry), ", "))
 			}
 		}
@@ -654,6 +690,43 @@ func applyRole(a *Agent, n *yNode, baseDir string) error {
 	if v := n.str("temperature"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			a.Temperature = &f
+		}
+	}
+	// permission: is how a ROLE widens or narrows a key, and the mcp write grant
+	// rests on it: newChild denies mcp_write to every child of a role that does not
+	// name the key, so a role meant to file a ticket has to be able to say so. Until
+	// this existed, roles.yaml silently ignored the block and a same-named config.json
+	// agents: entry was replaced wholesale (NewOrchestrator), which left the README's
+	// "unless the role names the key" describing something no file could express.
+	//
+	// Same shape as an agent's own block: "key: action", or "key: {pattern: action}",
+	// with a bare action applying to everything. A bad action is an ERROR and not a
+	// warning, because a grant that did not parse is worse than no grant at all.
+	if p := n.child("permission"); p != nil {
+		if v := strings.TrimSpace(p.Value); v != "" {
+			act, ok := validAction(v)
+			if !ok {
+				return fmt.Errorf("permission: %q is not allow, ask or deny", v)
+			}
+			a.Rules = append(a.Rules, Rule{"*", "*", act})
+		}
+		for _, c := range p.Children {
+			key := toolPermKey(c.Key)
+			if v := strings.TrimSpace(c.Value); v != "" {
+				act, ok := validAction(v)
+				if !ok {
+					return fmt.Errorf("permission %s: %q is not allow, ask or deny", c.Key, v)
+				}
+				a.Rules = append(a.Rules, Rule{key, "*", act})
+				continue
+			}
+			for _, pc := range c.Children {
+				act, ok := validAction(pc.Value)
+				if !ok {
+					return fmt.Errorf("permission %s.%s: %q is not allow, ask or deny", c.Key, pc.Key, pc.Value)
+				}
+				a.Rules = append(a.Rules, Rule{key, expandHome(pc.Key), act})
+			}
 		}
 	}
 	if v := n.str("check_cmd"); v != "" {
@@ -894,6 +967,21 @@ func (rc *RolesConfig) YAML() string {
 		if a.ToolsSet {
 			fmt.Fprintf(&b, "    tools: [%s]\n", strings.Join(a.Tools, ", "))
 		}
+		// permission:, written back because /role save and /setup rewrite this whole
+		// file from these structs — a grant the writer could not spell would disappear
+		// on the next save, which for mcp_write means a role that silently stops being
+		// able to file a ticket. A role's Rules come from nowhere else, so this is a
+		// round trip and not a merge.
+		if len(a.Rules) > 0 {
+			b.WriteString("    permission:\n")
+			for _, r := range a.Rules {
+				if r.Pattern == "*" {
+					fmt.Fprintf(&b, "      %s: %s\n", yKey(r.Permission), r.Action)
+					continue
+				}
+				fmt.Fprintf(&b, "      %s: {%s: %s}\n", yKey(r.Permission), yKey(r.Pattern), r.Action)
+			}
+		}
 		if p := strings.TrimRight(a.Prompt, "\n"); p != "" {
 			b.WriteString("    prompt: |\n")
 			for _, l := range strings.Split(p, "\n") {
@@ -902,4 +990,39 @@ func (rc *RolesConfig) YAML() string {
 		}
 	}
 	return b.String()
+}
+
+// mcpToolNameError explains a roles.yaml tools: entry that looks like an mcp tool
+// but is not registered. sortedKeys(toolRegistry) would otherwise dump every tool
+// in the program at somebody who mistyped one ticket field.
+func mcpToolNameError(name string) error {
+	server, tool, ok := mcpSplit(name)
+	if !ok {
+		if strings.Contains(name, ".") {
+			if s, t, found := strings.Cut(name, "."); found {
+				return fmt.Errorf("unknown tool %q — an mcp tool name looks like %s__%s (two underscores), because a dot cannot appear in a tool tag or in a gateway function name", name, s, t)
+			}
+		}
+		return nil
+	}
+	if mcpSet == nil || mcpSet.servers[server] == nil {
+		return fmt.Errorf("unknown mcp tool %q — no mcp server %q is configured%s; an mcp tool name looks like server__tool",
+			name, server, mcpConfiguredList(mcpSet))
+	}
+	sv := mcpSet.servers[server]
+	if len(sv.Expose) == 0 {
+		return fmt.Errorf("unknown mcp tool %q — mcp server %q exposes nothing: %s", name, server, firstNonEmpty(sv.loadErr, "its expose: list is empty"))
+	}
+	_ = tool
+	return fmt.Errorf("unknown mcp tool %q — mcp server %q exposes: %s%s",
+		name, server, strings.Join(sv.Expose, ", "), mcpLockNote(sv))
+}
+
+// mcpLockNote is the second half of that message when the name IS in expose: but
+// the lock has not recorded it, which is the likeliest reason it does not exist.
+func mcpLockNote(sv *MCPServer) string {
+	if sv.lock == nil {
+		return " (none of them are registered yet — run /mcp refresh)"
+	}
+	return ""
 }

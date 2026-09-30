@@ -38,7 +38,10 @@ type FileConfig struct {
 	Providers     map[string]ProviderConfig `json:"providers"`
 	Agents        map[string]AgentConfig    `json:"agents"`
 	Permission    PermissionConfig          `json:"permission"`
-	Sources       []string                  `json:"-"`
+	// MCP is the internal MCP servers and, first of all, which hosts they may be
+	// reached at. nil when no file declared one.
+	MCP     *MCPFileConfig `json:"mcp"`
+	Sources []string       `json:"-"`
 
 	// The scalars are carried as the TEXT that was in the file, keyed by JSON
 	// name, and validated once by applySetting (settings.go) — the same code /set
@@ -256,6 +259,34 @@ func loadFileConfig(cfg Config) (*FileConfig, error) {
 			out.Agents[k] = v
 		}
 		out.Permission = append(out.Permission, fc.Permission...)
+		// The mcp block merges PER SERVER NAME, project last, exactly as Providers
+		// and Agents do above. allow_hosts, allow_cidrs, stdio and trust_annotations
+		// are taken from the last file that sets them and the file is remembered, so
+		// "which hosts may be reached" has one answer and one place to look.
+		if fc.MCP != nil {
+			if out.MCP == nil {
+				out.MCP = &MCPFileConfig{Servers: map[string]MCPServerConfig{}}
+			}
+			if fc.MCP.AllowHosts != nil {
+				out.MCP.AllowHosts = fc.MCP.AllowHosts
+			}
+			if fc.MCP.AllowCIDRs != nil {
+				out.MCP.AllowCIDRs = fc.MCP.AllowCIDRs
+			}
+			if fc.MCP.Stdio != "" {
+				out.MCP.Stdio = fc.MCP.Stdio
+			}
+			if fc.MCP.TrustAnnotations {
+				out.MCP.TrustAnnotations = true
+			}
+			for _, k := range fc.MCP.Order {
+				if _, seen := out.MCP.Servers[k]; !seen {
+					out.MCP.Order = append(out.MCP.Order, k)
+				}
+				out.MCP.Servers[k] = fc.MCP.Servers[k]
+			}
+			out.MCP.From = p
+		}
 	}
 	return out, nil
 }

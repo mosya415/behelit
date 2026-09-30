@@ -1276,6 +1276,7 @@ func (p *setupPlan) rolesConfig(r *Repl) *RolesConfig {
 // Configuration-derived, copied:  cfg fc providers agents skills commands
 //
 //	userRules warnings roles remote members memOrd defMem hasMembers gatewayModels
+//	mcp
 //
 // Live, kept:  jl rec tracer ap children nextTask slots reads history worktrees
 //
@@ -1288,8 +1289,28 @@ func (p *setupPlan) rolesConfig(r *Repl) *RolesConfig {
 // lists. A field in neither is either stale after a reload or clobbers running
 // state, and the compiler cannot tell you which.
 func (o *Orchestrator) adopt(n *Orchestrator) {
+	old := o.swap(n)
+	// The MCP set being replaced owns live connections and, for a stdio server, child
+	// PROCESSES. registerMCPTools has already pointed the tool bindings at the new
+	// set's servers, so nothing holds a reference to these any more — and CloseMCP at
+	// exit walks o.mcp, which is now the new one. Not closing them here left a stdio
+	// server spawned before a reload running after lca was gone.
+	if old != nil && old != o.mcp {
+		closeMCPSet(old)
+	}
+}
+
+// swap copies the configuration-derived half under the lock and hands back the MCP
+// set it replaced, so the closing happens with no lock held.
+func (o *Orchestrator) swap(n *Orchestrator) *MCPSet {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	old := o.mcp
+	// mcp is configuration-derived like the rest: without it /mcp and lca doctor
+	// rendered the pre-reload allowlist, stdio posture and server list while the
+	// model's calls went through the new set — the one screen a security review reads,
+	// stale, and a server ADDED by the reload missing from it entirely.
+	o.mcp = n.mcp
 	o.cfg, o.fc = n.cfg, n.fc
 	o.providers, o.agents, o.skills, o.commands = n.providers, n.agents, n.skills, n.commands
 	o.userRules, o.warnings = n.userRules, n.warnings
@@ -1300,6 +1321,7 @@ func (o *Orchestrator) adopt(n *Orchestrator) {
 	o.memMu.Lock()
 	o.locMem, o.legMem = nil, nil
 	o.memMu.Unlock()
+	return old
 }
 
 // reload re-resolves the configuration and moves the running session onto it.

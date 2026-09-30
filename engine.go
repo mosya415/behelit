@@ -46,6 +46,11 @@ type Orchestrator struct {
 	readMu sync.Mutex
 	reads  map[string]time.Time // abs path → mtime when the agent last saw it
 
+	// mcp is the configured internal MCP servers, their reachability allowlist and
+	// the pinned tool manifest. nil is impossible after buildOrchestrator; empty is
+	// the normal case.
+	mcp *MCPSet
+
 	roles     *RolesConfig // roles.yaml, nil when absent
 	remote    *Remote      // the "remote" member: the old single-machine spelling
 	tracer    *Tracer
@@ -1180,6 +1185,18 @@ func (s *Session) execCall(ctx context.Context, c *pendingCall, stop *atomic.Boo
 		c.invalid = true
 		return fmt.Sprintf("error: the %s tool was called with invalid arguments: %v. Rewrite the call with valid JSON arguments", c.def.Name, c.err)
 	}
+	// A role's tools: list is a CAPABILITY and not only a prefix. extractCalls
+	// resolves a name against the process-wide registry — natively through
+	// resolveToolName, in the text transport straight out of toolRegistry — so a
+	// model that names a tool it was never shown (guessed, carried over from a
+	// resumed transcript, or suggested by injected ticket text) used to reach it
+	// whenever its permission was allow-by-default. mcp_read is allow-by-default, so
+	// "a role that names no MCP tool gets none of them" held for the prefix and not
+	// for reach. This is the same predicate toolsFor uses for the prefix, enforced
+	// where the call happens, and it closes the equivalent gap for builtins.
+	if s.agent.ToolsSet && !contains(s.agent.Tools, c.def.Name) {
+		return fmt.Sprintf("error: the %s tool is not available to the %s agent", c.def.Name, s.agent.Name)
+	}
 	if Disabled(permissionOf(c.def.Name), s.rules()...) {
 		return fmt.Sprintf("error: the %s tool is not available to the %s agent", c.def.Name, s.agent.Name)
 	}
@@ -1209,6 +1226,12 @@ func (s *Session) execCall(ctx context.Context, c *pendingCall, stop *atomic.Boo
 	s.view.ToolStart(c.def.Name, toolSummary(c.def.Name, c.args))
 	res := c.def.Run(&ToolCtx{Ctx: ctx, S: s, CallID: c.id, Name: c.def.Name}, c.args)
 	s.view.ToolDone(c.def.Name, c.args, res)
+	// An MCP result is somebody's ticket. summarize() below would put 200 bytes of
+	// it in the audit log, which outlives every transcript here. MCP tools audit
+	// themselves instead, with argument KEYS and never argument values.
+	if mcpTools[c.def.Name] != nil {
+		return res
+	}
 	switch c.def.Name {
 	case "edit", "write", "run_command", "task", "todowrite", "skill", "webfetch":
 		// these audit themselves with richer fields
@@ -1302,6 +1325,24 @@ func permPath(j *Jail, p string) string {
 
 // toolSummary is the one-line argument shown next to a tool marker.
 func toolSummary(name string, a Args) string {
+	// An MCP call has no path argument, so it used to render as a bare marker with
+	// nothing after it. run_command shows its command and webfetch its URL; a read of
+	// somebody's ticket showed neither the key nor the query — and mcp_read is
+	// allow-by-default, so no approval question ever displayed them either. That
+	// gutter line is the only visibility a read has.
+	if mcpTools[name] != nil {
+		args, keys, err := mcpArgs(a)
+		if err != nil {
+			return ""
+		}
+		keys = mcpArgOrder(args)
+		for _, k := range keys {
+			if v, ok := args[k].(string); ok && strings.TrimSpace(v) != "" {
+				return truncate(collapseWS(v), 80)
+			}
+		}
+		return truncate(strings.Join(keys, " "), 80)
+	}
 	switch name {
 	case "read_file":
 		s := a.Str("path")

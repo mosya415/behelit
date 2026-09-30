@@ -181,7 +181,10 @@ func (o *Orchestrator) reviewDelegation(ctx context.Context, child *Session, rev
 	// reviewer must not be able to edit its way into the diff it is judging. The
 	// apply itself is safe regardless — diff and wt.changedFiles were captured
 	// before the review started — but a reviewer grading its own patch is not.
-	rev.extra = append(rev.extra, Rule{"edit", "*", Deny}, Rule{"delegate", "*", Deny})
+	// mcp_write for the same reason edit is denied here: a reviewer judging a diff
+	// has no business changing a ticket. newChild denied it already unless the
+	// reviewer's role named the key; this makes it unconditional.
+	rev.extra = append(rev.extra, Rule{"edit", "*", Deny}, Rule{"delegate", "*", Deny}, Rule{"mcp_write", "*", Deny})
 	rev.RefreshSystem()
 	out.Model = rev.client.Model()
 

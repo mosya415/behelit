@@ -129,7 +129,10 @@ func marshalConfig(obj map[string]json.RawMessage) ([]byte, error) {
 			order = append(order, s.JSON)
 		}
 	}
-	for _, k := range []string{"providers", "agents", "permission"} {
+	// mcp last, after permission: the permission rules that gate it read better
+	// above the servers they gate, and a deterministic order is one whose git diff a
+	// reviewer can read.
+	for _, k := range []string{"providers", "agents", "permission", "mcp"} {
 		if !seen[k] {
 			seen[k] = true
 			order = append(order, k)

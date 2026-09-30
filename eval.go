@@ -458,6 +458,9 @@ func runEvalTask(cfg Config, t *EvalTask, dir string, keep, verbose bool) (res E
 		return res
 	}
 	defer orch.rec.Close()
+	// Every eval task builds its own orchestrator, so a stdio MCP server would
+	// otherwise be left running once per task.
+	defer orch.CloseMCP()
 	view := &evalView{name: t.Name, verbose: verbose}
 	roleName := t.Role
 	if roleName == "" && orch.roles != nil {

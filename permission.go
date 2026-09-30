@@ -22,6 +22,9 @@ import (
 //	skill      skill                               → skill name
 //	todo       todowrite                           → *
 //	web        webfetch                            → url
+//	mcp        opening a connection to an mcp server → server name
+//	mcp_read   an mcp tool the operator listed read-only → registry name
+//	mcp_write  every other mcp tool                 → registry name
 //	doom_loop  a tool called 3× with identical args → tool name
 //
 // Actions: allow (run), ask (the approval gate decides), deny (the model is
@@ -139,6 +142,11 @@ func permissionOf(tool string) string {
 	case "webfetch":
 		return "web"
 	}
+	// mcpTools is written once, before any session exists (registerMCPTools), and
+	// is read-only afterwards — so this lookup needs no lock and -race stays clean.
+	if mt := mcpTools[tool]; mt != nil {
+		return mt.permKey() // "mcp_read" | "mcp_write"
+	}
 	return tool // task, delegate, skill: their own keys
 }
 
@@ -151,6 +159,17 @@ func defaultRules() Ruleset {
 		{"edit", "*", Ask},
 		{"run", "*", Ask},
 		{"web", "*", Ask},
+		// Opening a connection asks, because that is where outbound traffic to a
+		// named internal host becomes visible. A write asks, because it lands in
+		// somebody's ticket. A read is allowed: the host is on the operator's own
+		// allowlist and the tool was named by hand in their own file — and a read
+		// that asks every time teaches the operator to type y without reading, which
+		// is how the write gate gets defeated. mcp_read is spelled out although
+		// {"*","*",Allow} above already covers it, so all three keys are visible in
+		// one place and Disabled() has a row to find.
+		{"mcp", "*", Ask},
+		{"mcp_read", "*", Allow},
+		{"mcp_write", "*", Ask},
 		{"doom_loop", "*", Ask},
 		{"read", "*.env", Ask},
 		{"read", "*.env.*", Ask},
