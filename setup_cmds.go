@@ -138,6 +138,7 @@ func runInit(cfg Config, args []string) int {
 entry: lead
 transport: native      # the models' own tool-call format (engines need their tool-call parser)
 apply: verified        # a delegate's diff reaches your tree only when its check passed
+#                      # verified | always | never | branch (README: apply: branch)
 
 %s# models:               # per-model settings, e.g. a model whose native tool parser is broken:
 #   some-model: {transport: text}

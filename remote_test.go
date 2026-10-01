@@ -51,17 +51,17 @@ func TestRemoteFileTools(t *testing.T) {
 	if got := rem.grep(ctx, "package", "", "", func(f string) bool { return !strings.HasPrefix(f, "pkg/") }); strings.Contains(got, "pkg/") {
 		t.Fatalf("grep ignored the read rules: %q", got)
 	}
-	if errs := rem.write(ctx, "new/dir/file.txt", "hello\n"); errs != "" {
-		t.Fatal(errs)
+	if code, errs := rem.write(ctx, "new/dir/file.txt", "hello\n", "", true); code != 0 {
+		t.Fatalf("write: code %d %s", code, errs)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "new", "dir", "file.txt")); string(b) != "hello\n" {
 		t.Fatalf("write: %q", b)
 	}
-	if _, ok := rem.stat(ctx, "new/dir/file.txt"); !ok {
-		t.Fatal("stat should find the written file")
+	if _, _, _, ok := rem.statSum(ctx, "new/dir/file.txt"); !ok {
+		t.Fatal("statSum should find the written file")
 	}
-	if _, ok := rem.stat(ctx, "nope.txt"); ok {
-		t.Fatal("stat should not find a missing file")
+	if _, _, _, ok := rem.statSum(ctx, "nope.txt"); ok {
+		t.Fatal("statSum should not find a missing file")
 	}
 	out, exit := rem.run(ctx, "echo hi && pwd", 30*time.Second, nil, nil)
 	if exit != 0 || !strings.Contains(out, "hi") {

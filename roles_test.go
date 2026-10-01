@@ -52,14 +52,23 @@ roles:
 // through the real setup path (gateway model validation included).
 func newRoleHarness(t *testing.T, fs *fakeServer, roles string, approve bool) *harness {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("LCA_ROLES", "")
-	t.Setenv("LCA_GW_MAX_WAIT", "5")
 	root := t.TempDir()
 	if real, err := filepath.EvalSymlinks(root); err == nil {
 		root = real
 	}
+	return newRoleHarnessAt(t, root, fs, roles, approve)
+}
+
+// newRoleHarnessAt is newRoleHarness with the repository root handed in, for
+// the one shape of test that needs it: a fake endpoint whose replies WRITE to
+// the caller's tree, which has to know where that tree is before the harness
+// exists.
+func newRoleHarnessAt(t *testing.T, root string, fs *fakeServer, roles string, approve bool) *harness {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LCA_ROLES", "")
+	t.Setenv("LCA_GW_MAX_WAIT", "5")
 	os.MkdirAll(filepath.Join(root, ".lca"), 0o755)
 	os.WriteFile(filepath.Join(root, ".lca", "roles.yaml"), []byte(roles), 0o644)
 	os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644)
@@ -781,7 +790,7 @@ func TestDelegateDiffLimitedToCallerJail(t *testing.T) {
 	jl, _ := NewJail(sub, h.orch.jl.Allowed, false)
 	h.orch.jl = jl
 	h.sess.RefreshSystem()
-	wt, err := h.orch.worktrees.create(sub, t.TempDir(), "x")
+	wt, err := h.orch.worktrees.create(sub, t.TempDir(), "x", "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1278,9 +1278,23 @@ func (p *setupPlan) rolesConfig(r *Repl) *RolesConfig {
 //	userRules warnings roles remote members memOrd defMem hasMembers gatewayModels
 //	mcp
 //
-// Live, kept:  jl rec tracer ap children nextTask slots reads history worktrees
+// Live, kept:  jl rec tracer ap children nextTask slots history worktrees
 //
-//	locMem legMem
+//	locMem legMem locksOnce locks mt3Once mt3 mt3Ver
+//	waveMu waveInflight waveStarted waveDone
+//
+// locks (the file-lease directory, filelock.go) is LIVE: it is derived from the
+// repository, not from the configuration, and two Orchestrators in one project
+// must resolve to the same directory whatever their LCA_DIR says — re-deriving
+// it on a reload could only ever produce the same answer or a wrong one.
+//
+// mt3* (branch.go's `merge-tree --write-tree` probe) is LIVE for the same
+// reason and one more: it describes the git BINARY, which a /reload cannot
+// change, and re-probing would spend a subprocess to learn the same answer.
+//
+// wave* (the "integrated 2nd of 3" counter) is LIVE because delegations may be
+// in flight across a reload: resetting the counter under them would renumber a
+// burst halfway through and the second result would claim to be the first.
 //
 // jl is LIVE and not copied: every Session holds o.jl, so the allowlist is
 // mutated in place (Jail.SetAllowed) and a fresh jail would orphan them.

@@ -20,7 +20,7 @@ import (
 //
 //	entry: lead                 # role of the REPL / one-shot session
 //	transport: native           # tool calling through the gateway: native | text
-//	apply: verified             # delegate diffs: verified (default) | always | never
+//	apply: verified             # delegate diffs: verified (default) | always | never | branch
 //	remote:                     # work on another machine (outbound ssh only)
 //	  host: cab-node
 //	  dir: /home/u/llmbench
@@ -178,8 +178,8 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			rc.Transport = v
 		}
 		if v := doc.str("apply"); v != "" {
-			if v != "verified" && v != "always" && v != "never" {
-				return nil, fmt.Errorf("%s: apply must be verified, always or never, got %q", p, v)
+			if v != "verified" && v != "always" && v != "never" && v != "branch" {
+				return nil, fmt.Errorf("%s: apply must be verified, always, never or branch, got %q", p, v)
 			}
 			rc.Apply = v
 		}

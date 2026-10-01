@@ -334,10 +334,43 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 	// — the laptop half of "build on the box, commit on the laptop" — with
 	// createOn's internal precondition note.
 	sameTree := target.IsLocal() && caller.IsLocal()
+
+	// The child is made BEFORE the worktree now, for one reason: its task id is
+	// half the branch name (lca/<role>/<session>-<task>), and a name chosen after
+	// the worktree exists would need a second `worktree add`. forgetChild follows
+	// immediately, exactly as it did below: the worktree dies with this call, so
+	// the child is not resumable via task_id either way.
+	child, err := o.newChild(s, role, truncate(firstLine(task), 60))
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	o.forgetChild(child.ID)
+	tc.TaskSession = child.UID
+
+	// One team-wide setting, never the model's and never per call. Everything
+	// about the mode is decided HERE, before any work exists, because every
+	// reason to fall back to the patch path is knowable now — and a fallback
+	// discovered at integration time is a verified change thrown away.
+	branch, why := "", ""
+	if o.applyPolicy() == "branch" {
+		switch ok, ver := o.mergeTree3Way(s.jail().Root); {
+		case !sameTree:
+			// The seam for §2.9's bundle transfer and nothing more: across machines
+			// the result stays a text patch in this version. Building the bundle path
+			// is a named follow-up, not a thing to half-do here — a transfer whose
+			// prerequisite is missing has to be detected before anything is
+			// attempted, and that detection belongs with the transfer.
+			why = fmt.Sprintf("%s works in its own repository on %s, so its result crosses as a text patch, not as a branch: there is no shared object store to merge in. Run %s on member local to get a branch.",
+				roleName, target.Label(), roleName)
+		case !ok:
+			why = fmt.Sprintf("your git is %s; merging a delegation onto a branch needs 2.38 or newer, so this was applied as a patch.", ver)
+		default:
+			branch = branchFor(roleName, s.rootUID(), child.ID)
+		}
+	}
 	var wt *worktree
-	var err error
 	if target.IsLocal() {
-		wt, err = o.worktrees.create(s.jail().Root, o.cfg.stateDir(), s.rootUID())
+		wt, err = o.worktrees.create(s.jail().Root, o.cfg.stateDir(), s.rootUID(), branch)
 	} else {
 		wt, err = o.worktrees.createOn(tc.Ctx, target, s.rootUID())
 	}
@@ -369,12 +402,6 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 	}
 	defer wt.remove()
 
-	child, err := o.newChild(s, role, truncate(firstLine(task), 60))
-	if err != nil {
-		return "error: " + err.Error()
-	}
-	o.forgetChild(child.ID) // its worktree dies with this call: not resumable via task_id
-	tc.TaskSession = child.UID
 	if target.IsLocal() {
 		// A worktree on this machine, so the child gets a local jail rooted in it —
 		// built from the TARGET member's policy, not the team's: the allowlist the
@@ -397,6 +424,19 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 			roleName, target.Label()))
 	}
 	child.isolated = true
+	// Under apply: branch the ENGINE commits the work, once per verifier attempt,
+	// from RunVerifiedAll. The model is never asked to commit: no new tool, no
+	// change to the request prefix, and a role cannot forget.
+	child.branch, child.wt = wt.branch, wt
+	if wt.branch != "" {
+		child.view.Note(fmt.Sprintf("BRANCH %s — the work is committed there, one commit per attempt, and the branch outlives this call", wt.branch))
+		// Counted from here and not from the integration, so "of N" names the
+		// delegations that were actually in flight together.
+		o.waveEnter()
+		defer o.waveLeave()
+	} else if why != "" {
+		child.view.Note("PATCH  " + why)
+	}
 	child.RefreshSystem()
 	// Before the task message and after RefreshSystem: the child's own system
 	// prompt stays Msgs[0], byte-identical to any other session of that role,
@@ -463,7 +503,10 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 	applied := false
 	var apply bool
 	switch o.applyPolicy() {
-	case "verified":
+	// branch is "verified, on a branch, merged": a failed, rejected or unverified
+	// delegation is NEVER merged. Its branch is kept so it can be looked at, which
+	// is already better than today, where the work evaporates with the worktree.
+	case "verified", "branch":
 		apply = v.Status == "passed"
 	// "rejected" is none of these, so apply: always cannot override a reject.
 	case "always":
@@ -473,20 +516,7 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		preview := fmt.Sprintf("   %s by %s:\n     %s", plural(files, "file changed", "files changed"), roleName+map[bool]string{true: ", check passed", false: ", check " + v.Status}[v.Status == "passed"], strings.Join(wt.changedFiles, "\n     "))
 		// Every file the diff touches is checked against the edit rules; the
 		// strictest decides (one denied file blocks the whole apply).
-		pattern, act := "*", Allow
-		for _, f := range wt.changedFiles {
-			switch Evaluate("edit", permPath(s.jail(), f), s.rules()...) {
-			case Deny:
-				pattern, act = f, Deny
-			case Ask:
-				if act == Allow {
-					pattern, act = f, Ask
-				}
-			}
-			if act == Deny {
-				break
-			}
-		}
+		act, pattern := s.editGate(wt.changedFiles)
 		var msg string
 		ok := act == Allow
 		switch act {
@@ -495,21 +525,35 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		case Ask:
 			msg, ok = tc.Ask("edit", pattern, "APPLY diff from "+roleName, preview)
 		}
-		if !ok {
+		switch {
+		case !ok:
 			v.Status = "not_applied"
 			v.Tail = strings.TrimSpace(v.Tail + "\n" + msg)
-		} else if err := wt.applyTo(s.jail().Root, diff); err != nil {
-			v.Status = "conflict"
-			why := "applying the diff to the caller's tree failed:\n" + err.Error()
-			if !sameTree {
-				why = fmt.Sprintf("applying %s's diff from %s to your tree on %s failed:\n%s\n%s",
-					roleName, target.MemberName(), caller.MemberName(), err.Error(), wt.heads(roleName))
+		case wt.branch != "":
+			applied, v.Status, v.Tail = o.mergeBranch(tc, child, wt, s.rootUID(), child.ID, checks, v.Status, v.Tail)
+		default:
+			// apply: branch was asked for and could not be honoured: say so where the
+			// model will read it, next to the result of the patch it got instead.
+			if why != "" {
+				v.Tail = strings.TrimSpace(v.Tail + "\n\n" + why)
 			}
-			v.Tail = strings.TrimSpace(v.Tail + "\n\n" + why)
-		} else {
-			applied = true
-			for _, f := range wt.changedFiles {
-				s.noteRead(tc.Ctx, f) // the caller has "seen" what it just merged
+			if err := s.applyPatch(wt, diff); err != nil {
+				v.Status = "conflict"
+				why := "applying the diff to the caller's tree failed:\n" + err.Error()
+				if !sameTree {
+					why = fmt.Sprintf("applying %s's diff from %s to your tree on %s failed:\n%s\n%s",
+						roleName, target.MemberName(), caller.MemberName(), err.Error(), wt.heads(roleName))
+				}
+				v.Tail = strings.TrimSpace(v.Tail + "\n\n" + why)
+			} else {
+				applied = true
+				for _, f := range wt.changedFiles {
+					// DROPPED, not refreshed. The caller has seen a DIFF, not the file:
+					// a record here said "you know these bytes" and licensed its next
+					// whole-file write to erase the merge it had just accepted. One extra
+					// read_file is the price of not losing the delegation's work.
+					s.forgetRead(tc.Ctx, f)
+				}
 			}
 		}
 	}
@@ -570,6 +614,7 @@ type worktree struct {
 	root         string   // the subagent's jail root inside it (same subdir as the caller's)
 	sub          string   // jail root relative to the repo top ("." = top)
 	base         string   // snapshot commit
+	branch       string   // real branch this worktree is on ("" = detached, today's default)
 	changedFiles []string // relative to the jail root
 }
 
@@ -627,8 +672,21 @@ func gitCmd(dir string, env []string, stdin []byte, args ...string) (string, err
 
 // create snapshots the working tree under jailRoot — tracked changes and new
 // non-ignored files, without touching the user's index or HEAD (a temporary
-// index) — and checks the snapshot out as a detached worktree.
-func (m *worktrees) create(jailRoot, lcaDir, session string) (*worktree, error) {
+// index) — and checks the snapshot out as a worktree.
+//
+// branch == "" is today's path to the byte: a DETACHED worktree that dies with
+// the call. A non-empty branch (apply: branch) makes `worktree add -b` create a
+// real branch instead, which survives the worktree and so survives a failed,
+// rejected or conflicted delegation — the work can be looked at next morning
+// instead of evaporating. The branch is cut from the caller's DIRTY tree, as the
+// snapshot already is: a subagent that cannot see the caller's uncommitted work
+// is working on a different program.
+//
+// Real branches and not refs/lca/* for the work, for one measured reason: git
+// refuses `branch -d` and `branch -D` on a branch a worktree holds, while
+// `update-ref -d` SUCCEEDS under a live worktree and leaves it at HEAD 0000000.
+// The safety net only exists for things under refs/heads.
+func (m *worktrees) create(jailRoot, lcaDir, session, branch string) (*worktree, error) {
 	top, err := gitCmd(jailRoot, nil, nil, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return nil, fmt.Errorf("delegate needs a git repository: %w", err)
@@ -644,59 +702,49 @@ func (m *worktrees) create(jailRoot, lcaDir, session string) (*worktree, error) 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	idx, err := os.CreateTemp("", "lca-index-*")
-	if err != nil {
-		return nil, err
+	// A lock FILE as well as the mutex: worktrees.mu serialises this process only,
+	// and two terminals in one project race git's worktree bookkeeping exactly as
+	// removeLocked's own note says they do. Best-effort — an unlockable repository
+	// must not make delegation impossible — but when it works, the branch-name
+	// probe below and `worktree add` cannot be interleaved by another lca.
+	if unlock, err := lockGit(leaseDir(top, lcaDir)); err == nil {
+		defer unlock()
 	}
-	idx.Close()
-	os.Remove(idx.Name()) // git wants to create it
-	defer os.Remove(idx.Name())
-	env := []string{"GIT_INDEX_FILE=" + idx.Name()}
+
 	head, headErr := gitCmd(top, nil, nil, "rev-parse", "--verify", "-q", "HEAD")
 	head = strings.TrimSpace(head)
-	if headErr == nil && head != "" {
-		if _, err := gitCmd(top, env, nil, "read-tree", head); err != nil {
-			return nil, err
-		}
+	if headErr != nil {
+		head = ""
 	}
-	if _, err := gitCmd(top, env, nil, "add", "-A"); err != nil {
-		return nil, err
-	}
-	tree, err := gitCmd(top, env, nil, "write-tree")
+	commit, err := snapshotOf(top, lcaDir, "lca delegate snapshot", head, head)
 	if err != nil {
 		return nil, err
 	}
-	args := []string{"commit-tree", strings.TrimSpace(tree), "-m", "lca delegate snapshot"}
-	if head != "" {
-		args = append(args, "-p", head)
-	}
-	commit, err := gitCmd(top, nil, nil, args...)
-	if err != nil {
-		return nil, err
-	}
-	commit = strings.TrimSpace(commit)
 
-	base, err := filepath.Abs(filepath.Join(lcaDir, "worktrees"))
+	dir, err := worktreeDir(lcaDir, session)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		return nil, err
-	}
-	dir, err := os.MkdirTemp(base, session+"-")
-	if err != nil {
-		return nil, err
-	}
-	os.Remove(dir) // worktree add wants to create it
 	// no user hooks: post-checkout scripts don't belong in an agent's scratch copy
-	if _, err := gitCmd(top, nil, nil, "-c", "core.hooksPath="+os.DevNull, "worktree", "add", "--detach", dir, commit); err != nil {
+	add := []string{"-c", "core.hooksPath=" + os.DevNull, "worktree", "add", "--detach", dir, commit}
+	if branch != "" {
+		branch = freeBranch(top, branch)
+		add = []string{"-c", "core.hooksPath=" + os.DevNull, "worktree", "add", "-b", branch, dir, commit}
+	}
+	if _, err := gitCmd(top, nil, nil, add...); err != nil {
 		return nil, err
+	}
+	if branch != "" {
+		// Authorship, recorded the moment the branch exists: `lca clean --branches`
+		// deletes only a branch that carries this, because the name and the ancestry
+		// can both be satisfied by a branch a human made (see madeRef).
+		gitCmd(top, nil, nil, "update-ref", madeRef(branch), commit)
 	}
 	if real, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = real
 	}
-	w := &worktree{mgr: m, top: top, dir: dir, root: filepath.Join(dir, sub), sub: filepath.ToSlash(sub), base: commit}
+	writeOwner(dir, owner{session: session, role: "delegate", branch: branch, base: commit})
+	w := &worktree{mgr: m, top: top, dir: dir, root: filepath.Join(dir, sub), sub: filepath.ToSlash(sub), base: commit, branch: branch}
 	if info, err := os.Stat(w.root); err != nil || !info.IsDir() {
 		w.removeLocked()
 		return nil, fmt.Errorf("%s has no tracked or untracked non-ignored files, so it doesn't exist in the snapshot", sub)
@@ -999,5 +1047,13 @@ func (w *worktree) removeLocked() {
 	if _, err := gitCmd(w.top, nil, nil, "worktree", "remove", "--force", w.dir); err != nil {
 		os.RemoveAll(w.dir)
 	}
-	gitCmd(w.top, nil, nil, "worktree", "prune")
+	// The branch, if there is one, SURVIVES this on purpose: that is the whole
+	// point of apply: branch, and git refuses `branch -d`/`-D` on a branch a
+	// worktree holds, so the order is forced anyway. Only `lca clean --branches`
+	// deletes one, and only when asked.
+	os.Remove(w.dir + ".owner")
+	// --expire and never bare: a bare prune in one lca removes the admin entry of
+	// a worktree another lca added three milliseconds ago, and that worktree's next
+	// git command fails with no explanation anyone can act on.
+	gitCmd(w.top, nil, nil, "worktree", "prune", "--expire=1.hour.ago")
 }

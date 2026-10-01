@@ -650,28 +650,130 @@ func (r *Remote) grep(ctx context.Context, pattern, p, include string, allow fun
 	return strings.Join(kept, "\n")
 }
 
-// stat returns the file's size and mtime (unix seconds), or exists=false.
-func (r *Remote) stat(ctx context.Context, rel string) (mtime int64, exists bool) {
-	out, exit := r.run(ctx, "stat -c %Y -- "+shellQuote(remotePath(rel))+" 2>/dev/null || stat -f %m -- "+shellQuote(remotePath(rel)), 30*time.Second, nil, nil)
+// statSum returns the file's mtime (unix seconds), size and sha256 in ONE round
+// trip, or exists=false. The hash is what kills `stat -c %Y`'s whole-second
+// blindness: two writes inside one second are invisible to the mtime and
+// obvious to the hash. sum comes back "" when the far side has neither shasum
+// nor sha256sum, and "" never equals a recorded fingerprint.
+func (r *Remote) statSum(ctx context.Context, rel string) (mtime, size int64, sum string, exists bool) {
+	q := shellQuote(remotePath(rel))
+	// The existence test is first and decides the exit code, because the pipeline
+	// that follows ends in `cut`, which exits 0 on empty input: without the
+	// explicit exit the function would report every missing file as existing, and
+	// a `write` meaning "create" would turn into an overwrite of nothing.
+	//
+	// GNU's stat form first, BSD's second — the order Remote.stat already uses.
+	// The other way round, GNU's -f means "file system status", so it prints a
+	// block of mount information to stdout before failing. The braces are for
+	// Remote.script's `cd <dir> && <cmd>`: without them the && would bind to the
+	// first line only and the rest would run wherever the process started.
+	cmd := fmt.Sprintf("{ [ -e %s ] || exit 1\nstat -c '%%Y %%s' -- %s 2>/dev/null || stat -f '%%m %%z' -- %s 2>/dev/null\n(shasum -a 256 -- %s 2>/dev/null || sha256sum -- %s 2>/dev/null) | cut -d' ' -f1\n}",
+		q, q, q, q, q)
+	out, exit := r.run(ctx, cmd, 30*time.Second, nil, nil)
 	if exit != 0 {
-		return 0, false
+		return 0, 0, "", false
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(lastLines(out, 1, 64)), 10, 64)
-	if err != nil {
-		return 0, true
+	// Each line is identified by its shape rather than its position, so a member
+	// with no stat or no hashing tool degrades to the half it does have instead of
+	// reporting the other half's output as a timestamp.
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		switch {
+		case l == "":
+		case len(l) == 64 && strings.IndexFunc(l, func(r rune) bool {
+			return !strings.ContainsRune("0123456789abcdefABCDEF", r)
+		}) < 0:
+			sum = strings.ToLower(l)
+		default:
+			f := strings.Fields(l)
+			if n, err := strconv.ParseInt(f[0], 10, 64); err == nil {
+				mtime = n
+				if len(f) > 1 {
+					size, _ = strconv.ParseInt(f[1], 10, 64)
+				}
+			}
+		}
 	}
-	return n, true
+	return mtime, size, sum, true
 }
 
-// write replaces a file's contents (creating parent directories).
-func (r *Remote) write(ctx context.Context, rel, content string) string {
-	dir := path.Dir(rel)
-	cmd := fmt.Sprintf("mkdir -p %s && cat > %s", shellQuote(remotePath(dir)), shellQuote(remotePath(rel)))
-	out, exit := r.run(ctx, cmd, 2*time.Minute, []byte(content), nil)
-	if exit != 0 {
-		return "error: " + strings.TrimSpace(lastLines(out, 5, 500))
+// The two refusals the compare-and-swap below can report. They are exit codes
+// and not strings because the shell is the only thing that can see them, and a
+// message built on this side would be guessing.
+const (
+	remoteWriteStale    = 3 // the file's bytes are not the ones this write was computed from
+	remoteWriteAppeared = 4 // a "create" found the file already there
+	remoteWriteGone     = 5 // an "overwrite" found the file deleted
+)
+
+// write replaces a file's contents (creating parent directories), and does its
+// own compare-and-swap: expectSum is the hash the far side must still see, or
+// expectNew says the file must not exist at all. Doing it HERE, in one shell, is
+// the point — the check and the bytes used to be separated by a network hop and
+// a human answering an approval prompt, and anything written in that window was
+// erased without a word.
+//
+// It is also the far side's atomicity: the old form was `cat > file`, truncate
+// then stream, so an ssh killed mid-transfer left a TRUNCATED file. Now the
+// bytes land in a temp file and `mv` renames it, which leaves a stray
+// .lca-tmp-XXXXXX at worst. There is still no cross-process lock on the member
+// and none is invented: another writer on that machine inside the microseconds
+// between the hash and the mv wins, and the README says so.
+//
+// The temp name is UNIQUE per writer, which is not a detail. A name derived only
+// from the path — one `<rel>.lca-tmp` per file — is shared by every writer of
+// that file, and there is deliberately no lock out here to stop two of them: two
+// `cat >` into one temp and two `mv -f` of it produce a file holding an
+// interleave of both payloads, content no writer ever had, in the function whose
+// stated job is that no reader sees a spliced file. That is strictly worse than
+// the `cat > file` it replaces, which could only truncate. mktemp first, the
+// shell's own pid as the fallback for a member without it.
+func (r *Remote) write(ctx context.Context, rel, content, expectSum string, expectNew bool) (int, string) {
+	f := shellQuote(remotePath(rel))
+	dir := remotePath(path.Dir(rel))
+	tmpl := shellQuote(strings.TrimSuffix(dir, "/") + "/.lca-tmp-XXXXXX")
+	fallback := shellQuote(strings.TrimSuffix(dir, "/") + "/.lca-tmp-")
+	newFlag := ""
+	if expectNew {
+		newFlag = "1"
 	}
-	return ""
+	// Braces around the whole thing, because Remote.script frames a command as
+	// `cd <dir> && <cmd>` and these paths are relative: without the group the &&
+	// would bind to the first LINE only and a failed cd would run the rest of the
+	// script — and the mv — in the home directory.
+	script := "{\n" + strings.Join([]string{
+		"set -e",
+		"mkdir -p " + shellQuote(remotePath(path.Dir(rel))),
+		"m=",
+		"if [ -e " + f + " ]; then",
+		"  [ -z " + shellQuote(newFlag) + " ] || { echo lca-appeared; exit 4; }",
+		"  if [ -n " + shellQuote(expectSum) + " ]; then",
+		"    h=$( (shasum -a 256 -- " + f + " 2>/dev/null || sha256sum -- " + f + ") | cut -d' ' -f1 )",
+		"    [ \"$h\" = " + shellQuote(expectSum) + " ] || { echo \"lca-stale $h\"; exit 3; }",
+		"  fi",
+		"  m=$(stat -c %a -- " + f + " 2>/dev/null || stat -f %Lp -- " + f + " 2>/dev/null || echo)",
+		"else",
+		"  [ -n " + shellQuote(newFlag) + " ] || { echo lca-gone; exit 5; }",
+		"fi",
+		"t=$(mktemp " + tmpl + " 2>/dev/null) || t=" + fallback + "$$",
+		// The trap and not `set -e` alone: a cat that fails halfway (a full disk, a
+		// dropped link) must not leave the temp file behind for `lca clean` to find
+		// an hour later, and after a successful mv there is nothing left to remove.
+		"trap 'rm -f \"$t\"' EXIT",
+		"cat > \"$t\"",
+		// The mode is copied explicitly: mv preserves the temp file's mode, so an
+		// executable script would come back 0644 (or 0600) without this.
+		"[ -z \"$m\" ] || chmod \"$m\" \"$t\" 2>/dev/null || true",
+		"mv -f \"$t\" " + f,
+	}, "\n") + "\n}"
+	out, exit := r.run(ctx, script, 2*time.Minute, []byte(content), nil)
+	switch exit {
+	case 0:
+		return 0, ""
+	case remoteWriteStale, remoteWriteAppeared, remoteWriteGone:
+		return exit, ""
+	}
+	return exit, "error: " + strings.TrimSpace(lastLines(out, 5, 500))
 }
 
 // read returns a file's whole contents for editing.

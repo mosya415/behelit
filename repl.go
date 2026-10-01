@@ -114,7 +114,14 @@ func replRegistry() []replCmd {
 		{name: "/edit", desc: "edit and resend your last message", group: "turn", run: (*Repl).cmdEdit},
 
 		{name: "/diff", desc: "what the agents changed this session", group: "review", run: (*Repl).cmdDiff},
-		{name: "/undo", desc: "revert the last change", group: "review", run: (*Repl).cmdUndo},
+		{name: "/undo", desc: "revert the last change (/undo force overrides the staleness guard)", group: "review", run: (*Repl).cmdUndo},
+		// Listed only under apply: branch — the two commands have nothing to say
+		// about a team that never makes a branch, and /help's review group is
+		// already the longest one on the screen.
+		{name: "/branches", args: "[graph]", desc: "the branches lca made, and what is integrated", group: "review",
+			show: func(r *Repl) bool { return r.orch.applyPolicy() == "branch" }, run: (*Repl).cmdBranches},
+		{name: "/merge", args: "<branch>|--finish", desc: "check a conflicted delegation out as a real merge, then write the resolution", group: "review",
+			show: func(r *Repl) bool { return r.orch.applyPolicy() == "branch" }, run: (*Repl).cmdMerge},
 		{name: "/context", desc: "context size, cache, biggest outputs", group: "review", run: (*Repl).cmdContext},
 		{name: "/stats", desc: "this session: turns, tokens, cache, tool-call failures", group: "review", run: (*Repl).cmdStats},
 		// Short arg strings on purpose: /help pads its name column to the WIDEST
@@ -246,11 +253,15 @@ func (r *Repl) Loop() {
 // submit sends a typed message, attaching @file mentions.
 func (r *Repl) submit(line string) {
 	content := line
-	blocks, names := expandMentions(r.orch.jl, line)
-	if len(names) > 0 {
+	var names []string
+	blocks, reads := expandMentions(r.orch.jl, line)
+	if len(reads) > 0 {
 		content += blocks
-		for _, n := range names {
-			r.orch.noteRead(r.orch.jl, n)
+		for _, rd := range reads {
+			// The mention goes into THIS session's read set: the records are
+			// per-session now, and a mention is this conversation seeing a file.
+			r.sess.noteLocalRead(r.orch.jl, rd.path, rd.body, rd.whole)
+			names = append(names, rd.path)
 		}
 		fmt.Println(" " + faint("%s attached @%s", gNone, strings.Join(names, " @")))
 	}
@@ -863,16 +874,22 @@ func (r *Repl) cmdDiff(string) bool {
 	return false
 }
 
-func (r *Repl) cmdUndo(string) bool {
-	msg, ok := undoLast()
+func (r *Repl) cmdUndo(arg string) bool {
+	force := strings.EqualFold(strings.TrimSpace(arg), "force")
+	msg, ok := undoLast(r.orch, force)
 	if !ok {
 		fmt.Println("  " + faint("nothing to undo"))
 		return false
 	}
-	r.orch.rec.Event("undo", map[string]any{"result": msg})
-	if strings.HasPrefix(msg, "error") {
+	r.orch.rec.Event("undo", map[string]any{"result": msg, "force": force})
+	switch {
+	case strings.HasPrefix(msg, "error"):
 		errLine("%s", msg)
-	} else {
+	// A refusal is not an error: nothing went wrong, the change is still in the
+	// log, and the line it prints says how to proceed on purpose.
+	case strings.Contains(msg, "/undo force"):
+		warnLine("%s", msg)
+	default:
 		okLine("%s", msg)
 	}
 	return false

@@ -17,6 +17,11 @@ type fileChange struct {
 	before  []byte // file contents before this change
 	existed bool   // whether the file existed before this change
 	tool    string // "edit" | "write"
+	// after is the hex sha256 of what this change LEFT on disk. /undo is a writer
+	// like any other, and without this it was the only one with no guard at all:
+	// it restored in-memory bytes with os.WriteFile and no check, so a subagent's
+	// or the user's editor's later work on that file was discarded silently.
+	after string
 }
 
 var (
@@ -34,9 +39,9 @@ func snapshot(abs string) (before []byte, existed bool) {
 	return data, true
 }
 
-func recordChange(name, abs, tool string, before []byte, existed bool) {
+func recordChange(name, abs, tool string, before []byte, existed bool, after string) {
 	changeMu.Lock()
-	changeLog = append(changeLog, fileChange{name, abs, before, existed, tool})
+	changeLog = append(changeLog, fileChange{name, abs, before, existed, tool, after})
 	changeMu.Unlock()
 }
 
@@ -48,13 +53,46 @@ func resetChanges() {
 
 // undoLast reverts the most recent applied change: restores the prior bytes, or
 // deletes the file if the change had created it. Returns a description.
-func undoLast() (string, bool) {
+//
+// It is a writer, so it takes the file's lease and checks staleness like every
+// other writer: if the file no longer holds what that change left behind,
+// someone wrote it afterwards and /undo would throw their work away. `force`
+// says the human looked and wants it anyway. The log entry is only popped once
+// the undo is actually going ahead — a refusal must leave /undo able to try
+// again after the human has looked.
+func undoLast(o *Orchestrator, force bool) (string, bool) {
 	changeMu.Lock()
-	defer changeMu.Unlock()
-	if len(changeLog) == 0 {
+	n := len(changeLog)
+	if n == 0 {
+		changeMu.Unlock()
 		return "", false
 	}
-	c := changeLog[len(changeLog)-1]
+	c := changeLog[n-1]
+	changeMu.Unlock()
+
+	// The lease FIRST and changeMu second, never the other way round: a writer
+	// holds the file's lease and then takes changeMu to record what it did, so
+	// taking them in the opposite order here would wedge /undo against a subagent
+	// that is mid-write. That is why this peeks, leases, and only then re-takes
+	// the log — a lock order is a property of the whole program, not of one
+	// function.
+	release, err := o.leaseFile(c.name, c.abs)
+	if err != nil {
+		return "error: " + err.Error(), true
+	}
+	defer release()
+	if !force && c.after != "" {
+		if now := sumFile(c.abs); now != c.after {
+			return fmt.Sprintf("%s changed after that edit (a subagent or your editor wrote it) — /undo would discard that; /undo force to do it anyway", c.name), true
+		}
+	}
+	changeMu.Lock()
+	defer changeMu.Unlock()
+	// A subagent may have recorded a change while we waited for the lease. Undo
+	// the entry that was actually checked, or nothing.
+	if len(changeLog) != n || changeLog[n-1].abs != c.abs || changeLog[n-1].after != c.after {
+		return "another change landed while /undo was waiting for the file — run /undo again", true
+	}
 	changeLog = changeLog[:len(changeLog)-1]
 	if !c.existed {
 		if err := os.Remove(c.abs); err != nil && !os.IsNotExist(err) {
@@ -62,7 +100,7 @@ func undoLast() (string, bool) {
 		}
 		return "removed " + c.name + " (undo of create)", true
 	}
-	if err := os.WriteFile(c.abs, c.before, 0o644); err != nil {
+	if err := writeFileAtomic(c.abs, c.before); err != nil {
 		return "error restoring " + c.name + ": " + err.Error(), true
 	}
 	return "reverted " + c.name, true

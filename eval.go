@@ -599,7 +599,14 @@ func prepareWorkspace(cfg Config, t *EvalTask, work string) (func(), error) {
 	}
 	return func() {
 		gitCmd(top, nil, nil, "worktree", "remove", "--force", work)
-		gitCmd(top, nil, nil, "worktree", "prune")
+		// --expire, never bare: a bare prune in one lca deletes the admin entry of a
+		// worktree another lca created milliseconds ago, and that worktree's next git
+		// command fails with "not a git repository" — which nobody can act on. It
+		// used to cost a scratch copy here; under `apply: branch` the entry can
+		// belong to a worktree holding a verified delegation's branch, and running
+		// `lca eval` in the same repository as an unattended session is ordinary.
+		// Same reason as delegate.go's and clean.go's prunes, which already say so.
+		gitCmd(top, nil, nil, "worktree", "prune", "--expire=1.hour.ago")
 	}, nil
 }
 

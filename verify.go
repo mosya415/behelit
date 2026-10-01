@@ -99,7 +99,32 @@ func (s *Session) RunVerifiedAll(ctx context.Context, checks []string, attempts 
 		case err != nil:
 			v.Status, v.Err, v.Tail = "error", err, err.Error()
 			return v
-		case len(checks) == 0:
+		}
+		// Under `apply: branch` the ENGINE commits what this attempt produced, here
+		// and nowhere else: one commit per attempt, before the check runs, so a
+		// failed delegation's branch still shows what it tried. No new tool, so the
+		// request prefix does not move and a role cannot forget to commit.
+		//
+		// A commit that fails is an ERROR and not a warning, because under this mode
+		// the BRANCH is the deliverable. Warned about and carried on, the sequence
+		// is: the branch stays at the snapshot, the check passes, the diff is
+		// non-empty so the integration runs, the merge of an empty branch produces a
+		// 0-byte patch, and the caller is handed `status: passed` with the words
+		// "already in your working tree" while the worktree holding the only copy of
+		// the work is deleted by `defer wt.remove()`. Measured against a project with
+		// commit.gpgsign on: nothing is written and the loss is reported as a
+		// success. In an unattended run nobody reads a warnLine.
+		//
+		// A session without a branch — every session under `apply: verified`, which
+		// is the default — returns nil from commitWork immediately, so nothing here
+		// changes for them.
+		if cerr := s.commitWork(ctx, s.wt, attempt); cerr != nil {
+			v.Status, v.Err = "error", cerr
+			v.Tail = fmt.Sprintf("committing %s's attempt %d onto %s failed, so the branch does not hold the work and NOTHING was merged: %s",
+				s.agent.Name, attempt, s.branch, cerr)
+			return v
+		}
+		if len(checks) == 0 {
 			v.Status = "unverified"
 			return v
 		}

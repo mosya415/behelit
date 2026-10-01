@@ -148,7 +148,13 @@ func (v *termView) ToolDone(name string, args Args, res string) {
 		case "not_applied":
 			toolInfo(fmt.Sprintf("verified, not applied (%s)", plural(files, "file", "files")))
 		case "conflict":
-			toolErr("verified, but the diff no longer applies to your tree")
+			// Patch-era wording would be wrong under `apply: branch` — nothing was
+			// patched and nothing failed to apply there, a real three-way merge
+			// conflicted — and this one line is all the delegate row can hold. Where
+			// the branch, the merge worktree and "the run stops here" go is
+			// Session.tellTheHuman, which prints them from the orchestrator rather
+			// than hoping the lead relays them.
+			toolErr("verified, but it conflicts with your tree — nothing was written")
 		default:
 			toolErr(fmt.Sprintf("%s — %s", r.Status, summarize(lastLines(r.TestTail, 1, 200))))
 		}

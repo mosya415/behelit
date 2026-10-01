@@ -66,6 +66,14 @@ transport: native      # tool calling through the gateway: native | text
 #     prompt: |
 #       You review one finished diff and name the failure mode you found.
 apply: verified        # delegate diffs reach your tree only when the check passed
+#                      # verified | always | never | branch. "branch" puts each
+#                      # delegation on a real lca/<role>/<session>-<task> branch and
+#                      # merges it three-way into your working tree: a conflict is
+#                      # then a real conflict, the branch survives a failure, and
+#                      # /branches, /merge and `lca clean --branches` manage them.
+#                      # Declare a role literally named "integrator" to give a
+#                      # conflict ONE supervised resolution attempt before it
+#                      # goes to you — one, whatever verify_attempts says.
 
 # named model chains, so price is one edit instead of one per role. A role points
 # at a chain with "tier: <name>"; -tier / LCA_TIER / `lca run -tier` /

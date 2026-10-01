@@ -241,8 +241,12 @@ func (o *Orchestrator) forkedContext(parent, child *Session) (msgs []Message, fi
 		if err != nil {
 			continue
 		}
-		if data, err := os.ReadFile(abs); err == nil && string(data) == strings.TrimPrefix(r.body, prefix) {
-			o.noteRead(child.jail(), r.path)
+		body := strings.TrimPrefix(r.body, prefix)
+		if data, err := os.ReadFile(abs); err == nil && string(data) == body {
+			// The CHILD's own read set, not the parent's. The records are per-session
+			// now, so seeding the parent's would hand the child nothing and quietly
+			// refresh the caller's knowledge of a file it has not looked at again.
+			child.noteLocalRead(child.jail(), r.path, body, true)
 		}
 	}
 	return render(found), len(found), dropped

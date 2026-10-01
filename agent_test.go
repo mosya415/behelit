@@ -112,7 +112,7 @@ func TestApplyEdit_Strict(t *testing.T) {
 	f := filepath.Join(dir, "a.txt")
 	os.WriteFile(f, []byte("alpha\nbeta\ngamma\n"), 0o644)
 
-	if _, err := applyEdit(f, "a.txt", "beta", "BETA"); err != nil {
+	if _, _, err := applyEdit(f, "a.txt", "beta", "BETA"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	got, _ := os.ReadFile(f)
@@ -120,12 +120,12 @@ func TestApplyEdit_Strict(t *testing.T) {
 		t.Fatalf("bad result: %q", got)
 	}
 
-	if _, err := applyEdit(f, "a.txt", "nope", "x"); err == nil {
+	if _, _, err := applyEdit(f, "a.txt", "nope", "x"); err == nil {
 		t.Fatal("expected not-found error")
 	}
 
 	os.WriteFile(f, []byte("x\nx\n"), 0o644)
-	if _, err := applyEdit(f, "a.txt", "x", "y"); err == nil {
+	if _, _, err := applyEdit(f, "a.txt", "x", "y"); err == nil {
 		t.Fatal("expected ambiguous-match error")
 	}
 }
@@ -315,27 +315,28 @@ func TestUndoLast(t *testing.T) {
 	os.WriteFile(f, []byte("original\n"), 0o644)
 	before, existed := snapshot(f)
 	os.WriteFile(f, []byte("changed\n"), 0o644)
-	recordChange("a.txt", f, "edit", before, existed)
+	recordChange("a.txt", f, "edit", before, existed, sumBytes([]byte("changed\n")))
 
 	// create of a new file → undo deletes it
 	g := filepath.Join(dir, "new.txt")
 	nb, ne := snapshot(g)
 	os.WriteFile(g, []byte("created\n"), 0o644)
-	recordChange("new.txt", g, "write", nb, ne)
+	recordChange("new.txt", g, "write", nb, ne, sumBytes([]byte("created\n")))
 
-	if _, ok := undoLast(); !ok { // undo the create
+	o := leaseOrch(t, dir)
+	if _, ok := undoLast(o, false); !ok { // undo the create
 		t.Fatal("undo create failed")
 	}
 	if _, err := os.Stat(g); !os.IsNotExist(err) {
 		t.Fatal("undo of a create must delete the file")
 	}
-	if _, ok := undoLast(); !ok { // undo the edit
+	if _, ok := undoLast(o, false); !ok { // undo the edit
 		t.Fatal("undo edit failed")
 	}
 	if got, _ := os.ReadFile(f); string(got) != "original\n" {
 		t.Fatalf("undo edit didn't restore: %q", got)
 	}
-	if _, ok := undoLast(); ok {
+	if _, ok := undoLast(o, false); ok {
 		t.Fatal("undo on empty log should report nothing to undo")
 	}
 }
@@ -345,9 +346,9 @@ func TestExpandMentions(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "greet.go"), []byte("package main\nfunc greet() {}\n"), 0o644)
 	j, _ := NewJail(dir, nil, false)
 
-	blocks, names := expandMentions(j, "please explain @greet.go, thanks")
-	if len(names) != 1 || names[0] != "greet.go" {
-		t.Fatalf("names = %v, want [greet.go]", names)
+	blocks, reads := expandMentions(j, "please explain @greet.go, thanks")
+	if len(reads) != 1 || reads[0].path != "greet.go" || !reads[0].whole {
+		t.Fatalf("reads = %+v, want one whole greet.go", reads)
 	}
 	if !strings.Contains(blocks, `<file path="greet.go">`) || !strings.Contains(blocks, "func greet()") {
 		t.Fatalf("blocks missing file content: %q", blocks)

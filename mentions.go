@@ -73,7 +73,17 @@ var reMention = regexp.MustCompile(`(^|\s)@([^\s]+)`)
 // file inside the jail, returning injectable <file> blocks and the names
 // attached. Tokens that don't resolve to a readable file are left untouched, so
 // stray @handles in prose are harmless.
-func expandMentions(jail *Jail, line string) (blocks string, names []string) {
+// mentionRead is one attached file: the path as it was written, and whether the
+// block carries the WHOLE file. headTail truncates an oversized one, and a
+// truncated attachment is not knowledge of the file — recording it as one would
+// let the next `write` erase everything the model never saw.
+type mentionRead struct {
+	path  string
+	body  string
+	whole bool
+}
+
+func expandMentions(jail *Jail, line string) (blocks string, reads []mentionRead) {
 	seen := map[string]bool{}
 	for _, m := range reMention.FindAllStringSubmatch(line, -1) {
 		tok := strings.TrimRight(m[2], ".,;:!?)") // shed trailing prose punctuation
@@ -94,7 +104,7 @@ func expandMentions(jail *Jail, line string) (blocks string, names []string) {
 		}
 		seen[tok] = true
 		blocks += fmt.Sprintf("\n<file path=\"%s\">\n%s\n</file>\n", tok, headTail(string(data), maxReadBytes))
-		names = append(names, tok)
+		reads = append(reads, mentionRead{path: tok, body: string(data), whole: len(data) <= maxReadBytes})
 	}
-	return blocks, names
+	return blocks, reads
 }

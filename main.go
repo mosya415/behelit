@@ -32,6 +32,14 @@ func main() {
 			os.Exit(runDoctor(context.Background(), cfg, os.Args[2:]))
 		case "report":
 			os.Exit(runReport(cfg, os.Args[2:]))
+		// clean and merge are the two things only a human does, so they are
+		// subcommands and not tools: removing what a session left behind, and
+		// finishing a merge a model was told to hand over. Neither of them talks to
+		// a gateway, which is why they are here and not after the client is built.
+		case "clean":
+			os.Exit(runClean(cfg, os.Args[2:]))
+		case "merge":
+			os.Exit(runMerge(cfg, os.Args[2:]))
 		case "help", "--help":
 			usage()
 			return
@@ -287,6 +295,8 @@ func usage() {
 		"   lca run <name>               run a workflow (deterministic steps; -list, -dry-run)",
 		"   lca eval tasks/              run evaluation tasks (see README)",
 		"   lca report                   render the newest trace as one HTML file",
+		"   lca merge <branch>           check a delegation's branch out as a real merge (apply: branch)",
+		"   lca clean [--branches]       remove what dead sessions left behind",
 		"",
 		" " + f("FLAGS"),
 		"   -role <name>                 role (roles.yaml) or agent to run as",

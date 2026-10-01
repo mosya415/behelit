@@ -22,10 +22,10 @@ trail come from the process (uid/gid) for free.
 - [Configuration in the session](#configuration-in-the-session--setup-config-set-save) — `/config`, `/set`, `/save`, the `config.json` keys, the API-key rule
 - [Non-interactive: CI, scripts and containers](#non-interactive-ci-scripts-and-containers) · [Environment variables](#environment-an-override-one-run-at-a-time)
 - [Models & providers](#models--providers--providersgo-modelsgo-chatgo) — presets, per-family profiles, the JSON config
-- [The team — `roles.yaml`](#the-team--rolesyaml-rolesgo-delegatego-verifygo) — roles, [delegation and the verifier](#delegation-and-the-verifier--delegaterole-task-check_cmd), [cross-family review](#cross-family-review), [`fork:`](#fork-true--inherit-the-reads-not-the-transcript), [tiers](#tiers-develop-on-premium-operate-on-cheap), `/role`
+- [The team — `roles.yaml`](#the-team--rolesyaml-rolesgo-delegatego-verifygo) — roles, [delegation and the verifier](#delegation-and-the-verifier--delegaterole-task-check_cmd), [`apply: branch`](#apply-branch--a-delegation-becomes-a-real-branch--branchgo-cleango), [cross-family review](#cross-family-review), [`fork:`](#fork-true--inherit-the-reads-not-the-transcript), [tiers](#tiers-develop-on-premium-operate-on-cheap), `/role`
 - [Through the gateway](#through-the-gateway--gwpolicygo-chatgo) — the cacheable prefix, [failure policy](#gateway-failure-policy), transports, per-model settings
 - [Measuring runs](#measuring-runs--the-trace-lca-eval-lca-report) — the trace, `lca eval`, `lca report`
-- [The sandbox](#the-sandbox--jailgo-toolsgo) — allowlist, shell mode, the GPU policy
+- [The sandbox](#the-sandbox--jailgo-toolsgo) — allowlist, shell mode, the GPU policy, [concurrent edits](#concurrent-edits--filelockgo-enginego-editgo)
 - [Internal MCP servers](#internal-mcp-servers--mcpgo-mcpclientgo-mcpcmdgo) — the host allowlist, the pinned tool manifest, read vs. write, `/mcp`
 - [Deterministic workflows — `lca run`](#deterministic-workflows--lca-run-workflowgo)
 - [Working on other machines: the fleet](#working-on-other-machines-the-fleet--membersgo-remotego)
@@ -415,7 +415,7 @@ at it and describe the team in `roles.yaml` (`.lca/roles.yaml`,
 ```yaml
 entry: lead
 transport: native
-apply: verified            # verified | always | never
+apply: verified            # verified | always | never | branch
 defaults: {context: 128000, verify_attempts: 2, check_timeout: 900}
 sandbox:
   allow: [go, git, make, pytest, ls, cat, bsk]
@@ -476,6 +476,130 @@ without prompts; `bsk` still asks.
 `-check` gives a one-shot run the same contract:
 `lca -role coder -check "go test ./..." "fix the flaky parser test"` exits 0
 only if the check passes.
+
+### `apply: branch` — a delegation becomes a real branch — `branch.go`, `clean.go`
+
+One team-wide line in `roles.yaml`:
+
+```yaml
+apply: branch
+```
+
+Everyone who does not write it keeps today's behaviour to the byte: detached
+worktrees, `git apply` of the text patch, the same statuses, the same result
+JSON. The switch is **not** per call and the model never chooses it — a tool
+parameter would move the request prefix the gateway caches on, and a default
+that quietly changed how a verified diff lands would change the outcome of every
+existing workflow on upgrade.
+
+With it on, a delegation's work is a branch named
+`lca/<role>/<session>-<task>` — `lca/coder/20260930-141233-4412-t3`, the same
+ids the transcript, the trace and the HTML report use, so a branch found next
+morning traces back to the session that made it. The branch is cut from the
+caller's **dirty** tree (as the snapshot already is: a subagent that cannot see
+your uncommitted work is working on a different program), the engine commits
+once per verifier attempt, and the branch **outlives the call** — including when
+the delegation failed, was rejected or conflicted. Today that work evaporates
+with the worktree; now you can read it.
+
+`branch` means *verified, on a branch, merged*. Nothing unverified is ever
+merged.
+
+**Integration is a real three-way merge in the object database, never a
+checkout.** Your tree is usually dirty, and against a dirty tree a text patch
+fails as "the patch did not apply" whether the two sides genuinely collide or
+merely sit three lines apart — while `git merge` refuses outright and
+`git apply --3way` reads the index your dirty tree does not match. So lca
+snapshots your current tree as the *ours* side, merges with
+`git merge-tree --write-tree` against the snapshot the branch was cut from, and
+writes the result as `git diff | git apply --binary` behind the usual per-file
+`edit` approval. HEAD, your checked-out branch, your index and the
+staged/unstaged split of a half-staged file all come back byte-identical; your
+dirty lines and untracked files stay. The clean-tree case is the same code path,
+not a second one. Needs git 2.38; an older git is detected up front and falls
+back to the patch, saying so.
+
+**A conflict is a conflict.** `status` stays `conflict`, **nothing** is written,
+the branch is kept, and the three sides go into `test_tail` as
+`git cat-file -p <oid>` commands the calling model can resolve from. Conflict
+markers never go into your files — the patch is scanned for them before
+anything is written, so a resolution that only *looks* finished is refused
+wherever it came from. Then, in order: the calling model; an `integrator` role,
+if your team declares one, which gets **one** supervised attempt in its own
+merge worktree under the failed delegation's own `check_cmd` (one, literally —
+not your `verify_attempts`), its resolution meeting the same `edit` rules a
+delegation's own diff meets; and if that attempt does not pass, the run stops,
+your screen says so and names the worktree, and both the branch and the merge
+worktree are left for you — the worktree holding the markers, the three stages
+and a working `git merge --abort`, with the rejected attempt kept readable on
+`refs/lca/attempt/…`. Or you, with `/merge <branch>`, which checks the merge
+out as a real merge and `/merge --finish`, which writes what you committed
+there. Half a verified change is never written: partial integration of the
+clean files is deliberately not offered.
+
+Several results in one reply integrate one at a time, each re-snapshotting, so
+"the first one moved the tree" is simply the second one's *ours* side; the result
+line says `integrated 2nd of 3`. If lca is killed mid-`git apply` your tree
+really can be half patched — nothing can fix that — but a journal records it,
+`/branches` and `lca clean` tell you, and re-running the integration **is** the
+recovery, because an already-integrated branch produces a zero-byte patch.
+
+Reviewing and clearing up:
+
+```
+/branches [graph]        the branches lca made, what is integrated, what was interrupted
+/merge <branch>          check a conflicted delegation out as a real merge
+/merge --finish          write the resolution you committed there into your tree
+lca merge …              the same two, outside a session
+lca clean                remove the worktrees of dead processes, stale leases, temp files
+lca clean --branches     also delete integrated lca/* branches older than a day
+lca clean --branches <b> delete that branch even unintegrated — the only way one goes
+```
+
+A conflict that reaches you says so **on screen** and names the branch and the
+merge worktree, rather than leaving the hand-over inside the model's prompt for
+the lead to summarise away.
+
+**How to undo any of it.** Everything lca wrote to your files is unstaged
+working-tree change, so `git diff` is the complete list of what landed and
+`git log --graph --all --glob='refs/lca/*'` shows each integration commit and
+what it merged. `/undo` reverts lca's own writes one at a time, and refuses if
+something has touched the file since. Throwing a merged file away is your
+`git restore <file>` — lca will not run that for you — and nothing is lost by
+doing it, because the branch still holds the work and `lca merge <branch>`
+re-does the integration.
+
+Nothing is ever deleted on a timer or on the way out of a session. An
+unintegrated branch is deleted only when you name it; an integrated one is kept
+for a day, counted from when it **landed** and not from its last commit — an
+integration you recover two days later is still a day old to you. And only a
+branch lca recorded creating (`refs/lca/made/…`) is ever deleted: the name
+`lca/…` is one anybody may use, and a branch of your own pointing into your own
+history satisfies every other test there is. A merge worktree you were handed
+belongs to a person, not to a process, so `lca clean` leaves it alone and tells
+you how to finish it; it goes only once it is a day old, clean, and not
+mid-merge.
+
+**Across machines the result is still a text patch.** A member works on a real
+branch with real commits *on that machine*, but there is no shared object store
+to merge in, so what crosses the ssh link is the patch and the existing
+diverged-checkout message. Transferring the objects with `git bundle` is a
+measured follow-up, not something half-built here.
+
+**What is never done to your repository**, in one list: no `add`, `commit`,
+`stash`, `reset`, `checkout --`, `clean`, `rebase`, `cherry-pick`, `amend`, `gc`
+or `reflog expire` in your checkout; never a write to your index or a move of
+your HEAD; nothing under `refs/heads` except an `lca/…` branch lca made; no
+push, force-push or fetch into your refs; your unrelated dirty files are never
+committed to anything that gets merged; no conflict markers in your working
+tree; no `git apply` without `git apply --check` first; no `worktree prune`
+without `--expire`; and `-c core.hooksPath=/dev/null` and
+`-c commit.gpgsign=false` on every `worktree add`, every agent commit and the
+resolution merge, because your `pre-commit` hook otherwise runs inside an agent's
+scratch copy and your signing config otherwise asks an agent for a passphrase —
+and either one failing used to make a verified change quietly vanish. The one
+`reset --hard` in the codebase is on lca's own merge worktree, to put the markers
+and `git merge --abort` back after an integrator's attempt was rejected.
 
 ### Cross-family review
 
@@ -801,6 +925,101 @@ through the scheduler: `srun`/`sbatch`/`salloc`/`torchrun`/`deepspeed`/`accelera
 `CUDA_VISIBLE_DEVICES=` are refused with a pointer to `bsk submit -g N -- cmd`,
 and `bsk gw` (gateway administration) is off-limits — in unsafe mode too, per
 chained command segment.
+
+### Concurrent edits — `filelock.go`, `engine.go`, `edit.go`
+
+**The guarantee, in one sentence:** *no write through `edit`, `write`, a
+delegation's integration or `/undo` can silently destroy another writer's bytes
+— not across tool calls, not across subagents, not across two `lca` processes,
+not against your editor; it fails with a message instead.*
+
+How, in five moves:
+
+- **A lease per file**, keyed by the jail-resolved absolute path — never a
+  directory and never the tree, because a tree lease turns a parallel reply into
+  a queue. It is taken **after** the approval question and held to the rename,
+  for single-digit milliseconds. Never across the question: a lease held while a
+  human is away would stall every other session, and three subagents asking
+  about one file would deadlock. Waiting for one is bounded at two seconds from
+  when you asked — not two seconds per waiter ahead of you — and then fails with
+  retryable advice: contention degrades to a message, never to a hang.
+- **The check runs again under the lease.** The cheap pre-flight before the
+  prompt only saves the human a pointless question; the re-check is the
+  guarantee. `write` never re-read the file, so a sibling that wrote during the
+  prompt used to be erased without a word.
+- **The lock files live in the repository** (`<git-common-dir>/lca-locks/`), not
+  in `$LCA_DIR`. Two terminals in one project may have different `LCA_DIR`s, and
+  a lock neither one can see is not a lock. They never show in `git status` and
+  never land in a snapshot. Outside a git repository the fallback is
+  `$LCA_DIR/locks`, and the guarantee shrinks to processes that share it. A lock
+  whose owner is gone (a `SIGKILL` mid-write) is taken over by the next writer,
+  which says so and names the file. The takeover is a single atomic claim, so
+  two processes cannot both conclude a stale lock is theirs, and a lock file is
+  hard-linked into place complete — an empty one would read back as "no owner"
+  and be taken away from the writer who had just been granted it. A lock older
+  than a minute is taken over whatever its pid says: pids get reused, and a lock
+  nothing could expire made a file unwritable for ever.
+- **Writes are temp-file + mode + rename**, so no reader — another agent, your
+  editor, a test runner — ever sees half a file, and a `write` meaning "create"
+  goes through an exclusive link instead of skipping the check. The mode is
+  carried across in full, setuid/setgid/sticky included, and a file you made
+  read-only is still refused with the permission error `os.WriteFile` gave —
+  `chmod 444` keeps meaning "hands off". The costs are stated plainly: the inode
+  changes, so hard links break, a `tail -f` holding the old inode keeps seeing
+  the old bytes, extended attributes do not come across, and on a shared
+  repository a file a teammate owns comes back owned by `lca` unless the kernel
+  lets it be handed back — which is said on screen when it happens, not
+  swallowed. The bytes are `fsync`ed before the rename and the directory after
+  it, because a rename that is durable before its data is how a crash leaves you
+  with an empty file where your old one was. That costs about 8 ms a write on an
+  APFS SSD (measured: 130 µs without, 8.2 ms with) — paid once per `edit` or
+  `write` tool call and nowhere else, so an agent's whole session pays a fraction
+  of a second for never trading your old bytes against a flush that had not
+  happened. A process killed between the temp
+  file and the rename leaves a
+  `.lca-tmp-*` beside the target; it shows up as untracked in `git status` and
+  `lca clean` sweeps it (together with a member's, and the lock files under
+  `<git-common-dir>/lca-locks/`).
+- **The integration takes those leases too**, in both modes: `git apply --check`
+  then `git apply` is two passes over the same files, and git has decided the
+  patch applies by the time it starts writing. A caller on another machine is
+  not leased, because the files are over there and a lock here would guard
+  nothing.
+
+**What the model is told to have read** is now per **session** and
+content-addressed: mtime *and* size *and* the sha256 of the bytes it was shown.
+So a `touch`, or a `gofmt -w` that changed nothing, is no longer a change; bytes
+that moved inside one mtime are — including a rival write of exactly the same
+length that landed between the read and the stat, which only the hash can see; a `read_file` of a line range does not license a
+whole-file `write` (it would drop everything the model never saw); a `task` child
+starts with **none** of its parent's reads, exactly as the `task` tool's own
+description promises; and after a delegation's diff is merged the caller's
+records for those files are **dropped**, because it has seen a diff, not a file.
+
+**Not covered, said out loud:** `run_command` and a verifier's `check_cmd` write
+arbitrarily and cannot be leased — we cannot know what a command will write. They
+are *accounted for* instead: the session remembers the last one, and when a file
+turns out to have moved at or after that moment the message names the command
+rather than blaming a stranger for your own `sed -i`.
+
+`/undo` is a writer like any other: it takes the lease and refuses if the file no
+longer holds what that change left behind. `/undo force` overrides it.
+
+**On a member** the guard is a compare-and-swap inside the member's own shell:
+the hash it must still see is the hash of the bytes the model was shown, so a
+same-size rewrite inside `stat`'s whole second is caught by the hash and not
+missed by the clock. There is no cross-process lock on a member and none is
+invented — a writer on that machine inside the microseconds between the hash and
+the `mv` still wins. The temp file it writes through has a unique name per
+writer, so two concurrent writers cannot stream into one temp and `mv` a splice
+of both into place. If a member's non-interactive shell prints anything to
+stdout (an rc file without a `[ -t 1 ]` guard), what `cat` returns is not the
+file, so changes to it are refused naming the rc file rather than blaming the
+file: re-reading would reproduce the banner, and a `write` would store it.
+
+A file larger than `read_file` returns in one piece can never license a
+whole-file `write` — nothing can show the model all of it — so the refusal names
+`edit` rather than asking for a read the tool cannot perform.
 
 ## Internal MCP servers — `mcp.go`, `mcpclient.go`, `mcpcmd.go`
 
@@ -1215,8 +1434,15 @@ narrows it to one machine.
 
 On a member the file tools read and write over ssh, `run_command` and the
 verifier execute there, paths stay inside `dir` (absolute paths and `..` are
-refused, every path is shell-quoted), and the read-before-edit guard uses remote
-mtimes. Two things about the sandbox on a member, neither of them obvious:
+refused, every path is shell-quoted), and the read-before-edit guard asks the
+member for a hash, not just an mtime — `stat` there has whole-second
+granularity, and two writes inside one second are invisible to it. A write to a
+member is a **compare-and-swap in that machine's own shell**: it re-checks the
+hash of the bytes the change was computed from, refuses if they moved, and lands
+through a sibling temp file and `mv`, so an ssh killed mid-transfer leaves a
+stray `.lca-tmp` and never a truncated file. There is **no cross-process lock on
+a member and none is invented**: another writer on that machine inside the
+microseconds between the hash and the `mv` still wins. Two things about the sandbox on a member, neither of them obvious:
 
 - **A member's `allow:` replaces the team's, it does not intersect it.**
   Intersecting would turn a GPU node's `[python3, bsk]` into `[]` on most teams.
@@ -1749,7 +1975,8 @@ glob.go       glob matching, file search, HTML → text
 frontmatter.go minimal YAML frontmatter parser
 protocol.go   line-anchored tag parser (text tool-call transport)
 tools.go      fs helpers, run_command (no-shell exec, live output, stdin=EOF)
-edit.go       search/replace apply layer + whole-file write
+edit.go       search/replace apply layer + atomic whole-file write (temp + mode + rename)
+filelock.go   per-file write leases in the git common dir, content fingerprints
 replacers.go  opencode's tolerant match strategies for edit
 jail.go       realpath jail + command allowlist
 approval.go   soft approval gate + session approve-all mode
@@ -1760,7 +1987,7 @@ input.go/input_*.go one keyboard buffer: paste staging, type-ahead, per-OS reads
 rawmode_*.go  per-OS raw terminal mode (termios, no cgo)
 width_*.go    terminal size (TIOCGWINSZ), falling back to $COLUMNS
 mentions.go   @path completion and <file> attachment
-changes.go    per-session change log behind /diff and /undo
+changes.go    per-session change log behind /diff and /undo (leased, staleness-checked)
 diff.go       LCS line diff for /diff
 sessions.go   transcript listing, /resume picker, startup pruning
 recorder.go   audit.jsonl + transcript writing
@@ -1787,6 +2014,7 @@ roles_test.go gateway policy, headers, delegate/verifier, compaction, trace, san
 workflow_test.go lca run: parsing, placeholders and quoting, when/on_fail, state, resume, locks
 members_test.go the fleet: routing, per-member sandbox, cross-machine worktrees and diffs
 remote_test.go remote transport: reachability, quoting, path confinement
+filelock_test.go concurrent edits: leases, staleness, atomic writes, the member's CAS
 report_test.go lca report: totals, escaping of hostile model text, corrupt lines, no external refs
 agent_test.go tests for parser / edit / jail / tokenizer
 orchestration_test.go end-to-end loop tests against a fake OpenAI-compatible server

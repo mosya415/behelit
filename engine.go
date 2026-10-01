@@ -43,8 +43,31 @@ type Orchestrator struct {
 	nextTask int
 	slots    chan struct{} // bounds concurrently running subagents
 
-	readMu sync.Mutex
-	reads  map[string]time.Time // abs path → mtime when the agent last saw it
+	// locks is where cross-process file leases live (filelock.go): the git common
+	// dir of the project, resolved once. Not a config-derived field — two
+	// Orchestrators with different LCA_DIRs on one repository must land on the
+	// same directory, which is the whole point of asking git for it.
+	locksOnce sync.Once
+	locks     string
+
+	// Whether this git can merge in the object database (branch.go), asked once:
+	// the answer is a property of the binary and cannot change while we run, and
+	// every integration would otherwise pay a subprocess to re-learn it.
+	mt3Once sync.Once
+	mt3     bool
+	mt3Ver  string
+
+	// The integration wave, for "integrated 2nd of 3". Parallel results are never
+	// buffered into reply order — that would make a finished delegation wait on a
+	// slower sibling and only widen the window for the human to touch the file —
+	// so the ordinal is all the caller gets, and it has to be counted somewhere
+	// that outlives the individual delegations. The wave restarts once no
+	// delegation is in flight, so a later pair is "1st of 2" again and not
+	// "7th of 8".
+	waveMu       sync.Mutex
+	waveInflight int
+	waveStarted  int
+	waveDone     int
 
 	// mcp is the configured internal MCP servers, their reachability allowlist and
 	// the pinned tool manifest. nil is impossible after buildOrchestrator; empty is
@@ -113,8 +136,8 @@ func NewOrchestrator(cfg Config, fc *FileConfig, jl *Jail, ap *Approver, rec *Re
 	ps := NewProviders(cfg, fc, local)
 	ps.UseStateDir(cfg.stateDir()) // remembered context windows outlive the session
 	o := &Orchestrator{cfg: cfg, fc: fc, jl: jl, ap: ap, rec: rec, providers: ps, roles: roles, tracer: tracer, gatewayModels: -1,
-		children: map[string]*Session{}, reads: map[string]time.Time{},
-		slots: make(chan struct{}, atoiDefault(os.Getenv("LCA_MAX_PARALLEL"), 4))}
+		children: map[string]*Session{},
+		slots:    make(chan struct{}, atoiDefault(os.Getenv("LCA_MAX_PARALLEL"), 4))}
 	var w []string
 	o.agents, w = loadAgents(jl.Root, cfg.Dir, fc, ps)
 	o.warnings = append(o.warnings, w...)
@@ -165,37 +188,59 @@ func (o *Orchestrator) primaryAgents() []*Agent {
 	return out
 }
 
-// noteRead records that the agent has seen a file's current contents.
-func (o *Orchestrator) noteRead(j *Jail, path string) {
-	abs, err := j.Resolve(path)
-	if err != nil {
-		return
-	}
-	if info, err := os.Stat(abs); err == nil {
-		o.readMu.Lock()
-		o.reads[abs] = info.ModTime()
-		o.readMu.Unlock()
-	}
+// seenFile is what a session was SHOWN of a file, and when. mtime alone was not
+// enough three different ways: a whole second of mtime granularity hides a
+// change (and an ssh `stat` has only seconds), a same-size overwrite inside that
+// second is invisible, and a `touch` or a `gofmt -w` that changed nothing looked
+// like someone else's edit and sent the model back to re-read an identical file.
+type seenFile struct {
+	mtime time.Time // the file's mtime at the moment it was shown
+	size  int64
+	sum   string // hex sha256 of the bytes the model was SHOWN; "" when not a whole read
+	// noisy says the bytes the model was shown are NOT the file's bytes, and that
+	// the FILE is not to blame: on a member whose non-interactive shell prints a
+	// banner, `shown` is banner+content while the member's own sha256 is of
+	// content alone. The record then holds the MEMBER's hash — which is what its
+	// next compare-and-swap compares against, so it is the authoritative one — and
+	// the refusal names the rc file rather than the file. Reported as staleness
+	// instead it named the wrong cause and offered a remedy that cannot work: a
+	// re-read reproduces the same banner, so remote editing stayed wedged for ever
+	// behind a message about a file nobody had touched.
+	noisy bool
+	at    time.Time // when it was shown — the only thing that can say "you read it at"
 }
 
-// checkStale guards edits of existing files: the agent must have read the file
-// (so it isn't editing from a guess), and the file must not have changed on
-// disk since (so it isn't overwriting someone else's edit). "" means OK.
-func (o *Orchestrator) checkStale(j *Jail, path, abs string) string {
-	info, err := os.Stat(abs)
-	if err != nil {
-		return "" // new file
+// readSet is one session's file knowledge. Per SESSION, not per process: the map
+// used to hang off the Orchestrator, so a `task` child could edit a file only its
+// parent had read, and the child's post-write note refreshed the PARENT's record
+// — which then licensed the parent's next whole-file write to erase the child's
+// work. The task tool's own description promises "the subagent starts with none
+// of your context"; this is that promise kept.
+type readSet struct {
+	mu sync.Mutex
+	m  map[string]seenFile
+}
+
+func (rs *readSet) note(key string, sf seenFile) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.m == nil {
+		rs.m = map[string]seenFile{}
 	}
-	o.readMu.Lock()
-	seen, ok := o.reads[abs]
-	o.readMu.Unlock()
-	if !ok {
-		return fmt.Sprintf("%s has not been read in this session — read_file it first, then retry the change", path)
-	}
-	if !info.ModTime().Equal(seen) {
-		return fmt.Sprintf("%s was modified since it was last read — read it again before changing it", path)
-	}
-	return ""
+	rs.m[key] = sf
+}
+
+func (rs *readSet) get(key string) (seenFile, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	sf, ok := rs.m[key]
+	return sf, ok
+}
+
+func (rs *readSet) forget(key string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	delete(rs.m, key)
 }
 
 // Session is one conversation: agent + model + transcript.
@@ -211,15 +256,21 @@ type Session struct {
 	Msgs   []Message
 	extra  Ruleset // session-level restrictions (subagents)
 
-	checkLive    io.Writer // where a verifier check's output streams live (nil: nowhere)
-	member       string    // member NAME pinned to this session ("" = resolve from the role)
-	wtRem        *Remote   // a delegate worktree that lives on a member, not on this machine
-	jl           *Jail     // own working tree (delegate worktree); nil = the orchestrator's
-	isolated     bool      // works in a scratch worktree: edits/commands there are the point
-	rootOverride string    // root session id for detached helper sessions (compaction)
-	transport    string    // tool transport, fixed per session ("" = the client's provider)
-	malformed    int       // text-protocol tool tags in the last reply that didn't parse
-	models       []string  // role model chain (gateway names); empty = fixed client
+	checkLive io.Writer // where a verifier check's output streams live (nil: nowhere)
+	member    string    // member NAME pinned to this session ("" = resolve from the role)
+	wtRem     *Remote   // a delegate worktree that lives on a member, not on this machine
+	jl        *Jail     // own working tree (delegate worktree); nil = the orchestrator's
+	isolated  bool      // works in a scratch worktree: edits/commands there are the point
+	// branch and wt are set only under `apply: branch`: the real branch this
+	// session's work is committed onto, and the worktree holding it. Both empty is
+	// today's behaviour to the byte — commitWork is a no-op and nothing else in the
+	// loop looks at them.
+	branch       string
+	wt           *worktree
+	rootOverride string   // root session id for detached helper sessions (compaction)
+	transport    string   // tool transport, fixed per session ("" = the client's provider)
+	malformed    int      // text-protocol tool tags in the last reply that didn't parse
+	models       []string // role model chain (gateway names); empty = fixed client
 	modelIdx     int
 	schemas      []ToolSchema // tool schemas, computed once: the request prefix never changes
 	toolDefs     []*ToolDef
@@ -232,7 +283,12 @@ type Session struct {
 	LastReason string // reasoning captured in the last run (/think last)
 	title      string // subagent: the task description
 
-	mu                sync.Mutex
+	mu      sync.Mutex
+	rs      *readSet // files THIS session has been shown (lazily made; readSet())
+	lastCmd struct { // the last run_command / check_cmd, for blame
+		line string
+		at   time.Time
+	}
 	todos             []Todo
 	inbox             []string // results of finished background subagents
 	bgRunning         int
@@ -374,52 +430,291 @@ func sampleSrc(role, opt, prof *float64, src Origin) string {
 	return srcFloat(prof, src)
 }
 
+// readSet is this session's file knowledge, made on first use. Lazily, because
+// a Session is built in half a dozen places (NewPrimary, newChild, compaction,
+// tests) and a nil map here is a panic in the middle of a write.
+func (s *Session) readSet() *readSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rs == nil {
+		s.rs = &readSet{m: map[string]seenFile{}}
+	}
+	return s.rs
+}
+
+// noteCmd remembers the command this session is about to run. run_command and
+// the verifier's check_cmd write arbitrarily and cannot be leased — we cannot
+// know what a command will write — so they are ACCOUNTED FOR instead: when a
+// file turns out to have moved at or after this moment, the guard names the
+// command rather than blaming a stranger for the session's own `sed -i`.
+func (s *Session) noteCmd(line string) {
+	s.mu.Lock()
+	s.lastCmd.line, s.lastCmd.at = line, time.Now()
+	s.mu.Unlock()
+}
+
+func (s *Session) cmdSince(mod time.Time) (string, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastCmd.line == "" || mod.Before(s.lastCmd.at) {
+		return "", time.Time{}
+	}
+	return s.lastCmd.line, s.lastCmd.at
+}
+
 // noteRead / checkStale are the "read it before you change it" guard, for a
-// local project or a remote one (where mtimes come back over ssh).
-func (s *Session) noteRead(ctx context.Context, p string) {
+// local project or a remote one (where the fingerprint comes back over ssh).
+// `shown` is what the model was given and `whole` says those bytes were the
+// ENTIRE file: only then is a fingerprint recorded, so a line range or a
+// truncated head+tail can never be mistaken for knowledge of the whole file.
+func (s *Session) noteRead(ctx context.Context, p, shown string, whole bool) {
 	rem := s.remote()
 	if rem == nil {
-		s.orch.noteRead(s.jail(), p)
+		s.noteLocalRead(s.jail(), p, shown, whole)
 		return
 	}
 	rel, err := rem.relPath(p)
 	if err != nil {
 		return
 	}
-	if mt, ok := rem.stat(ctx, rel); ok {
-		s.orch.readMu.Lock()
-		s.orch.reads[rem.Label()+"/"+rel] = time.Unix(mt, 0)
-		s.orch.readMu.Unlock()
+	mt, size, sum, ok := rem.statSum(ctx, rel)
+	if !ok {
+		return
+	}
+	sf := seenFile{mtime: time.Unix(mt, 0), size: size, at: time.Now()}
+	if whole {
+		sf.sum = sumBytes([]byte(shown))
+		if sum != "" && sum != sf.sum {
+			// Record the MEMBER's hash, not ours. Remote.run merges stdout and stderr
+			// (a condition this codebase already names: "something on %s writes to
+			// stdout for non-interactive ssh (a shell rc file)"), so on a chatty
+			// member every whole read disagrees with the member's own hash — and
+			// poisoning the record there refused every later edit of every file for
+			// ever. The member's hash is the one its own compare-and-swap will check,
+			// so it is the one worth keeping; the disagreement is remembered beside it
+			// and costs only the whole-file `write`.
+			sf.sum, sf.noisy = sum, true
+		}
+	}
+	s.readSet().note(rem.Label()+"/"+rel, sf)
+}
+
+// tornRead is the zero time, which no file's mtime can equal. A LOCAL record
+// carrying it can never satisfy the cheap mtime+size comparison, so the guard is
+// forced to compare the hash of what the model was actually shown — and locally
+// that disagreement really is staleness: a rival landed inside the read→stat
+// window, the model is holding old bytes, and a re-read fixes it.
+var tornRead time.Time
+
+// noteLocalRead records a read against an explicit jail. It exists for the two
+// callers that read a local file while the session itself may be pinned to a
+// member: an @file mention and a forked child's inherited context.
+func (s *Session) noteLocalRead(j *Jail, p, shown string, whole bool) {
+	abs, err := j.Resolve(p)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return
+	}
+	sf := seenFile{mtime: info.ModTime(), size: info.Size(), at: time.Now()}
+	if whole {
+		sf.sum = sumBytes([]byte(shown))
+		// The stat happens AFTER the read, so a writer that landed in between gets
+		// its own mtime and size recorded against bytes the model never saw — and
+		// the cheap mtime+size comparison then vouches for them, so the next
+		// whole-file `write` erases that writer silently. Which is the one outcome
+		// the guarantee forbids.
+		//
+		// Comparing the file's HASH and not merely its length is what catches the
+		// rival whose write happened to be the same size — a one-character
+		// substitution, a formatter, two versions of the same line. One sha256 over
+		// a file that is at most maxReadBytes long and still in the page cache, on a
+		// path that is hashing those same bytes in memory anyway. The remote leg has
+		// always compared hashes here; this is the local leg catching up.
+		if sf.sum != sumFile(abs) {
+			sf.mtime = tornRead
+		}
+	}
+	s.readSet().note(abs, sf)
+}
+
+// seenSum is the hash of the bytes this session was SHOWN for a path, or "" when
+// it has no whole-file record of it.
+//
+// It exists for the member's compare-and-swap, which must be told what the MODEL
+// saw. A hash statted fresh just before the write is the RIVAL's hash whenever a
+// rival wrote in the meantime, so handing that to the far side asks it to compare
+// a value with itself — the swap passes and the rival's bytes go.
+func (s *Session) seenSum(p string) string {
+	if rem := s.remote(); rem != nil {
+		if rel, err := rem.relPath(p); err == nil {
+			if sf, ok := s.readSet().get(rem.Label() + "/" + rel); ok {
+				return sf.sum
+			}
+		}
+		return ""
+	}
+	if abs, err := s.jail().Resolve(p); err == nil {
+		if sf, ok := s.readSet().get(abs); ok {
+			return sf.sum
+		}
+	}
+	return ""
+}
+
+// forgetRead drops a file's record. Used after a delegation's diff is merged
+// into this tree: the caller has seen a DIFF, not the file, and a record there
+// would license its next whole-file write to erase the merge.
+func (s *Session) forgetRead(ctx context.Context, p string) {
+	if rem := s.remote(); rem != nil {
+		if rel, err := rem.relPath(p); err == nil {
+			s.readSet().forget(rem.Label() + "/" + rel)
+		}
+		return
+	}
+	if abs, err := s.jail().Resolve(p); err == nil {
+		s.readSet().forget(abs)
 	}
 }
 
+// checkStale guards a targeted change (`edit`): the file must have been read and
+// must not have moved since. checkStaleWhole is the same guard for a whole-file
+// `write`, which additionally demands that the WHOLE file was read.
 func (s *Session) checkStale(ctx context.Context, p string) string {
+	return s.checkStaleFor(ctx, p, false)
+}
+
+func (s *Session) checkStaleWhole(ctx context.Context, p string) string {
+	return s.checkStaleFor(ctx, p, true)
+}
+
+func (s *Session) checkStaleFor(ctx context.Context, p string, whole bool) string {
 	rem := s.remote()
 	if rem == nil {
 		abs, err := s.jail().Resolve(p)
 		if err != nil {
 			return err.Error()
 		}
-		return s.orch.checkStale(s.jail(), p, abs)
+		return s.checkStaleLocal(p, abs, whole)
 	}
 	rel, err := rem.relPath(p)
 	if err != nil {
 		return err.Error()
 	}
-	mt, exists := rem.stat(ctx, rel)
+	mt, size, sum, exists := rem.statSum(ctx, rel)
 	if !exists {
-		return "" // a new file
+		return "" // a new file; the create race is caught by the write itself
 	}
-	s.orch.readMu.Lock()
-	seen, ok := s.orch.reads[rem.Label()+"/"+rel]
-	s.orch.readMu.Unlock()
+	seen, ok := s.readSet().get(rem.Label() + "/" + rel)
 	switch {
 	case !ok:
 		return fmt.Sprintf("%s has not been read in this session — read_file it first, then retry the change", p)
-	case !seen.Equal(time.Unix(mt, 0)):
+	case seen.sum != "" && sum != "":
+		// When BOTH hashes are in hand the hash DECIDES, and the cheap mtime+size
+		// branch is not cheaper, it is wrong. `stat` on a member has one-second
+		// granularity (Remote.stat says so), so a rival's same-size overwrite inside
+		// that second matches mtime and size exactly — and statSum has already paid
+		// for the hash that proves otherwise, in the same round trip.
+		if seen.sum != sum {
+			return fmt.Sprintf("%s was modified on %s since it was last read — read it again before changing it", p, rem.Where())
+		}
+		// Identical bytes under a new timestamp: a touch, or a formatter that
+		// changed nothing. Re-note so the next call compares against what is there.
+		s.readSet().note(rem.Label()+"/"+rel, seenFile{mtime: time.Unix(mt, 0), size: size, sum: sum, noisy: seen.noisy, at: seen.at})
+	case seen.mtime.Equal(time.Unix(mt, 0)) && seen.size == size:
+	default:
 		return fmt.Sprintf("%s was modified on %s since it was last read — read it again before changing it", p, rem.Where())
 	}
+	switch {
+	case seen.noisy:
+		return noisyReadMsg(p, rem)
+	case whole && seen.sum == "":
+		return partialReadMsg(p, size)
+	}
 	return ""
+}
+
+// noisyReadMsg refuses a change whose source bytes are not the file's, and says
+// why WITHOUT blaming the file.
+//
+// It covers `edit` as well as `write`, which is the honest scope: Remote.run
+// merges stdout and stderr, so on a member whose non-interactive shell prints a
+// banner the bytes `cat` hands back are banner+content, and both writers build
+// from them. `write` would store the banner; `edit` would store it too, because
+// fuzzyReplace rewrites the whole string it was given. Before the guard existed
+// that is exactly what happened, silently.
+//
+// The cause named here is the one this repository already names for the same
+// symptom on the patch path, and it is a member's shell configuration: something
+// the operator can fix and the model cannot. A staleness message instead put the
+// model in a loop — re-reading reproduces the same banner, so the refusal never
+// cleared.
+func noisyReadMsg(name string, rem *Remote) string {
+	return fmt.Sprintf("%s read back with bytes %s says are not in the file — something there writes to stdout for non-interactive ssh (a shell rc file), so a change would store that output in the file; guard it with [ -t 1 ], then read it again",
+		name, rem.Where())
+}
+
+// checkStaleLocal is the local half, in order: no file is a new file, no record
+// is "read it first", equal mtime AND size is ok, a matching hash under a
+// different mtime is ok (and re-noted), anything else is stale.
+func (s *Session) checkStaleLocal(name, abs string, whole bool) string {
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "" // new file: §create race is caught under the lease by the write
+	}
+	seen, ok := s.readSet().get(abs)
+	if !ok {
+		return fmt.Sprintf("%s has not been read in this session — read_file it first, then retry the change", name)
+	}
+	switch {
+	case info.ModTime().Equal(seen.mtime) && info.Size() == seen.size:
+	case seen.sum != "" && seen.sum == sumFile(abs):
+		s.readSet().note(abs, seenFile{mtime: info.ModTime(), size: info.Size(), sum: seen.sum, at: seen.at})
+	default:
+		return s.staleMsg(name, seen, info)
+	}
+	if whole && seen.sum == "" {
+		return partialReadMsg(name, info.Size())
+	}
+	return ""
+}
+
+// partialReadMsg refuses a whole-file overwrite built on a partial read. A
+// `write` replaces every byte, so a model that saw lines 10-40 (or a truncated
+// head+tail) would silently drop everything it never looked at — the same loss
+// the lease prevents between writers, here between the model and the file.
+//
+// A file LARGER than a whole read can carry gets a different sentence, because
+// it is a different refusal. readFile truncates above maxReadBytes, so no read
+// of such a file ever records a fingerprint: telling the model to "read the
+// whole file" there names a remedy the tool cannot perform, and it loops read →
+// write → refused for ever. Regenerating a 300 KB lockfile or a large JSON is
+// then impossible and the message does not say so. `edit` is the honest route,
+// and naming it is what the >8 MiB branch of staleMsg already does.
+func partialReadMsg(name string, size int64) string {
+	if size > maxReadBytes {
+		return fmt.Sprintf("%s is %s, more than read_file returns in one piece, so no read of it can license a whole-file write — use edit to change the part you have read", name, byteCount(int(size)))
+	}
+	return fmt.Sprintf("%s was only read in part — read the whole file before overwriting it with write, or use edit to change just the part you have", name)
+}
+
+func (s *Session) staleMsg(name string, seen seenFile, info os.FileInfo) string {
+	if info.Size() > maxFingerprintBytes {
+		return fmt.Sprintf("%s is %d MB, too large to fingerprint, so the guard can only compare its size and timestamp — they changed; read it again before changing it",
+			name, info.Size()>>20)
+	}
+	if line, at := s.cmdSince(info.ModTime()); line != "" {
+		return fmt.Sprintf("%s was modified since it was last read — your run_command `%s` at %s is the likely cause; read it again before changing it",
+			name, line, at.Format("15:04:05"))
+	}
+	// One line, like every other guard message in this file. The two-line form
+	// with a hanging indent was the spec document's own page wrapping, and a tool
+	// result is not a page: it goes into the model's prompt, the transcript and
+	// the trace exactly as written.
+	return fmt.Sprintf("%s was modified since it was last read (you read it at %s, it was written at %s) — read it again before changing it",
+		name, seen.at.Format("15:04:05"), info.ModTime().Format("15:04:05"))
 }
 
 func (s *Session) jail() *Jail {
@@ -442,6 +737,9 @@ func (s *Session) jail() *Jail {
 // and "error: …" refusals, while a verifier or a workflow step keeps execCheck's
 // ("sandbox: …", -1), which the runner already looks for.
 func (s *Session) runTool(ctx context.Context, cmd string, timeout time.Duration, live io.Writer) string {
+	// Before it runs, not after: a file this command writes gets an mtime at or
+	// after this moment, and the stale message has to be able to name it.
+	s.noteCmd(cmd)
 	if rem := s.remote(); rem != nil {
 		if err := s.checkCmd(cmd); err != nil {
 			return "error: " + err.Error()
@@ -453,6 +751,7 @@ func (s *Session) runTool(ctx context.Context, cmd string, timeout time.Duration
 }
 
 func (s *Session) runCheck(ctx context.Context, cmd string, timeout time.Duration, live io.Writer) (string, int) {
+	s.noteCmd(cmd) // a check_cmd writes too: `go build -o bin/x`, `gofmt -w`, a codegen step
 	if rem := s.remote(); rem != nil {
 		if err := s.checkCmd(cmd); err != nil {
 			return "sandbox: " + err.Error(), -1

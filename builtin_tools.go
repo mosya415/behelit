@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -111,12 +113,20 @@ func init() {
 				res = readFile(tc.S.jail(), path, lines)
 			}
 			if !strings.HasPrefix(res, "error:") {
-				tc.S.noteRead(tc.Ctx, path)
+				body, whole := wholeRead(path, res)
+				tc.S.noteRead(tc.Ctx, path, body, whole)
 			}
 			return res
 		},
 	})
 
+	// edit, write and run_command carry NO Parallel flag, and must not gain one:
+	// execCalls drops a whole batch to sequential if any call in it is not
+	// parallel-safe, so two edits in one reply are serialised. That was never the
+	// protection — it does nothing across subagents, sessions or processes, which
+	// is what the file leases are for (filelock.go) — but turning it on would put
+	// two writes of one reply in a race inside this process as well.
+	// TestEditAndWriteAreNotParallel fails if either ever does.
 	registerTool(&ToolDef{
 		Name: "edit",
 		Desc: "Replace text in an existing file. old_string must match the file (exact match first; whitespace/indentation-tolerant fallbacks apply only when they identify a single location). Include enough surrounding lines to be unique, or set replace_all to change every occurrence. Never include line-number prefixes. Needs approval.",
@@ -231,6 +241,9 @@ func runEditTool(tc *ToolCtx, a Args) string {
 		a["content"] = newS
 		return runWriteTool(tc, a)
 	}
+	// A cheap pre-flight, so a change that was never going to land fails before
+	// it bothers a human. It is NOT the guarantee: the approval below takes as
+	// long as a person takes, and the file can move inside that window.
 	if msg := tc.S.checkStale(tc.Ctx, path); msg != "" {
 		return "error: " + msg
 	}
@@ -239,16 +252,27 @@ func runEditTool(tc *ToolCtx, a Args) string {
 		tc.S.event("edit", map[string]any{"path": path, "approved": false})
 		return msg
 	}
+	// The lease starts HERE — after the question, never across it — and is held
+	// to the rename. Everything inside it is milliseconds.
+	release, lerr := tc.S.orch.leaseFile(path, abs)
+	if lerr != nil {
+		tc.S.event("edit", map[string]any{"path": path, "approved": true, "error": lerr.Error()})
+		return "error: " + lerr.Error()
+	}
+	defer release()
+	if msg := tc.S.checkStale(tc.Ctx, path); msg != "" {
+		return "error: " + msg // the window between the check and the bytes, closed
+	}
 	before, existed := snapshot(abs)
-	res, err := applyEditMode(abs, path, oldS, newS, a.Bool("replace_all"))
+	res, after, err := applyEditMode(abs, path, oldS, newS, a.Bool("replace_all"))
 	if err != nil {
 		tc.S.event("edit", map[string]any{"path": path, "approved": true, "error": err.Error()})
 		return "error: " + err.Error()
 	}
 	if !tc.S.isolated {
-		recordChange(path, abs, "edit", before, existed)
+		recordChange(path, abs, "edit", before, existed, sumBytes([]byte(after)))
 	}
-	tc.S.noteRead(tc.Ctx, path)
+	tc.S.noteRead(tc.Ctx, path, after, true)
 	tc.S.event("edit", map[string]any{"path": path, "approved": true, "result": res})
 	return res
 }
@@ -266,7 +290,7 @@ func runWriteTool(tc *ToolCtx, a Args) string {
 	action := "overwrite"
 	if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
 		action = "create"
-	} else if msg := tc.S.checkStale(tc.Ctx, path); msg != "" {
+	} else if msg := tc.S.checkStaleWhole(tc.Ctx, path); msg != "" {
 		return "error: " + msg
 	}
 	preview := fmt.Sprintf("  %s %s (%d bytes)", action, path, len(content))
@@ -275,16 +299,44 @@ func runWriteTool(tc *ToolCtx, a Args) string {
 		tc.S.event("write", map[string]any{"path": path, "approved": false})
 		return msg
 	}
+	// `write` is the dangerous one: it never re-reads, so without this lease and
+	// the re-check under it a sibling's write landing during the approval was
+	// erased without a word. That is the silent loss this whole guard exists for.
+	release, lerr := tc.S.orch.leaseFile(path, abs)
+	if lerr != nil {
+		tc.S.event("write", map[string]any{"path": path, "approved": true, "error": lerr.Error()})
+		return "error: " + lerr.Error()
+	}
+	defer release()
+	if action == "overwrite" {
+		// Deleted during the prompt: the approved action was an overwrite, and
+		// writing it back would resurrect a file somebody removed on purpose. Said
+		// out loud, the way the member's leg says it.
+		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+			tc.S.event("write", map[string]any{"path": path, "approved": true, "error": "vanished"})
+			return fmt.Sprintf("error: %s was deleted while you were composing the change — nothing was written; read_file it, then retry", path)
+		}
+		if msg := tc.S.checkStaleWhole(tc.Ctx, path); msg != "" {
+			return "error: " + msg
+		}
+	}
 	before, existed := snapshot(abs)
-	res, err := writeWholeFile(abs, path, content)
+	res, err := writeWholeFile(abs, path, content, action == "create")
+	if errors.Is(err, fs.ErrExist) {
+		// The create path used to skip the staleness check entirely, so two
+		// children that both saw "not exist" both wrote and the loser was never
+		// told. Now the create itself is the test.
+		tc.S.event("write", map[string]any{"path": path, "approved": true, "error": "create race"})
+		return fmt.Sprintf("error: %s was created by someone else while you were composing it — read_file it, then retry", path)
+	}
 	if err != nil {
 		tc.S.event("write", map[string]any{"path": path, "approved": true, "error": err.Error()})
 		return "error: " + err.Error()
 	}
 	if !tc.S.isolated {
-		recordChange(path, abs, "write", before, existed)
+		recordChange(path, abs, "write", before, existed, sumBytes([]byte(content)))
 	}
-	tc.S.noteRead(tc.Ctx, path)
+	tc.S.noteRead(tc.Ctx, path, content, true)
 	tc.S.event("write", map[string]any{"path": path, "approved": true, "bytes": len(content)})
 	return res
 }
@@ -411,10 +463,16 @@ func runRemoteEdit(tc *ToolCtx, rem *Remote, a Args, path, oldS, newS string) st
 		tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": false})
 		return msg
 	}
-	if errs := rem.write(tc.Ctx, rel, updated); errs != "" {
-		return errs
+	// There is no cross-process lock on the member and none is invented. What
+	// replaces it is a compare-and-swap in the member's own shell: the far side
+	// re-checks the hash of the bytes this edit was computed from and refuses if
+	// they moved, so the window no longer contains a network hop AND a human.
+	code, errs := rem.write(tc.Ctx, rel, updated, sumBytes([]byte(content)), false)
+	if msg := remoteWriteMsg(path, rem, code, errs); msg != "" {
+		tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": true, "error": msg})
+		return msg
 	}
-	tc.S.noteRead(tc.Ctx, path)
+	tc.S.noteRead(tc.Ctx, path, updated, true)
 	tc.S.event("edit", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": true, "strategy": strategy})
 	res := fmt.Sprintf("edited %s on %s (1 replacement)", path, rem.Where())
 	if strategy != "exact" {
@@ -428,11 +486,24 @@ func runRemoteWrite(tc *ToolCtx, rem *Remote, path, content string) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	action := "create"
-	if _, exists := rem.stat(tc.Ctx, rel); exists {
+	action, expect := "create", ""
+	if _, _, _, exists := rem.statSum(tc.Ctx, rel); exists {
 		action = "overwrite"
-		if msg := tc.S.checkStale(tc.Ctx, path); msg != "" {
+		if msg := tc.S.checkStaleWhole(tc.Ctx, path); msg != "" {
 			return "error: " + msg
+		}
+		// The expectation is what the MODEL was shown, not a hash statted a moment
+		// ago. A fresh stat returns the rival's hash whenever a rival wrote in the
+		// meantime, and the far side then compares that value with itself: the swap
+		// passes and the bytes it was supposed to protect are gone. The guard above
+		// has just established that the recorded hash is still the file's.
+		expect = tc.S.seenSum(path)
+		if expect == "" {
+			// Unreachable while checkStaleWhole refuses a file with no whole-file
+			// record, and asserted rather than assumed: an empty expectation makes the
+			// member's script skip the compare-and-swap altogether, which is the guard
+			// switching itself off without saying so.
+			return "error: " + partialReadMsg(path, 0)
 		}
 	}
 	preview := fmt.Sprintf("   %s %s on %s (%d bytes)", action, path, rem.Where(), len(content))
@@ -441,12 +512,47 @@ func runRemoteWrite(tc *ToolCtx, rem *Remote, path, content string) string {
 		tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": false})
 		return msg
 	}
-	if errs := rem.write(tc.Ctx, rel, content); errs != "" {
-		return errs
+	// expect is the hash the far side must still see, or "" with expectNew: the
+	// member decides, in one shell, whether this write is still the write that was
+	// approved. A file that appeared during the prompt is a create race, not an
+	// overwrite.
+	code, errs := rem.write(tc.Ctx, rel, content, expect, action == "create")
+	if msg := remoteWriteMsg(path, rem, code, errs); msg != "" {
+		tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": true, "error": msg})
+		return msg
 	}
-	tc.S.noteRead(tc.Ctx, path)
+	tc.S.noteRead(tc.Ctx, path, content, true)
 	tc.S.event("write", map[string]any{"path": path, "remote": rem.Label(), "member": tc.S.memberName(), "approved": true, "bytes": len(content)})
 	return fmt.Sprintf("wrote %s on %s (%d bytes)", path, rem.Where(), len(content))
+}
+
+// remoteWriteMsg turns the compare-and-swap's verdict into the guard's own
+// words, or "" when the bytes landed.
+func remoteWriteMsg(path string, rem *Remote, code int, errs string) string {
+	switch code {
+	case 0:
+		return ""
+	case remoteWriteStale:
+		return fmt.Sprintf("error: %s was modified on %s since it was last read — read it again before changing it", path, rem.Where())
+	case remoteWriteAppeared:
+		return fmt.Sprintf("error: %s was created by someone else while you were composing it — read_file it, then retry", path)
+	case remoteWriteGone:
+		return fmt.Sprintf("error: %s was deleted on %s while you were composing the change — nothing was written; read_file it, then retry", path, rem.Where())
+	}
+	return errs
+}
+
+// wholeRead splits a read_file result into the bytes the model was shown and
+// whether they were the whole file. readFile frames a whole read as
+// "<path>:\n<content>" and a partial one as "<path> (lines …):\n" or
+// "<path> (truncated…):\n" — the same prefix test forkedContext uses to decide
+// whether an inherited body IS the file. Remote.readFile uses the same shape.
+func wholeRead(path, res string) (string, bool) {
+	prefix := path + ":\n"
+	if !strings.HasPrefix(res, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(res, prefix), true
 }
 
 // remoteCmdResult shapes a remote command's outcome like the local one.
