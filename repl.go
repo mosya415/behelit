@@ -504,14 +504,48 @@ func (r *Repl) Banner() {
 	}
 	hold.Print()
 	fmt.Println()
-	// two lines, not one: the single line was 85 columns and wrapped at 80, which
-	// put "Ctrl-C interrupts" on a line of its own with no lead-in
-	fmt.Println(" " + faint("%s", "Type a task to start. /help for commands"+gSep+"@file attaches a file"))
+	// Packed to the terminal, not split by hand: splitting one line in two fixed
+	// the 85-column case and left the three-segment one at 99 columns, which
+	// wrapped at 80 and put "lca init does it from the shell" on a row of its own
+	// with no lead-in. The packer breaks BETWEEN segments, so a hint never wraps
+	// mid-phrase whatever the width.
+	printHints("Type a task to start. /help for commands", "@file attaches a file")
 	if !r.teamMode() && o.gatewayModels < 0 {
-		fmt.Println(" " + faint("%s", "Ctrl-C interrupts"+gSep+"/setup picks the models and gives them roles"+gSep+"lca init does it from the shell"))
+		printHints("Ctrl-C interrupts", "/setup picks the models and gives them roles", "lca init does it from the shell")
 		return
 	}
-	fmt.Println(" " + faint("%s", "Ctrl-C interrupts"+gSep+"/setup re-picks the models"+gSep+"/agents lists the roles"))
+	printHints("Ctrl-C interrupts", "/setup re-picks the models", "/agents lists the roles")
+}
+
+// printHints prints a row of hints, broken between segments so no row is wider
+// than the terminal. One leading space, and the separator is the theme's.
+func printHints(segs ...string) {
+	for _, line := range packHints(termWidth()-2, segs) {
+		fmt.Println(" " + faint("%s", line))
+	}
+}
+
+// packHints greedily fills rows of at most room columns with whole segments. A
+// segment longer than a whole row goes on a row of its own — a hint is never
+// cut, because half a hint is worse than a wrapped one.
+func packHints(room int, segs []string) []string {
+	var rows []string
+	cur := ""
+	for _, seg := range segs {
+		switch {
+		case cur == "":
+			cur = seg
+		case visibleWidth(cur+gSep+seg) <= room:
+			cur += gSep + seg
+		default:
+			rows = append(rows, cur)
+			cur = seg
+		}
+	}
+	if cur != "" {
+		rows = append(rows, cur)
+	}
+	return rows
 }
 
 // ── session ─────────────────────────────────────────────────────────────────

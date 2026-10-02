@@ -468,11 +468,38 @@ func (e *LineEditor) submit(prompt string, buf []rune) {
 func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 	menu := e.suggest(string(buf))
 	e.out("\r\033[J") // clear from line start down (input + any old menu / status)
+	// The input is kept to ONE terminal row, by showing a window over the text
+	// instead of all of it. Printed whole, a line longer than the terminal is
+	// SOFT-WRAPPED by the terminal onto a second row, and from there every
+	// assumption below is off by that row: the walk-back counts menu rows only,
+	// so "\033[<n>A" lands on the row the wrap ended on, the next repaint's
+	// "\r\033[J" clears from there down and leaves the first row standing, and the
+	// cursor's "\033[<col>C" is one row too low. The operator's screen filled with
+	// dozens of stacked copies of their own half-typed question — a 153-column
+	// line in an 80-column terminal, repainted once per keystroke.
+	//
+	// A window needs no state: it is computed from the cursor every repaint, the
+	// same way the rest of this file recomputes everything it draws.
+	lead := 0
+	stagedTag := ""
 	if e.staged != "" {
-		e.out(prompt + cBold + "[" + pasteSummary(e.staged) + "]" + cReset + " " + e.display(buf))
-	} else {
-		e.out(prompt + e.display(buf))
+		stagedTag = cBold + "[" + pasteSummary(e.staged) + "]" + cReset + " "
+		lead = visibleWidth("[" + pasteSummary(e.staged) + "] ")
 	}
+	disp := []rune(e.display(buf))
+	dpos := len([]rune(e.display(buf[:pos])))
+	// One column is left unwritten: writing in the last one is what makes a
+	// terminal wrap, and the cursor has to be able to sit after the last rune.
+	room := termWidth() - visibleWidth(prompt) - lead - 1
+	lo, hi, cutL, cutR := inputWindow(disp, dpos, room)
+	shown := string(disp[lo:hi])
+	if cutL {
+		shown = cFaint + gEllipsis + cReset + shown
+	}
+	if cutR {
+		shown += cFaint + gEllipsis + cReset
+	}
+	e.out(prompt + stagedTag + shown)
 	below := 0
 	// ONE width snapshot for the whole menu: this region is walked back over by
 	// COUNTING its rows (below, further down), so a row that soft-wraps puts the
@@ -509,13 +536,88 @@ func (e *LineEditor) render(prompt string, buf []rune, pos int) {
 		e.out(fmt.Sprintf("\033[%dA", below)) // back up to the input line
 	}
 	e.out("\r")
-	lead := 0
-	if e.staged != "" {
-		lead = visibleWidth("[" + pasteSummary(e.staged) + "] ")
+	// The cursor is placed inside the WINDOW: the text left of it that scrolled
+	// off costs no columns, and the left marker costs its own measured width.
+	col := visibleWidth(prompt) + lead + visibleWidth(string(disp[lo:dpos]))
+	if cutL {
+		col += visibleWidth(gEllipsis)
 	}
-	if col := visibleWidth(prompt) + lead + visibleWidth(e.display(buf[:pos])); col > 0 {
+	if col > 0 {
 		e.out(fmt.Sprintf("\033[%dC", col))
 	}
+}
+
+// inputWindow picks the slice of a line that is shown on the input row, so the
+// row never wraps. It keeps the cursor on screen with a little room to its
+// right, so typing forward does not re-scroll on every keystroke, and reports
+// which ends were cut so the caller can mark them.
+//
+// Widths, not rune counts: one Cyrillic rune is one column and one CJK rune is
+// two, and a window measured in runes shears exactly the lines this exists to
+// keep whole.
+func inputWindow(rs []rune, pos, room int) (lo, hi int, cutL, cutR bool) {
+	if room <= 0 || len(rs) == 0 {
+		return 0, 0, false, false
+	}
+	if pos > len(rs) {
+		pos = len(rs)
+	}
+	w := make([]int, len(rs))
+	total := 0
+	for i, r := range rs {
+		w[i] = visibleWidth(string(r))
+		total += w[i]
+	}
+	if total <= room {
+		return 0, len(rs), false, false
+	}
+	mark := visibleWidth(gEllipsis)
+	slack := min(8, room/4) // columns kept ahead of the cursor
+	// Two passes at most: the budget depends on which ends are cut, and which
+	// ends are cut depends on the budget. It settles immediately because cutting
+	// an end only ever shrinks the window.
+	for iter := 0; iter < 3; iter++ {
+		budget := room
+		if cutL {
+			budget -= mark
+		}
+		if cutR {
+			budget -= mark
+		}
+		if budget < 1 {
+			budget = 1
+		}
+		hi = min(len(rs), pos+slack)
+		used := 0
+		lo = hi
+		for lo > 0 && used+w[lo-1] <= budget {
+			lo--
+			used += w[lo]
+		}
+		// The cursor must be inside the window even when the budget is tiny: show
+		// the text to its right rather than a window it has fallen off.
+		if lo > pos {
+			lo = pos
+			used = 0
+			for i := lo; i < hi; i++ {
+				used += w[i]
+			}
+			for hi > pos && used > budget {
+				hi--
+				used -= w[hi]
+			}
+		}
+		for hi < len(rs) && used+w[hi] <= budget {
+			used += w[hi]
+			hi++
+		}
+		nl, nr := lo > 0, hi < len(rs)
+		if nl == cutL && nr == cutR {
+			break
+		}
+		cutL, cutR = nl, nr
+	}
+	return lo, hi, cutL, cutR
 }
 
 // cooked is the fallback line read for non-terminal stdin. It shows the prefill
