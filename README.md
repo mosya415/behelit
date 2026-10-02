@@ -149,10 +149,16 @@ human line, including the model's own prose, moves to stderr, and so does colour
  "check_logs": ["/path/<session>-1.1.log", "/path/<session>-2.1.log"],
  "files_changed": 3, "diff_bytes": 1840, "turns": 17, "tool_calls": 42,
  "tool_errors": 1, "invalid_calls": 0, "tokens": {"prompt": 0, "completion": 0, "cached": 0},
- "duration_ms": 0, "transcript": "/path", "trace": "/path",
+ "duration_ms": 0, "started_at": "2026-10-03T01:12:04Z", "finished_at": "2026-10-03T01:19:38Z",
+ "transcript": "/path", "trace": "/path",
  "lca_version": "sha", "roles_hash": "sha256 of roles.yaml",
  "prompt_hash": "sha256 of the role's system prompt"}
 ```
+
+`started_at` and `finished_at` are the run's two ends in UTC RFC3339. A duration
+cannot answer the question a ticket is read with — "the stand went down at 02:14,
+had this run finished by then" — and the wrapper knows when it launched lca but
+not when lca stopped.
 
 `check_exit` is `null` when no check ran, so `check_exit == 0` can never be read
 as green by accident; `check_cmd` and `check_tail` are always present beside it

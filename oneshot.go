@@ -163,6 +163,13 @@ type runResult struct {
 
 	Tokens     resultTokens `json:"tokens"`
 	DurationMs int64        `json:"duration_ms"`
+	// StartedAt and FinishedAt are the run's two ends in UTC RFC3339, because a
+	// duration cannot answer the question a ticket is read with: "the stand went
+	// down at 02:14 — had this run finished by then". The wrapper has the clock
+	// time it launched us, but not the one we stopped at, and a cron job's own
+	// timestamps are the moments around the run rather than its own.
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at"`
 
 	Transcript string `json:"transcript"`
 	Trace      string `json:"trace"`
@@ -736,6 +743,8 @@ func (o *Orchestrator) resultOf(s *Session, v Verdict, check string, files, diff
 		InvalidCalls: s.stats.InvalidCalls,
 		Tokens:       resultTokens{Prompt: prompt, Completion: completion, Cached: cached},
 		DurationMs:   time.Since(start).Milliseconds(),
+		StartedAt:    traceTS(start),
+		FinishedAt:   traceTS(time.Now()),
 		Transcript:   o.rec.SessionPath(), Trace: o.tracer.Path,
 		LCAVersion: lcaVersion(), RolesHash: rolesHash(o.roles), PromptHash: promptFingerprint(s),
 		// Never nil: see the field. A run with no check and a run whose check

@@ -265,3 +265,32 @@ func TestAClockTimeSaysWhichDayItWas(t *testing.T) {
 		t.Fatalf("a time nobody recorded says so, got %q", clockOf(time.Time{}))
 	}
 }
+
+// The wrapper has the clock time it launched lca, but not the one lca stopped
+// at, and a duration cannot answer the question a ticket is read with: "the
+// stand went down at 02:14 — had this run finished by then".
+func TestTheResultObjectSaysWhenTheRunEnded(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	h := newHarness(t, fs.URL, "native", false)
+	start := time.Now().Add(-90 * time.Second)
+	r := h.orch.resultOf(h.sess, Verdict{Status: "passed"}, "", 0, 0, start, nil)
+
+	for name, got := range map[string]string{"started_at": r.StartedAt, "finished_at": r.FinishedAt} {
+		ts, err := time.Parse(time.RFC3339, got)
+		if err != nil {
+			t.Fatalf("%s must be RFC3339 a wrapper can parse, got %q: %v", name, got, err)
+		}
+		if ts.Location() != time.UTC {
+			t.Fatalf("%s must be UTC, got %q", name, got)
+		}
+	}
+	a, _ := time.Parse(time.RFC3339, r.StartedAt)
+	b, _ := time.Parse(time.RFC3339, r.FinishedAt)
+	if !b.After(a) {
+		t.Fatalf("the run ended after it started: %s then %s", r.StartedAt, r.FinishedAt)
+	}
+	// The two ends and the duration are the same measurement, so they must agree.
+	if d := b.Sub(a).Milliseconds(); d-r.DurationMs > 50 || r.DurationMs-d > 50 {
+		t.Fatalf("duration_ms %d does not match %s..%s (%d ms)", r.DurationMs, r.StartedAt, r.FinishedAt, d)
+	}
+}
