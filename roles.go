@@ -241,7 +241,7 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		}
 		defs := doc.child("defaults")
 		defContext, _ := strconv.Atoi(defs.str("context"))
-		defSteps, _ := strconv.Atoi(defs.str("steps"))
+		defSteps, _ := parseStepCeiling("defaults: steps", defs.str("steps"))
 		if n, err := strconv.Atoi(defs.str("verify_attempts")); err == nil && n > 0 {
 			rc.VerifyAttempts = n
 		}
@@ -259,9 +259,9 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 			rc.RunTimeout = d
 		}
 		if v := defs.str("max_steps"); v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return nil, fmt.Errorf("%s: defaults: max_steps: %q is not a step count", p, v)
+			n, err := parseStepCeiling("defaults: max_steps", v)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %v", p, err)
 			}
 			rc.RunMaxSteps = n
 		}
@@ -772,7 +772,14 @@ func applyRole(a *Agent, n *yNode, baseDir string) error {
 		a.Context = c
 	}
 	if v := n.str("steps"); v != "" {
-		if c, err := strconv.Atoi(v); err == nil && c > 0 {
+		// `steps: unlimited` is how a role says the step count is not the right
+		// bound for its work — a long refactor under a check command, say. The run
+		// still has to be bounded by a clock or tokens when nobody is watching.
+		c, err := parseStepCeiling("steps", v)
+		if err != nil {
+			return err
+		}
+		if c != 0 {
 			a.Steps = c
 		}
 	}
@@ -970,7 +977,10 @@ func (rc *RolesConfig) YAML() string {
 	if rc.RunTimeout > 0 {
 		fmt.Fprintf(&b, "  timeout: %s\n", rc.RunTimeout)
 	}
-	if rc.RunMaxSteps > 0 {
+	switch {
+	case rc.RunMaxSteps == stepsUnlimited:
+		fmt.Fprintf(&b, "  max_steps: unlimited\n")
+	case rc.RunMaxSteps > 0:
 		fmt.Fprintf(&b, "  max_steps: %d\n", rc.RunMaxSteps)
 	}
 	if rc.RunMaxTokens > 0 {

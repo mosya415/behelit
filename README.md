@@ -215,6 +215,7 @@ do. So a run carries three ceilings:
 | --- | --- |
 | `-timeout <dur>` | wall clock for the whole run, the check and the summary included |
 | `-max-steps <n>` | model requests across the **whole run** — every role, every subagent, every verifier attempt — and a per-session ceiling over each role's own `steps`; a role that asked for less keeps its own |
+| `-max-steps unlimited` | no step ceiling at all, over every role's own. A step count is a *proxy* for "stop an agent grinding tokens with nothing to show", and in loop mode a turn spends a step per reply, so 50 is gone before a long task is half done. Unattended it is refused unless `-timeout` or `-max-tokens` is set beside it: one real ceiling has to exist where nobody is watching. `none`, `off` and a bare `0` say the same thing, and so does `steps: unlimited` on a role or `max_steps: unlimited` under `defaults:` |
 | `-max-tokens <n>` | prompt + completion across the run, every session in it: subagents, the compactor's request and the closing summary call |
 
 The defaults live in `roles.yaml` under `defaults:` (`timeout:`, `max_steps:`,
@@ -1993,8 +1994,19 @@ an automatic loop and must emit the next tool call rather than wait.
 
 `/loop` (or `LCA_LOOP`) turns on **autonomous loop mode**: after any tagless
 reply the agent keeps prompting the model to take the next action — unbounded by
-the heuristic nudge counter — until the model replies `TASK_DONE` or the step cap
-is hit. Use it to hand off a whole task and let the agent run it to completion.
+the heuristic nudge counter — until the model replies `TASK_DONE`, a budget is
+spent, or three replies in a row call no tool at all. Use it to hand off a whole
+task and let the agent run it to completion.
+
+Two things to know before you do. A loop spends a step per reply, so pair it
+with `-max-steps unlimited` and a real budget (`/set steps unlimited` in a
+session, where you are the budget); measured on a 61-turn task, the 50-step cap
+reported `budget_exceeded` at turn 50 while the same task with the ceiling
+removed finished all 61. And the idle guard is there because the doom-loop
+detector cannot see this case: it compares the signatures of recent **tool
+calls**, so a model answering prose and calling nothing has no signature to
+compare — one such run spent all fifty steps and fifty gateway requests taking
+no action of any kind.
 
 ## Design (the four non-trivial parts)
 

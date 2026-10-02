@@ -1252,7 +1252,9 @@ func TestRunBudgetResolution(t *testing.T) {
 		steps, tokens int
 	}{
 		{"timeout", -5 * time.Minute, 0, 0},
-		{"max-steps", 0, -1, 0},
+		// -1 is stepsUnlimited and a legitimate value now, so the negative that
+		// must still be refused is one below it.
+		{"max-steps", 0, -5, 0},
 		{"max-tokens", 0, 0, -1},
 	} {
 		_, err := newRunBudget(rc, tc.d, tc.steps, tc.tokens)

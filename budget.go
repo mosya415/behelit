@@ -81,6 +81,42 @@ type runBudget struct {
 // A negative value is a usage error and not a clamp — "-timeout -5m" is a
 // wrapper building its command line wrong, and running forever is the one
 // interpretation that cannot be right.
+// stepsUnlimited is a step ceiling the operator removed on purpose. It is a
+// sentinel and not 0, because 0 has always meant "nobody said" and a run in a
+// terminal gets it: the two have to stay tellable apart, or leaving the flag
+// out would silently uncap every role.
+//
+// The step cap was always a proxy for the thing actually worth bounding — an
+// agent grinding tokens with nothing to show — and as a proxy it cut long
+// legitimate work short: in loop mode a turn spends a step per reply, so 50 is
+// gone before a real task is half done. Now that a run has a clock and a token
+// ceiling, the proxy can be switched off and the real bound used instead, which
+// is why removeing the step cap in an unattended run REQUIRES one of those two
+// (checked in oneShot: nothing unattended may be unbounded in every dimension).
+const stepsUnlimited = -1
+
+// parseStepCeiling reads a step ceiling the way an operator writes one: a
+// number, or a word for "no ceiling". An explicit 0 is taken as the word,
+// because a run that may take zero steps is not a thing anybody asks for, while
+// `-max-steps 0` is exactly what a person types when they mean "no cap".
+func parseStepCeiling(what, v string) (int, error) {
+	v = strings.TrimSpace(v)
+	switch strings.ToLower(v) {
+	case "":
+		return 0, nil // nobody said
+	case "unlimited", "none", "off", "no", "0":
+		return stepsUnlimited, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, usageErrf("%s wants a number of steps or the word unlimited, got %q", what, v)
+	}
+	if n < 0 {
+		return 0, usageErrf("%s %d is negative — give a positive number of steps, or the word unlimited", what, n)
+	}
+	return n, nil
+}
+
 func newRunBudget(rc *RolesConfig, timeout time.Duration, maxSteps, maxTokens int) (*runBudget, error) {
 	b := &runBudget{}
 	if rc != nil {
@@ -89,16 +125,16 @@ func newRunBudget(rc *RolesConfig, timeout time.Duration, maxSteps, maxTokens in
 	switch {
 	case timeout < 0:
 		return nil, usageErrf("-timeout %s is negative — give a duration like 30m, or leave it out for no limit", timeout)
-	case maxSteps < 0:
-		return nil, usageErrf("-max-steps %d is negative — give a positive number of steps, or leave it out", maxSteps)
+	case maxSteps < stepsUnlimited:
+		return nil, usageErrf("-max-steps %d is negative — give a positive number of steps, the word unlimited, or leave it out", maxSteps)
 	case maxTokens < 0:
 		return nil, usageErrf("-max-tokens %d is negative — give a positive token count, or leave it out", maxTokens)
 	}
 	if timeout > 0 {
 		b.timeout = timeout
 	}
-	if maxSteps > 0 {
-		b.maxSteps = maxSteps
+	if maxSteps != 0 {
+		b.maxSteps = maxSteps // including stepsUnlimited: the flag outranks the file
 	}
 	if maxTokens > 0 {
 		b.maxTokens = maxTokens
@@ -116,6 +152,19 @@ func newRunBudget(rc *RolesConfig, timeout time.Duration, maxSteps, maxTokens in
 // spendStep: one session's loop restarting at 0 on every verifier attempt made
 // `-max-steps 200` with `verify_attempts: 3` and one delegation into 1200 model
 // requests. This bounds a session; spendStep bounds the run.
+// bounded answers whether SOMETHING other than the step count would stop this
+// run: a clock or a token ceiling. Those two are the real bounds — the clock
+// cancels the context and the tokens stop the model — and one of them has to
+// exist before the step ceiling may be removed in a run nobody is watching.
+func (b *runBudget) bounded() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.timeout > 0 || b.maxTokens > 0
+}
+
 func (b *runBudget) steps() int {
 	if b == nil || !b.armedNow() {
 		return 0

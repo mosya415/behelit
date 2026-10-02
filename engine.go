@@ -1107,14 +1107,20 @@ func (s *Session) maxSteps() int {
 	// (or roles.yaml's defaults.max_steps) is the operator saying "whatever the
 	// roles say, not more than this on this run", so a role's own 80 must not
 	// outrank it — including a subagent's, which is where the tokens actually go.
-	if n := s.orch.budget.steps(); n > 0 {
+	switch n := s.orch.budget.steps(); {
+	case n == stepsUnlimited:
+		// The operator removed the ceiling for this RUN, which is over every role's
+		// own by the same rule that lets -max-steps 20 cap a role's 80: a role's
+		// number is what it needs, the run's is what the operator allows.
+		return stepsUnlimited
+	case n > 0:
 		if s.agent.Steps > 0 && s.agent.Steps < n {
 			return s.agent.Steps
 		}
 		return n
 	}
-	if s.agent.Steps > 0 {
-		return s.agent.Steps
+	if s.agent.Steps != 0 {
+		return s.agent.Steps // a role may remove its own ceiling too
 	}
 	return s.orch.cfg.MaxSteps
 }
@@ -1163,11 +1169,12 @@ func (s *Session) Run(ctx context.Context) error {
 	continuing := false // the previous step was cut off by length; continue it
 	partial := -1       // index of the assistant message being continued
 	nudges := 0
+	idle := 0 // loop mode: replies in a row that called nothing
 	overflowRetried := false
 	maxSteps := s.maxSteps()
 	var stop atomic.Bool // a tool asked to end the turn (doom loop denied, interrupt)
 
-	for step := 0; step < maxSteps && !stop.Load(); step++ {
+	for step := 0; (maxSteps == stepsUnlimited || step < maxSteps) && !stop.Load(); step++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1181,7 +1188,7 @@ func (s *Session) Run(ctx context.Context) error {
 			s.saveTranscript()
 			return nil
 		}
-		last := step == maxSteps-1
+		last := maxSteps != stepsUnlimited && step == maxSteps-1
 		if last {
 			continuing = false // the final step is a plain summary request
 		}
@@ -1350,7 +1357,8 @@ func (s *Session) Run(ctx context.Context) error {
 				calls = nil
 			}
 			s.traceTurn(step, res, fallbacks, turnStart, nil, nil)
-			s.view.Warn(fmt.Sprintf("STOPPED — hit %d-step cap", maxSteps))
+			// The number is the thing to change, so the line says where it lives.
+			s.view.Warn(fmt.Sprintf("STOPPED — hit %d-step cap (raise it with /set steps N, or -max-steps; `unlimited` needs a -timeout or -max-tokens)", maxSteps))
 			s.stats.StepCaps++
 			s.event("step_cap", map[string]any{"steps": maxSteps})
 			s.saveTranscript()
@@ -1384,8 +1392,26 @@ func (s *Session) Run(ctx context.Context) error {
 				continue
 			}
 			// Loop mode: keep working autonomously until the model signals it is
-			// finished with TASK_DONE (or the step budget runs out).
+			// finished with TASK_DONE (or a budget runs out).
+			//
+			// With a limit on the idling, because the doom-loop detector cannot see
+			// this one: it compares the signatures of recent TOOL CALLS, and a model
+			// that answers prose and calls nothing has no signature to compare. A
+			// run measured against a stub that always replied "did some of the work"
+			// spent all fifty steps and fifty requests on a gateway, taking no
+			// action of any kind — the shape the step cap was standing in for, and
+			// the reason removing that cap needs this. Three is the same number the
+			// detector uses for an identical call: twice can be a model gathering
+			// itself, three times is not working.
 			if s.Loop && !strings.Contains(full, doneMarker) {
+				idle++
+				if idle >= 3 {
+					s.view.Warn(fmt.Sprintf("STOPPED — %d replies in a row with no tool call: the loop is not making progress", idle))
+					s.event("loop_idle", map[string]any{"replies": idle})
+					s.Msgs = append(s.Msgs, Message{Role: "user", Content: "You replied " + strconv.Itoa(idle) + " times without calling a tool, so nothing has happened. The loop is stopped."})
+					s.saveTranscript()
+					return nil
+				}
 				s.view.Note("loop — continuing…")
 				s.event("loop_continue", nil)
 				s.Msgs = append(s.Msgs, Message{Role: "user", Content: "Keep going — take the next action with a tool call. When the ENTIRE task is truly finished, reply with just " + doneMarker + " on its own line."})
@@ -1432,6 +1458,7 @@ func (s *Session) Run(ctx context.Context) error {
 			return nil
 		}
 
+		idle = 0 // a tool call is work: the loop is going somewhere again
 		results := s.execCalls(ctx, calls, &stop)
 		s.stats.ToolCalls += len(calls)
 		s.stats.InvalidCalls += s.malformed

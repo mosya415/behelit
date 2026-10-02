@@ -216,7 +216,11 @@ func TestSetRejectsUnknownAndBadValues(t *testing.T) {
 	fs.models = allModels()
 	r, h := replFor(t, fs, testRoles)
 	target := filepath.Join(h.orch.jl.Root, ".lca", "config.json")
-	for _, arg := range []string{"nope 1", "transport sideways", "temperature hot", "context -3", "steps 0"} {
+	// `steps 0` is NOT here any more: zero is how a person spells "no cap", and a
+	// step ceiling is the one limit a long task legitimately removes, so it is
+	// taken as unlimited (TestAStepCeilingCanBeRemovedByName). `steps many` is
+	// the refusal that replaced it.
+	for _, arg := range []string{"nope 1", "transport sideways", "temperature hot", "context -3", "steps many", "steps -4"} {
 		out := captureStdout(t, func() { r.cmdSet(arg) })
 		// the refusal must be MARKED as a failure, not merely mentioned — but the
 		// mark is the theme's, so the theme's own glyph is what is looked for

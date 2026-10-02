@@ -74,7 +74,7 @@ func main() {
 	// for a year while nothing enforces it. The two ceilings are meaningful in a
 	// session too — they bound each turn and its subagents — so they are not.
 	timeoutFlag := flag.Duration("timeout", 0, "")
-	maxStepsFlag := flag.Int("max-steps", 0, "")
+	maxStepsFlag := flag.String("max-steps", "", "")
 	maxTokensFlag := flag.Int("max-tokens", 0, "")
 	summaryFlag := flag.String("summary", "", "")
 	flag.Usage = usage
@@ -161,7 +161,11 @@ func main() {
 	}
 	// The budgets after the orchestrator, because roles.yaml's defaults: are the
 	// floor the flags override and the file has only just been read.
-	budget, berr := newRunBudget(orch.roles, *timeoutFlag, *maxStepsFlag, *maxTokensFlag)
+	runSteps, serr := parseStepCeiling("-max-steps", *maxStepsFlag)
+	if serr != nil {
+		fatalCode(exitUsage, serr)
+	}
+	budget, berr := newRunBudget(orch.roles, *timeoutFlag, runSteps, *maxTokensFlag)
 	if berr != nil {
 		fatalCode(exitUsage, berr)
 	}
@@ -368,7 +372,7 @@ func usage() {
 		"   -json                        result object on stdout; exit 0 passed, 1 failed, 2 usage,",
 		"                                3 infra, 4 budget, 130 cancelled",
 		"   -timeout <dur>               budget for the whole run; exceeding it is exit 4",
-		"   -max-steps <n>               step ceiling for the run, over every role's own",
+		"   -max-steps <n>|unlimited     step ceiling for the run, over every role's own",
 		"   -max-tokens <n>              prompt+completion ceiling for the run, subagents included",
 		"   -summary <path.md>           write a short markdown summary of the run there",
 		"   -y                           approve edits, commands and fetches without asking",

@@ -456,6 +456,25 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, machine bo
 	defer cancel()
 	orch.setRunContext(ctx)
 
+	// Unattended and unbounded in every dimension is the one combination nobody
+	// can afford: a step ceiling of `unlimited` is how a long task is allowed to
+	// finish, not a licence to spend the night on a gateway with nobody watching
+	// the GPU queue. In a terminal the person IS the bound — they can read the
+	// turns and press Ctrl-C — so this is refused only where nobody can.
+	//
+	// After budget.start() on purpose: a budget answers for its own ceilings only
+	// once it is armed, so asking before this line read every run as uncapped and
+	// the guard never fired.
+	if sess.maxSteps() == stepsUnlimited && !orch.budget.bounded() {
+		// Row 2 of the table: a mistake in the call. Nothing on stdout and no
+		// object, because nothing about the task was decided and no reply arrived.
+		why := "steps are unlimited and nothing else bounds this run — add -timeout (say 45m) or -max-tokens, " +
+			"or give a step count; an unattended run has to have one real ceiling"
+		errLine("%s", why)
+		orch.rec.Event("usage_error", map[string]any{"why": why})
+		return exitUsage
+	}
+
 	start := time.Now()
 	// One path whether or not there is a check: with none, RunVerifiedAll runs the
 	// agent once and reports "unverified", which is the same loop with the same

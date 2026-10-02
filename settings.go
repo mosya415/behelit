@@ -227,12 +227,30 @@ func applySetting(c *Config, key, raw string) error {
 		}
 		v = strings.ToLower(v)
 	case kInt:
+		// steps is the one int that takes a word, because a step ceiling is the one
+		// a long task legitimately wants gone. It is stored as the sentinel, so
+		// everything downstream reads an int as before.
+		if s.Key == "steps" {
+			n, err := parseStepCeiling("steps", v)
+			if err != nil {
+				return err
+			}
+			if n == stepsUnlimited {
+				v = strconv.Itoa(stepsUnlimited)
+			}
+		}
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return fmt.Errorf("%s wants a whole number, got %q", s.Key, v)
 		}
 		switch s.Key {
-		case "steps", "cmd_timeout", "subagent_depth":
+		case "steps":
+			// A step ceiling may be removed; the other two may not, because a command
+			// with no timeout and a recursion with no depth are hangs, not long work.
+			if n <= 0 && n != stepsUnlimited {
+				return fmt.Errorf("%s must be greater than 0, or the word unlimited", s.Key)
+			}
+		case "cmd_timeout", "subagent_depth":
 			if n <= 0 {
 				return fmt.Errorf("%s must be greater than 0", s.Key)
 			}
@@ -400,6 +418,9 @@ func readSetting(c Config, ap *Approver, key string) string {
 		}
 		return kfmt(c.MaxTokens)
 	case "steps":
+		if c.MaxSteps == stepsUnlimited {
+			return "unlimited"
+		}
 		return strconv.Itoa(c.MaxSteps)
 	case "cmd_timeout":
 		return strconv.Itoa(c.CmdTimeout) + faint("s")
