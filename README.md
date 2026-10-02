@@ -2172,6 +2172,17 @@ announced a next step without doing it, the agent nudges it to continue
 (`nudge_continue`, bounded). The system prompt also tells the model it runs in
 an automatic loop and must emit the next tool call rather than wait.
 
+**You can write to the agent while it is working.** Press Enter and the line is
+handed to the model at its next step, labelled so it can tell a correction that
+arrived mid-work from the task it was given — "stop, only look at f.txt" lands
+while it is still looking. It is never injected mid-request: a request already on
+the wire cannot be amended, and appending to the messages under it would move the
+prefix the gateway is caching. An unfinished line (no Enter) is still type-ahead
+for the next prompt, because half a sentence is not a message, and a slash
+command waits for the prompt rather than being sent to the model as prose — it is
+held, not lost. The screen says which happened: `queued for <model>`, then `your
+message was handed to <model>` when it actually arrives.
+
 `/loop` (or `LCA_LOOP`) turns on **autonomous loop mode**: after any tagless
 reply the agent keeps prompting the model to take the next action — unbounded by
 the heuristic nudge counter — until the model replies `TASK_DONE`, a budget is

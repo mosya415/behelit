@@ -349,6 +349,7 @@ type Session struct {
 	todos             []Todo
 	inbox             []string // results of finished background subagents
 	bgRunning         int
+	typed             []string // what the operator typed while the turn was running
 	wake              chan struct{}
 	recent            []string // signatures of recent tool calls (doom-loop detection)
 	stats             SessionStats
@@ -1091,6 +1092,39 @@ func (s *Session) deliver(result string) {
 	}
 }
 
+// Say queues something the operator typed WHILE this turn was running. It is
+// delivered at the next step boundary, never mid-request: a request already on
+// the wire cannot be amended, and appending to the messages under it would both
+// race the assembly and move the prefix the gateway is caching. So the agent
+// reads it exactly where it reads a background subagent's result — the same
+// mechanism, a different label, because "the operator just told you something"
+// and "a subagent finished" are not the same instruction.
+func (s *Session) Say(text string) {
+	s.mu.Lock()
+	s.typed = append(s.typed, text)
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// drainTyped appends what the operator typed during the turn as one user
+// message. Labelled, so the model can tell it from the task it was given: it
+// arrives in the middle of work, and it is usually a correction.
+func (s *Session) drainTyped() bool {
+	s.mu.Lock()
+	items := s.typed
+	s.typed = nil
+	s.mu.Unlock()
+	if len(items) == 0 {
+		return false
+	}
+	s.Msgs = append(s.Msgs, Message{Role: "user", Content: "[The operator typed this while you were working — read it as an instruction that arrives now, and adjust what you are doing]\n" + strings.Join(items, "\n")})
+	s.view.Note("your message was handed to " + s.client.Model())
+	return true
+}
+
 // drainInbox appends queued background results as one user message.
 func (s *Session) drainInbox() bool {
 	s.mu.Lock()
@@ -1125,10 +1159,15 @@ type SessionStats struct {
 }
 
 // pendingInbox reports delivered background results not yet handed to the model.
+// pendingInbox is "something arrived while this reply was being written, and the
+// turn must not end before the model has seen it" — a background result, or a
+// line the operator typed as the last reply came back. Without the second, a
+// message typed a moment too late sat in the queue until the NEXT turn, which
+// from the outside is indistinguishable from it being dropped.
 func (s *Session) pendingInbox() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.inbox) > 0
+	return len(s.inbox) > 0 || len(s.typed) > 0
 }
 
 func (s *Session) BackgroundRunning() int {
@@ -1231,6 +1270,7 @@ func (s *Session) Run(ctx context.Context) error {
 		// stay the last one sent, so nothing is appended or compacted meanwhile.
 		if !continuing {
 			s.drainInbox()
+			s.drainTyped()
 		}
 
 		budget := s.budget()

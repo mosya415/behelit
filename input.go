@@ -31,6 +31,10 @@ type Input struct {
 
 	mu      sync.Mutex
 	pending []byte
+	// lineHook takes whole lines typed DURING a turn (nil outside one); held is
+	// what it refused, given back to the prompt when the turn ends.
+	lineHook func(string) bool
+	held     []byte
 
 	// readMu keeps the non-blocking Drain out of a blocking read's way. Drain flips
 	// the descriptor to O_NONBLOCK for its duration, so a read blocked on the same
@@ -159,6 +163,53 @@ func (in *Input) Drain() {
 	}
 	in.mu.Lock()
 	in.pending = append(in.pending, data...)
+	// A COMPLETE line typed while the agent is working is a message for the agent,
+	// not type-ahead for the next prompt: that is the difference between "I'll say
+	// it when it stops" and "it should know this now". Only whole lines, because
+	// half a sentence is not a message; the remainder stays pending and becomes
+	// the next prompt's type-ahead exactly as before.
+	var lines []string
+	if in.lineHook != nil {
+		lines, in.pending = cutLines(in.pending)
+	}
+	in.mu.Unlock()
+	// Outside the lock: the hook prints, and printing takes the output lock.
+	for _, line := range lines {
+		if in.lineHook(line) {
+			continue
+		}
+		// Refused — a slash command, which belongs to the REPL and not to the
+		// model. Held, not dropped, and handed back when the turn ends.
+		in.mu.Lock()
+		in.held = append(append(in.held, line...), '\r')
+		in.mu.Unlock()
+	}
+}
+
+// cutLines splits off every complete line, returning them and what is left. A
+// line ends at CR or LF (a terminal in raw mode sends CR), and an empty one —
+// a bare Enter — is dropped here rather than handed on as a message with no
+// words in it.
+func cutLines(buf []byte) (lines []string, rest []byte) {
+	start := 0
+	for i := 0; i < len(buf); i++ {
+		if buf[i] != '\r' && buf[i] != '\n' {
+			continue
+		}
+		if line := string(buf[start:i]); strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+		start = i + 1
+	}
+	return lines, append([]byte(nil), buf[start:]...)
+}
+
+// SetLineHook installs (or clears, with nil) the handler for lines typed while
+// a turn is running. It returns false for a line it does not want, which is
+// then held for the next prompt instead of being lost.
+func (in *Input) SetLineHook(f func(string) bool) {
+	in.mu.Lock()
+	in.lineHook = f
 	in.mu.Unlock()
 }
 
@@ -239,6 +290,16 @@ func (in *Input) StopCapture() {
 	}
 	in.stopCapture()
 	in.stopCapture = nil
+	// The hook belongs to the turn, and whatever it refused goes back to the
+	// prompt — in front of the type-ahead that arrived after it, so the order the
+	// operator typed in is the order they get back.
+	in.mu.Lock()
+	in.lineHook = nil
+	if len(in.held) > 0 {
+		in.pending = append(in.held, in.pending...)
+		in.held = nil
+	}
+	in.mu.Unlock()
 }
 
 // pasteSummary describes staged text for the prompt line.

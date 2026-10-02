@@ -275,6 +275,27 @@ func (r *Repl) runTurn() {
 	// by the terminal's line buffer, and type-ahead becomes the next message.
 	r.in.StartCapture()
 	defer r.in.StopCapture()
+	// And a FINISHED line, typed while the agent works, goes to the agent now
+	// instead of waiting for the prompt to come back. Pressing Enter is the
+	// difference: an unfinished line is still type-ahead, because half a sentence
+	// is not a message.
+	r.in.SetLineHook(func(line string) bool {
+		text := strings.TrimSpace(cleanPaste(line))
+		switch {
+		case text == "":
+			return true // a bare Enter: nothing to say
+		case strings.HasPrefix(text, "/"):
+			// A command belongs to the REPL, which is not running right now — and
+			// sending "/compact" to the model as prose would be worse than waiting.
+			// Refused, which hands it back to the prompt rather than losing it.
+			r.sess.view.Note(text + " waits for the prompt — commands do not run while the agent works")
+			return false
+		}
+		r.sess.Say(text)
+		r.sess.view.Note("queued for " + r.sess.client.Model() + " — it reads this at its next step")
+		return true
+	})
+	defer r.in.SetLineHook(nil)
 	r.sess.Run(context.Background())
 	r.sess.saveTranscript()
 }
