@@ -298,6 +298,15 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 		}
 	}
 	for k, v := range thinkingParams(c.provider, c.model, prof, req.Thinking, replay) {
+		// template_kwargs: off in roles.yaml. A chat template is a property of the
+		// checkpoint AS SERVED: a deployment built without the one the card
+		// describes rejects every kwarg we send, so the model 400s on every turn
+		// and the operator sees "it cannot print". The top-level fields still go —
+		// they are the engine's own API, not the template's — and only the
+		// template's bag is dropped.
+		if c.noKwargs && k == "chat_template_kwargs" {
+			continue
+		}
 		b[k] = v
 	}
 	for k, v := range c.provider.Extra {

@@ -287,7 +287,7 @@ func (s *Session) useModel(i int) {
 	c.transport = s.transport
 	if s.orch.roles != nil {
 		if o := s.orch.roles.modelOpts(c.model); o != nil {
-			c.noReplay = o.NoReplay
+			c.noReplay, c.noKwargs = o.NoReplay, o.NoKwargs
 		}
 	}
 	// After Learn, so the file beats the probe: roles.yaml is the strongest engine

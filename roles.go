@@ -116,8 +116,15 @@ type RolesConfig struct {
 //	  some-model:  {transport: text}   # its native tool parser is broken
 //	  hy3:         {engine: sglang}    # one gateway url, two engines behind it
 type ModelOpts struct {
-	Transport   string
-	NoReplay    bool   // reasoning_replay: off — this server won't take the field back
+	Transport string
+	NoReplay  bool // reasoning_replay: off — this server won't take the field back
+	// NoKwargs is template_kwargs: off — this deployment 400s on
+	// chat_template_kwargs, so send none of them for this model. An escape hatch
+	// on purpose: a chat template is a property of the checkpoint AS SERVED, and a
+	// deployment that was built without one (or with a stricter engine build) 400s
+	// every single turn, which looks to the operator like "the model cannot
+	// print". Without this the only remedy was a new binary.
+	NoKwargs    bool
 	Engine      string // vllm | sglang — which engine serves THIS model, when the endpoint fronts both
 	Temperature *float64
 	TopP        *float64
@@ -360,6 +367,13 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 				case "", "on", "auto", "true":
 				default:
 					return nil, fmt.Errorf("%s: models.%s.reasoning_replay must be on or off", p, m.Key)
+				}
+				switch m.str("template_kwargs") {
+				case "off", "none", "false":
+					o.NoKwargs = true
+				case "", "on", "auto", "true":
+				default:
+					return nil, fmt.Errorf("%s: models.%s.template_kwargs must be on or off", p, m.Key)
 				}
 			}
 		}
@@ -1026,6 +1040,9 @@ func (rc *RolesConfig) YAML() string {
 			}
 			if o.NoReplay {
 				parts = append(parts, "reasoning_replay: off")
+			}
+			if o.NoKwargs {
+				parts = append(parts, "template_kwargs: off")
 			}
 			if len(parts) > 0 {
 				fmt.Fprintf(&b, "  %s: {%s}\n", name, strings.Join(parts, ", "))

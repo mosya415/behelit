@@ -1067,6 +1067,7 @@ models:
   a-thinking-model: {temperature: 1.0, top_p: 0.95, effort: max}
   a-fast-model:     {temperature: 0.3, top_p: 0.95}
   a-picky-model:    {reasoning_replay: off}   # server rejects reasoning_content in history
+  a-bare-template:  {template_kwargs: off}    # server 400s on chat_template_kwargs
   some-model:       {transport: text}
 ```
 
@@ -1078,7 +1079,17 @@ request entirely. `/model` prints what a session actually sends. Reasoning
 results, so its chain of thought survives between tool calls — is on for the
 families that want it (`all` = the whole turn's reasoning, `turn` = the last
 step's) on both transports; `reasoning_replay: off` is the escape hatch for a
-server that 4xx's on it. `lca doctor` probes both: two tool calls in one reply
+server that 4xx's on it.
+
+`template_kwargs: off` is the other escape hatch, and it is the one to reach for
+when a model "cannot print". A chat template is a property of the checkpoint **as
+served**: a deployment built without the one the card describes rejects every
+`chat_template_kwargs` entry lca sends to steer it, so the model 400s on every
+single turn. Turning thinking off does *not* help — for hy3 the off position is
+`no_think` and for GLM-5.3 it is `clear_thinking`, both kwargs themselves — so
+the switch has to be the model card's. A 400 that names one of our own fields now
+says this on screen instead of leaving the operator with "unknown field
+enable_thinking". `lca doctor` probes both: two tool calls in one reply
 with nested-JSON arguments, and a history that carries `reasoning_content`.
 
 A session keeps the transport of its role's first model — a fallback never

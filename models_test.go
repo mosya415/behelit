@@ -309,6 +309,15 @@ func TestEffortVocabularyIsPerModel(t *testing.T) {
 	for _, tc := range []struct{ id, level, want string }{
 		{"hy3", "high", "high"},
 		{"hy3", "low", "low"},
+		// Dropped on the HOSTED path, where a vendor API resolves its own
+		// spellings and has no template ambiguity to protect against. On the
+		// self-hosted path these fold instead — see effortForLocal, and hy3 is the one model whose card insists a level is always NAMED: its
+		// two template variants disagree about what "no level" means (high on one, no
+		// thinking at all on the other, under the same parser name), so a dropped
+		// level used to send the one request shape the card says never to send. An
+		// undocumented level now folds to the deeper documented one — the invariant
+		// that matters is unchanged: what goes on the wire is always inside
+		// no_think|low|high.
 		{"hy3", "max", ""},
 		{"hy3", "medium", ""},
 		{"glm5.3", "max", "max"},
@@ -322,6 +331,19 @@ func TestEffortVocabularyIsPerModel(t *testing.T) {
 			t.Errorf("%s effort %q → %q, want %q", tc.id, tc.level, got, tc.want)
 		}
 	}
+	// The self-hosted path is where hy3's levels fold, because that is where the
+	// template ambiguity lives: its card says a level must always be NAMED, and a
+	// dropped level sent the one request shape the card forbids.
+	for _, level := range []string{"max", "medium", "xhigh", "minimal"} {
+		if got := lookupProfile("hy3").effortForLocal(level); got != "high" {
+			t.Errorf("hy3 effort %q self-hosted → %q, want high", level, got)
+		}
+	}
+	// And only for that model: glm-5.3 has no such ambiguity and still drops.
+	if got := lookupProfile("glm5.3").effortForLocal("ultra"); got != "" {
+		t.Errorf("glm-5.3 self-hosted keeps dropping an undocumented level, got %q", got)
+	}
+
 	// A model with no profile takes what the operator typed: that is their
 	// instruction, not the client's guess.
 	if got := lookupProfile("brand-new-model-nobody-has-carded").effortFor("high"); got != "high" {
@@ -367,8 +389,8 @@ func TestLocalThinkingSwitchComesFromTheProfile(t *testing.T) {
 	if kw := kwargs("hy3", "off"); kw["reasoning_effort"] != "no_think" {
 		t.Errorf("hy3 off: %v", kw)
 	}
-	if kw := kwargs("hy3", "max"); len(kw) != 0 {
-		t.Errorf("hy3 must not be sent an effort its template raises on: %v", kw)
+	if kw := kwargs("hy3", "max"); kw["reasoning_effort"] != "high" {
+		t.Errorf("hy3's undocumented levels fold to high, and high is what its template accepts: %v", kw)
 	}
 	// Kimi-K3 has no switch at all and takes a TOP-LEVEL reasoning_effort.
 	out := thinkingParams(p, "kimi-k3", lookupProfile("kimi-k3"), "on", "all")
@@ -494,11 +516,15 @@ func TestNamedEffortStillSendsTheProfileSwitch(t *testing.T) {
 			t.Errorf("%s effort %q: %s = %v, want %v (%v)", tc.id, tc.mode, tc.key, kw[tc.key], on, kw)
 		}
 	}
-	// The level itself is still dropped, and EffortOn is NOT substituted for it:
-	// "think this much" is the operator's number, and hy3's template raises on a
-	// level outside no_think|low|high.
-	if kw := kwargs("hy3", "medium"); len(kw) != 0 {
-		t.Errorf("hy3 must be sent no effort it does not accept: %v", kw)
+	// For hy3 the level folds rather than dropping, because hy3 is the one model whose card insists a level is always NAMED: its
+	// two template variants disagree about what "no level" means (high on one, no
+	// thinking at all on the other, under the same parser name), so a dropped
+	// level used to send the one request shape the card says never to send. An
+	// undocumented level now folds to the deeper documented one — the invariant
+	// that matters is unchanged: what goes on the wire is always inside
+	// no_think|low|high.
+	if kw := kwargs("hy3", "medium"); kw["reasoning_effort"] != "high" {
+		t.Errorf("hy3 must be sent a level it accepts, and medium folds to high: %v", kw)
 	}
 	if kw := kwargs("qwen3.6", "high"); kw["reasoning_effort"] != nil {
 		t.Errorf("qwen3.6 documents no effort field, so no level may be sent: %v", kw)
@@ -535,9 +561,9 @@ func TestThinkingExpectedFollowsTheEffortActuallySent(t *testing.T) {
 		id, effort string
 		want       bool
 	}{
-		{"hy3", "medium", false}, // dropped, and reasoning_effort IS hy3's switch
-		{"hy3", "max", false},    // same
-		{"hy3", "high", true},    // accepted
+		{"hy3", "medium", true}, // folded to high, so thinking IS asked for
+		{"hy3", "max", true},    // same
+		{"hy3", "high", true},   // accepted
 		{"hy3", "no_think", false},
 		{"hy3", "", false},   // hy3 does not think unless told to
 		{"glm5.3", "", true}, // cannot be switched off, so silence is a symptom

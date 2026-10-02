@@ -50,6 +50,18 @@ type ModelProfile struct {
 	// template does not, and an out-of-vocabulary level reaching one is the hy3
 	// failure in a different house. Empty = the same list both ways.
 	EffortsLocal []string
+	// EffortAlways means a request for this model must NAME a level, even when the
+	// level asked for is not one this model documents: an unrecognised level folds
+	// to EffortOn instead of being dropped. It is our policy and not a vendor
+	// claim, and it exists for exactly one shape of model — hy3, whose two chat
+	// template variants disagree about what "no level" means (high on one, no
+	// thinking at all on the other, both served under the same parser name). For
+	// that model, dropping `effort: max` sent a request with no level and landed
+	// in the ambiguity the card's Note says lca must never rely on, so folding to
+	// the deeper documented level is the lesser of the two inventions: it is
+	// visible in what /model and doctor quote back, and it is a level the template
+	// accepts.
+	EffortAlways bool
 	EffortNone   bool   // the vendor documents that this model takes NO effort field
 	EffortOn     string // the level to send for a bare "think" (the vendor default where there is one)
 	EffortOff    string // the level that means "don't think" ("" = use Switch.Off)
@@ -320,6 +332,9 @@ var canonicalProfiles = []canonProfile{
 		// a level and never relies on the default.
 		EffortOn:  "high",
 		EffortOff: "no_think",
+		// Measured: with this false, `effort: max` on hy3 sent NO level at all,
+		// which is the one request shape the Note below says must never be sent.
+		EffortAlways: true,
 		// Effort and nothing else. A `preserved_thinking: true` kwarg was proposed
 		// here and is NOT sent: no source names it, and the template's own default
 		// (true whenever tools are present) is what the Replay comment above already
@@ -618,7 +633,18 @@ func (p ModelProfile) effortFor(level string) string {
 // reaches a local endpoint.
 func (p ModelProfile) effortForLocal(level string) string {
 	if len(p.EffortsLocal) == 0 {
-		return p.effortFor(level)
+		// The fold lives on THIS path only. It exists because a self-hosted hy3
+		// serves one of two chat templates that disagree about what "no level"
+		// means, so sending nothing is the one shape its card forbids. A hosted
+		// API resolves its own spellings and has no such ambiguity: adding a
+		// top-level field there would be inventing a request nobody asked for.
+		if v := p.effortFor(level); v != "" {
+			return v
+		}
+		if level != "" && p.EffortAlways && p.EffortOn != "" {
+			return p.EffortOn
+		}
+		return ""
 	}
 	if level == "" {
 		return ""
@@ -627,6 +653,9 @@ func (p ModelProfile) effortForLocal(level string) string {
 		if e == level {
 			return level
 		}
+	}
+	if p.EffortAlways && p.EffortOn != "" {
+		return p.EffortOn
 	}
 	return ""
 }

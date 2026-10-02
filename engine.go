@@ -410,6 +410,12 @@ func (s *Session) applyModelOpts(req *ChatRequest) {
 	if req.Thinking == "" {
 		req.Thinking = o.Effort
 	}
+	// On the CLIENT and not the request, because the body assembly asks the client
+	// (like noReplay beside it), and here because this is the one hook that runs
+	// for every session: useModel sets it for a role with `models:`, and a plain
+	// session never goes through useModel at all — which is exactly the session an
+	// operator is in when they reach for this escape hatch.
+	s.client.noKwargs = o.NoKwargs
 }
 
 // sampling describes what this session actually sends, and where each value came

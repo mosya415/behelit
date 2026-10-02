@@ -476,16 +476,37 @@ func TestHy3EffortCarrierIsTheKwargOnEveryEngine(t *testing.T) {
 				t.Fatalf("engine %q, %s: chat_template_kwargs.reasoning_effort = %v, want %q", engine, mode, kw["reasoning_effort"], want)
 			}
 		}
-		// Nothing outside the safe-everywhere intersection, ever.
+		// Nothing outside the safe-everywhere intersection, ever — and for hy3 that
+		// is now the whole of the rule, because an undocumented level FOLDS to a
+		// documented one rather than vanishing: hy3 is the one model whose card insists a level is always NAMED: its
+		// two template variants disagree about what "no level" means (high on one, no
+		// thinking at all on the other, under the same parser name), so a dropped
+		// level used to send the one request shape the card says never to send. An
+		// undocumented level now folds to the deeper documented one — the invariant
+		// that matters is unchanged: what goes on the wire is always inside
+		// no_think|low|high.
 		for _, mode := range []string{"none", "medium", "max", "xhigh", "minimal"} {
 			c := &Client{provider: &Provider{ID: "local", Local: true, Dialect: "vllm"}, model: "hy3"}
 			c.setEngine(engine, EngineFromEndpoint)
 			raw, _ := c.body(ChatRequest{Thinking: mode, Messages: []Message{{Role: "user", Content: "hi"}}}, false)
-			if strings.Contains(string(raw), "reasoning_effort") && mode != "none" {
-				t.Fatalf("engine %q: %q is outside hy3's vocabulary on both engines: %s", engine, mode, raw)
+			var got map[string]any
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
 			}
-			if strings.Contains(string(raw), `"none"`) {
-				t.Fatalf("engine %q: \"none\" makes the template raise: %s", engine, raw)
+			kw, _ := got["chat_template_kwargs"].(map[string]any)
+			lvl, _ := kw["reasoning_effort"].(string)
+			switch mode {
+			case "none":
+				if lvl != "no_think" {
+					t.Fatalf("engine %q: off must be spelled no_think, got %q: %s", engine, lvl, raw)
+				}
+			default:
+				if lvl != "high" {
+					t.Fatalf("engine %q: %q must fold to high, got %q: %s", engine, mode, lvl, raw)
+				}
+			}
+			if _, top := got["reasoning_effort"]; top {
+				t.Fatalf("engine %q: a top-level reasoning_effort is a 400 every turn: %s", engine, raw)
 			}
 		}
 	}

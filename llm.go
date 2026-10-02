@@ -25,6 +25,7 @@ type Client struct {
 	apiKey    string
 	temp      *float64 // nil = send no temperature (the model card / server decides)
 	noReplay  bool     // never send reasoning_content back (server rejects it)
+	noKwargs  bool     // never send chat_template_kwargs (this deployment 400s on them)
 	maxTokens int
 	ctxLen    int    // active model's context window (max_model_len), 0 if unknown
 	ctxSrc    Origin // where ctxLen came from; only ever OriginServer or unset
