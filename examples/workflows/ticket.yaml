@@ -1,0 +1,125 @@
+description: One ticket, end to end: baseline, brief, build on a branch, two reviews, merge, MR, ticket comment.
+role: lead
+
+# The longest shape lca can run today, written out so the ceilings are visible.
+# `lca run` has NO wall clock of its own on purpose (budget.go): a workflow's
+# units of time are the `timeout:` lines below, which an author writes next to a
+# build and a test suite. So the run's length is the sum of these numbers, and a
+# day-long run is a day of step timeouts — not a limit somebody forgot to raise.
+#
+# What DOES bound it is in roles.yaml under defaults:: max_steps and max_tokens
+# bound every model in the run — the primary, every child, the compactor — and
+# with `steps: unlimited` on a role, tokens are the only ceiling the model side
+# has. That is the pairing to use for long work: remove the step proxy, keep the
+# real budget.
+#
+# Interruptions are not failures. Every step writes state.json before and after
+# itself, the file's sha256 is checked so a resume cannot straddle an edit of
+# THIS file, and a pid lock keeps two runs off one state:
+#
+#   lca run ticket -var ticket=ABC-123 -var branch=agent/ABC-123
+#   lca run ticket -resume        # continues at the step that failed
+#
+# Needs: roles lead, coder, reviewer, integrator (lca doctor binds this file
+# against your team and names what is missing), `apply: branch` on coder so the
+# work lands as a branch, `review: reviewer` on coder for the cross-family
+# review, and an MCP server for the tracker and the forge. Every run:/check: line
+# is ONE command unless sandbox: {shell: true} — two steps instead of `a && b`.
+
+vars:
+  ticket:                     # no value: required, pass -var ticket=…
+  branch:                     # the branch the work lands on
+  tests: ./...
+
+steps:
+  # ── 1. is the tree green before we touch it ────────────────────────────────
+  baseline:
+    run: go test -count=1 ${vars.tests}
+    timeout: 3600
+    # A red baseline means the verifier cannot tell this change's breakage from
+    # what was already broken, so nothing after this should run.
+
+  # ── 2. read the ticket from the tracker ────────────────────────────────────
+  ticket:
+    prompt: |
+      Read ticket ${vars.ticket} and write a build brief: what to change, which
+      files, the failure mode to avoid, and the test that proves it works.
+      Answer with the brief only — it is handed verbatim to a model that sees
+      none of this conversation.
+    timeout: 900
+    # A READ of the tracker needs no grant: mcp_read is allowed by default
+    # (permission.go), because the server is on the operator's own allowlist and
+    # a read that asks every time teaches people to type y without reading.
+
+  # ── 3. build it, on its own branch, reviewed by another family ─────────────
+  build:
+    delegate: |
+      ${steps.ticket.out}
+
+      Implement exactly this. Stay inside the files named above.
+    role: coder
+    check: go test -count=1 ${vars.tests}
+    retries: 1
+    timeout: 14400
+    # Three gates, and they are different things: the coder role's own check_cmd,
+    # this step's check, and then the reviewer its roles.yaml names — a different
+    # model family — judging the diff before it is applied. retries wrap the whole
+    # delegation while verify_attempts works inside it, so the budgets multiply:
+    # -dry-run prints the effective number.
+
+  # ── 4. a written review, left in the repository ────────────────────────────
+  review:
+    prompt: |
+      Review this diff against the ticket and the constraints in AGENTS.md:
+
+      ${steps.build.diff}
+
+      Write review.md: first line exactly "VERDICT: ship" or "VERDICT: rework",
+      then the reasons, file by file.
+    role: reviewer
+    check: grep -q '^VERDICT: ship' review.md
+    retries: 0
+    timeout: 1800
+    # retries: 0 on purpose — a retry re-prompts with "the check FAILED", which
+    # pressures a model into flipping its verdict instead of reconsidering it.
+
+  # ── 5. merge the branch into the integration branch ────────────────────────
+  merge:
+    prompt: |
+      Merge ${vars.branch} into the integration branch. Resolve conflicts in
+      favour of the ticket's intent; if a conflict needs a decision nobody has
+      made, stop and say so instead of guessing.
+    role: integrator
+    when: ${steps.build.status} == ok && ${steps.review.status} == ok
+    timeout: 1800
+    # ${steps.build.review} is approve | reject | unreviewed | empty when you want
+    # to tell "a reviewer approved it" from "nobody reviewed it".
+
+  # ── 6. the merge request, through the forge's API ──────────────────────────
+  mr:
+    prompt: |
+      Open a merge request from ${vars.branch} for ticket ${vars.ticket}.
+      Title: the ticket's summary. Body: what changed, how it was verified
+      (command and exit), and the reviewer's verdict. Nothing else.
+    role: integrator
+    mcp_write: [forge__create_merge_request]
+    when: ${steps.merge.status} == ok
+    timeout: 900
+    # This is the ONLY way an unattended run writes anywhere outside its tree,
+    # and it is deliberately narrow: -y cannot grant mcp_write, so the grant is
+    # this line, it names ONE tool, and it is allowed on a prompt step only. Push
+    # is denied by the pipeline profile — the MR is created through the API, by a
+    # token whose own branch restriction is the real boundary.
+
+  # ── 7. tell the ticket what happened ──────────────────────────────────────
+  comment:
+    prompt: |
+      Comment on ${vars.ticket}: the MR link from the previous step, one line per
+      file changed, the verifying command with its exit code, and the verdict.
+      If anything was left undone, say that first.
+    role: integrator
+    mcp_write: [tracker__add_comment]
+    on_fail: continue
+    timeout: 900
+    # on_fail: continue — the work is already merged and the MR is open; a
+    # tracker that is down must not make the run report failure.

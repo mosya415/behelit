@@ -1473,6 +1473,37 @@ lca run <runid> -pause           # stop at the next step boundary (ids come from
 after you add one: a role that does not exist or a misspelt `${steps…}` reference
 is found by the command you already run, not by the first real run.
 
+The longest shape there is, written out so its ceilings are visible, is
+[`ticket.yaml`](examples/workflows/ticket.yaml): baseline, read the ticket, build
+it on its own branch under a cross-family review, a second written review left in
+the repository, merge by an `integrator` role, then the merge request and the
+ticket comment through named MCP write tools. Its own `-dry-run` plan:
+
+```
+  #  step      kind      role              member  tries      timeout  when         check
+  1  baseline  run       —                 local   1          1h0m0s   always       —
+  2  ticket    prompt    lead              local   1          15m0s    always       —
+  3  build     delegate  coder → reviewer  local   2 × 2 = 4  4h0m0s   always       go test -count=1 ./...
+  4  review    prompt    reviewer          local   1          30m0s    always       grep -q '^VERDICT: ship' review.md
+  5  merge     prompt    integrator        local   1          30m0s    conditional  —
+  6  mr        prompt    integrator        local   1          15m0s    conditional  —
+  7  comment   prompt    integrator        local   1          15m0s    always       —
+```
+
+**`lca run` has no wall clock of its own, on purpose.** A workflow's units of
+time are the `timeout:` lines its author wrote next to a build and a test suite,
+so the run is as long as they add up to — six and three quarter hours above — and
+a `defaults: timeout:` would cancel a legitimate four-step stand run halfway
+through. What bounds it instead is the part that actually runs away: `max_steps`
+and `max_tokens` under `defaults:` bound every model in the run, the primary,
+every child and the compactor. For long work, remove the step proxy and keep the
+real budget — `steps: unlimited` on the role plus a token ceiling.
+
+Across interruptions it is longer still: every step writes `state.json` before
+and after itself, the workflow file's sha256 is checked so a resume cannot
+straddle an edit of it, and a pid lock keeps two runs off one state, so
+`lca run ticket -resume` continues at the step that failed however long ago.
+
 The other shipped example, [`harden.yaml`](examples/workflows/harden.yaml), asks
 for more than `lca init` writes. A **`reviewer` role**: its fifth step runs as
 that role, so doctor and every run refuse the file until one exists, and it needs
