@@ -257,11 +257,21 @@ func main() {
 		"tier": orch.activeTier(),
 	})
 	defer orch.rec.Event("session_end", nil)
-	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions)
+	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions, resumed.id)
 
 	// After the prune, so a round two is never the thing that gets collected, and
 	// before the one-shot appends its message: the history has to be under it.
 	if resumed.id != "" {
+		// One process per session, for as long as this one runs: the transcript is
+		// rewritten whole after every turn, so a second round two would drop this
+		// one's work and both would report success.
+		unlock, lerr := lockSession(cfg, resumed.id)
+		if lerr != nil {
+			fatalCode(exitUsage, lerr)
+		}
+		if unlock != nil {
+			defer unlock()
+		}
 		n, err := continueSession(orch, sess, resumed)
 		if err != nil {
 			fatalCode(exitUsage, err)

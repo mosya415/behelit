@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -106,7 +108,76 @@ func resumableSession(cfg Config, uid string) (sessionMeta, error) {
 	if len(msgs) == 0 {
 		return sessionMeta{}, usageErrf("-session %s: %s is empty", uid, p)
 	}
+	// Its project, when the audit remembers it. A uid is only unique within a
+	// state directory, and a wrapper that points LCA_DIR at one place for several
+	// worktrees — one per ticket, which is exactly their shape — can hand round two
+	// the uid of a different ticket's round one. The transcript would load, the
+	// model would be told it had already edited files it has never seen, and the
+	// diff would be judged against the wrong work. Refused rather than noted: a
+	// uid from another tree is a wrapper bug, and continuing would corrupt a
+	// ticket quietly.
+	if was, ok := sessionRoot(cfg, uid); ok && cfg.Root != "" && was != cfg.Root {
+		return sessionMeta{}, usageErrf("-session %s ran in %s, not in %s — that uid belongs to another tree's round; a session id is only unique inside one LCA_DIR", uid, was, cfg.Root)
+	}
 	return sessionMeta{path: p, id: uid}, nil
+}
+
+// sessionRoot is the project root the audit says that session ran in, or false
+// when the audit cannot say. Missing evidence is not evidence: an audit that was
+// rotated, or a session from before this field existed, must not block a resume
+// the operator is entitled to.
+func sessionRoot(cfg Config, uid string) (string, bool) {
+	f, err := os.Open(filepath.Join(cfg.stateDir(), "audit.jsonl"))
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	root, found := "", false
+	for sc.Scan() {
+		var e struct {
+			Kind    string `json:"kind"`
+			Session string `json:"session"`
+			Root    string `json:"root"`
+		}
+		if json.Unmarshal(sc.Bytes(), &e) != nil {
+			continue
+		}
+		if e.Kind == "session_start" && e.Session == uid && e.Root != "" {
+			root, found = e.Root, true // the last one wins: a session may have been resumed before
+		}
+	}
+	return root, found
+}
+
+// lockSession keeps two processes off one session. The transcript is rewritten
+// WHOLE after every turn (recorder.go), so two rounds on the same uid do not
+// interleave — the loser's turns are silently gone, and the wrapper is told both
+// succeeded. A lock whose pid is dead is a crash and is taken over, because a
+// killed round two must leave the session resumable.
+func lockSession(cfg Config, uid string) (func(), error) {
+	path := transcriptPath(cfg, uid) + ".lock"
+	for try := 0; try < 2; try++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			f.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, nil // an unwritable state dir is not a reason to refuse the run
+		}
+		b, rerr := os.ReadFile(path)
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if rerr == nil && pid > 0 && pidAlive(pid) {
+			return nil, usageErrf("-session %s is in use by pid %d — two rounds on one session overwrite each other's turns", uid, pid)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, nil
+		}
+	}
+	return nil, nil
 }
 
 // continueSession puts a saved conversation under the session that is about to
@@ -144,7 +215,7 @@ func continueSession(o *Orchestrator, s *Session, m sessionMeta) (int, error) {
 
 // pruneTranscripts keeps only the `keep` most recent transcript files, deleting
 // older ones so transcripts/ doesn't grow without bound. keep<=0 disables it.
-func pruneTranscripts(dir string, keep int) {
+func pruneTranscripts(dir string, keep int, spare string) {
 	if keep <= 0 {
 		return
 	}
@@ -163,6 +234,13 @@ func pruneTranscripts(dir string, keep int) {
 		}
 		info, err := e.Info()
 		if err != nil {
+			continue
+		}
+		// The session this run is continuing is never collected. The comment at the
+		// call site already claimed this; it was not true, so a round two on a
+		// session older than `keep` others deleted the very transcript it was about
+		// to read — and deleted it for good.
+		if spare != "" && strings.TrimSuffix(e.Name(), ".json") == spare {
 			continue
 		}
 		files = append(files, ent{filepath.Join(dir, e.Name()), info.ModTime()})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,6 +76,15 @@ type reviewComment struct {
 	Line     int    `json:"line"`
 	Severity string `json:"severity"`
 	Body     string `json:"body"`
+	// Kind is "added" or "context": which sort of diff line this landed on,
+	// verified against the diff lca parsed. A comment may sit on a context line
+	// inside a hunk on purpose — that is postable, and a defect introduced by a
+	// new line is often best pointed at the `if` above it — but a forge needs
+	// both line numbers to post on a context line and only the new one to post on
+	// an added line, and the wrapper did not parse the diff. Beyond the four
+	// fields the requirement names, and additive: a wrapper that ignores it is
+	// unaffected.
+	Kind string `json:"kind"`
 }
 
 // reviewReport is the `review` field of the result object.
@@ -172,6 +182,7 @@ func prepareReview(cfg Config, base string) (*reviewRun, error) {
 		return nil, usageErrf("-diff-base %s: nothing in %s differs from it, so there is no diff to review", base, top)
 	}
 	rr := &reviewRun{base: base, from: from, diff: diff, lines: parseUnifiedDiff(diff)}
+	rr.lines.root = top // so an absolute path from the model's own file tools resolves
 	if len(rr.lines.order) == 0 {
 		return nil, usageErrf("-diff-base %s: the diff against it has no line changes in it (only modes, renames or binary files), so there is nothing to comment on", base)
 	}
@@ -193,7 +204,13 @@ type lineSpan struct{ from, to int }
 // — "a line that is not inside a changed hunk".
 type changedLines struct {
 	files map[string][]lineSpan
+	// added is the subset that was ADDED, so a comment can say which kind of line
+	// it landed on: a forge needs both line numbers to post on a context line and
+	// only the new one to post on an added line, and a wrapper cannot tell them
+	// apart from the diff it did not parse.
+	added map[string][]lineSpan
 	order []string // the paths in the order the diff lists them, for messages
+	root  string   // the repo root, for a model that answers with an absolute path
 }
 
 // parseUnifiedDiff reads git's own output. It is deliberately tolerant: a line
@@ -201,9 +218,47 @@ type changedLines struct {
 // thing this map decides is whether a comment can be placed, and the worst a
 // missed hunk does is move one comment into the summary.
 func parseUnifiedDiff(diff string) *changedLines {
-	cl := &changedLines{files: map[string][]lineSpan{}}
+	cl := &changedLines{files: map[string][]lineSpan{}, added: map[string][]lineSpan{}}
 	path := ""
+	// Inside a hunk the COUNTS decide what a line is, not its first byte: an added
+	// line whose own text begins with "++ " reads as a `+++ ` file header, and the
+	// real file then loses every hunk after it — a comment on a line that is in
+	// the diff gets "not in the diff at all" and the reviewer is asked to move a
+	// correct finding. git's own output is the authority on how many lines a hunk
+	// has, so it is used.
+	oldLeft, newLeft, at := 0, 0, 0
 	for _, line := range strings.Split(diff, "\n") {
+		if oldLeft > 0 || newLeft > 0 {
+			switch {
+			case strings.HasPrefix(line, "\\"):
+				// "\ No newline at end of file" belongs to the line above and counts
+				// for neither side.
+			case strings.HasPrefix(line, "+"):
+				cl.note(path, at, true)
+				at++
+				newLeft--
+			case strings.HasPrefix(line, "-"):
+				oldLeft--
+			case line == "" || strings.HasPrefix(line, " "):
+				cl.note(path, at, false)
+				at++
+				oldLeft--
+				newLeft--
+			default:
+				// Not a body line: the hunk was shorter than its header claimed, which
+				// a truncated diff looks like. Fall through and read it as a header.
+				oldLeft, newLeft = 0, 0
+			}
+			if oldLeft > 0 || newLeft > 0 {
+				continue
+			}
+			if oldLeft < 0 || newLeft < 0 {
+				oldLeft, newLeft = 0, 0
+			}
+			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") || strings.HasPrefix(line, " ") || line == "" || strings.HasPrefix(line, "\\") {
+				continue // consumed as a body line
+			}
+		}
 		switch {
 		case strings.HasPrefix(line, "diff --git "):
 			path = "" // a new file section; its +++ line decides the name
@@ -221,9 +276,46 @@ func parseUnifiedDiff(diff string) *changedLines {
 				cl.order = append(cl.order, path)
 			}
 			cl.files[path] = append(cl.files[path], lineSpan{from, from + count - 1})
+			_, oc, _ := oldSideRange(line)
+			oldLeft, newLeft, at = oc, count, from
 		}
 	}
 	return cl
+}
+
+// note records one new-side line of a hunk body: every line of it, and
+// separately the ones that were ADDED. Both are needed — a comment may be placed
+// anywhere in the hunk, which is what the forge accepts and what a reviewer
+// means when it points at the `if` above the new line, while a wrapper posting
+// the comment has to know which kind of line it got.
+func (cl *changedLines) note(path string, line int, added bool) {
+	if path == "" || line <= 0 {
+		return
+	}
+	if !added {
+		return
+	}
+	spans := cl.added[path]
+	if n := len(spans); n > 0 && spans[n-1].to == line-1 {
+		spans[n-1].to = line
+		cl.added[path] = spans
+		return
+	}
+	cl.added[path] = append(spans, lineSpan{line, line})
+}
+
+// oldSideRange is newSideRange for the `-a,b` half: the old side's count, which
+// with the new side's bounds the hunk body exactly.
+func oldSideRange(hdr string) (from, count int, ok bool) {
+	i := strings.IndexByte(hdr, '-')
+	if i < 0 {
+		return 0, 0, false
+	}
+	rest := hdr[i+1:]
+	if j := strings.IndexAny(rest, " @"); j >= 0 {
+		rest = rest[:j]
+	}
+	return parseHunkRange(rest)
 }
 
 // newSidePath is the path out of a `+++ b/path` line. git quotes a path with a
@@ -257,6 +349,13 @@ func newSideRange(hdr string) (from, count int, ok bool) {
 	if j := strings.IndexAny(rest, " @"); j >= 0 {
 		rest = rest[:j]
 	}
+	return parseHunkRange(rest)
+}
+
+// parseHunkRange reads one `c,d` half of an @@ header. A hunk of one line omits
+// the count, which is the shape this used to get wrong. (parseRange is taken:
+// tools.go has one for a line range in a tool call.)
+func parseHunkRange(rest string) (from, count int, ok bool) {
 	start, n, found := strings.Cut(rest, ",")
 	from, err := strconv.Atoi(start)
 	if err != nil || from < 0 {
@@ -280,7 +379,7 @@ func newSideRange(hdr string) (from, count int, ok bool) {
 // boundary — an ambiguous `mod.rs` is not placed, because guessing which of four
 // would post the comment on the wrong file.
 func (cl *changedLines) place(file string, line int) (string, bool) {
-	p := normalizeDiffPath(file)
+	p := normalizeDiffPath(cl.relToRoot(file))
 	if cl == nil || p == "" || line <= 0 {
 		return "", false
 	}
@@ -300,12 +399,27 @@ func (cl *changedLines) place(file string, line int) (string, bool) {
 		}
 		p, spans = match, cl.files[match]
 	}
-	for _, s := range spans {
-		if line >= s.from && line <= s.to {
+	for _, sp := range spans {
+		if line >= sp.from && line <= sp.to {
 			return p, true
 		}
 	}
 	return p, false
+}
+
+// kindOf says whether a placed line was ADDED or is context inside the hunk.
+// Only called for a line place() accepted, so "context" is the honest answer for
+// anything the added map does not hold.
+func (cl *changedLines) kindOf(path string, line int) string {
+	if cl == nil {
+		return "context"
+	}
+	for _, sp := range cl.added[path] {
+		if line >= sp.from && line <= sp.to {
+			return "added"
+		}
+	}
+	return "context"
 }
 
 // normalizeDiffPath puts a path the model wrote into the diff's own spelling as
@@ -393,7 +507,7 @@ func (rr *reviewRun) validate(rep *reviewReport) (*reviewReport, []string) {
 	out := &reviewReport{Verdict: rep.Verdict, Comments: []reviewComment{}, Summary: strings.TrimSpace(rep.Summary)}
 	var problems, salvaged []string
 	for _, c := range rep.Comments {
-		body := strings.TrimSpace(forPublication(c.Body))
+		body := strings.TrimSpace(forComment(c.Body))
 		sev := strings.ToLower(strings.TrimSpace(c.Severity))
 		where := strings.TrimSpace(c.File)
 		if where == "" {
@@ -434,7 +548,8 @@ func (rr *reviewRun) validate(rep *reviewReport) (*reviewReport, []string) {
 			salvaged = append(salvaged, fmt.Sprintf("%s (%s) — %s", where, sev, body))
 			continue
 		}
-		out.Comments = append(out.Comments, reviewComment{File: path, Line: c.Line, Severity: sev, Body: body})
+		out.Comments = append(out.Comments, reviewComment{File: path, Line: c.Line, Severity: sev, Body: body,
+			Kind: rr.lines.kindOf(path, c.Line)})
 	}
 	// Sorted, so two runs of the same review produce the same object and a
 	// wrapper diffing two reviews is diffing the reviews and not the order the
@@ -470,10 +585,26 @@ func (rr *reviewRun) validate(rep *reviewReport) (*reviewReport, []string) {
 // first and answers after must be read by its answer, exactly as parseVerdict
 // takes the last verdict line.
 func extractJSONObject(text string) (string, error) {
-	if strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("the reviewer replied with nothing at all")
+	cands, err := jsonCandidates(text)
+	if err != nil {
+		return "", err
 	}
-	best, spent := "", 0
+	raw, err := pickReview(cands)
+	if err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+// jsonCandidates returns every complete JSON object in the reply, outermost
+// first, plus the single object-valued field of one that has no verdict — which
+// is how a reviewer that wraps its answer ({"review": {…}}) is still read.
+func jsonCandidates(text string) ([]string, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("the reviewer replied with nothing at all")
+	}
+	var out []string
+	spent := 0
 	for i := 0; i < len(text); i++ {
 		if text[i] != '{' {
 			continue
@@ -489,15 +620,100 @@ func extractJSONObject(text string) (string, error) {
 		spent += end - i + 1
 		if raw != "" {
 			if json.Valid([]byte(raw)) {
-				best = raw
+				out = append(out, raw)
+				out = append(out, unwrapped(raw)...)
 			}
 			i = end // never rescan inside an object we already matched
 		}
 	}
-	if best == "" {
-		return "", fmt.Errorf("the reviewer's reply has no JSON object in it")
+	if len(out) == 0 {
+		return nil, fmt.Errorf("the reviewer's reply has no JSON object in it")
 	}
-	return best, nil
+	return out, nil
+}
+
+// unwrapped is the object inside a one-field wrapper, so a reviewer that answers
+// {"review": {…}} — the field name the README itself uses when it describes the
+// result — is read instead of refused.
+func unwrapped(raw string) []string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &m) != nil {
+		return nil
+	}
+	if _, ok := m["verdict"]; ok {
+		return nil // it is the object itself, not a wrapper
+	}
+	var out []string
+	for _, v := range m {
+		t := strings.TrimSpace(string(v))
+		if strings.HasPrefix(t, "{") && json.Valid([]byte(t)) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// pickReview chooses the candidate that IS the review, and refuses to choose
+// when two of them disagree.
+//
+// The rule used to be "the last complete object that parses wins", and that is
+// the one way this feature could do real harm: a reviewer that sends its verdict
+// and then adds `{"note": "hope this helps"}` had its whole review replaced by
+// the note — request_changes with a blocker became `approve`, `comments: []`,
+// exit 0, with no retry spent, which is a bad change reaching master under the
+// word "approve". So a candidate counts only if it carries a VERDICT, the first
+// such one wins (a reviewer answers and then chatters, not the reverse), and two
+// that carry DIFFERENT verdicts are not a review at all: that is unreadable, and
+// unreadable is reported as failed. Identical repeats — the same answer in a
+// fence and again in prose — are not a disagreement.
+func pickReview(cands []string) (string, error) {
+	var valid []struct {
+		raw     string
+		verdict string
+	}
+	hasField := ""
+	for _, raw := range cands {
+		var rep reviewReport
+		if json.Unmarshal([]byte(raw), &rep) != nil {
+			continue
+		}
+		if strings.TrimSpace(rep.Verdict) == "" {
+			continue
+		}
+		if hasField == "" {
+			hasField = raw
+		}
+		v, ok := normalizeVerdict(rep.Verdict)
+		if !ok {
+			// A verdict lca does not know is not a review to compare against: a
+			// reviewer quoting the shape it was asked for ({"verdict":"…"}) and
+			// answering after it must be read by its ANSWER, and treating the
+			// template as a rival verdict would refuse the whole reply.
+			continue
+		}
+		valid = append(valid, struct {
+			raw     string
+			verdict string
+		}{raw, v})
+	}
+	switch {
+	case len(valid) == 0 && hasField != "":
+		// Something called itself a verdict but is not one. Returned so the caller
+		// reports WHICH word it was, which is what the retry has to say.
+		return hasField, nil
+	case len(valid) == 0:
+		// Nothing carries a verdict at all; the outermost object is returned so the
+		// caller can report the missing field rather than "no JSON object here".
+		return cands[0], nil
+	}
+	first := valid[0]
+	for _, r := range valid[1:] {
+		if r.verdict != first.verdict {
+			return "", fmt.Errorf("the reply has %d review objects and they disagree (%s and %s); send exactly one",
+				len(valid), first.verdict, r.verdict)
+		}
+	}
+	return first.raw, nil
 }
 
 // jsonScanBudget is how many bytes extractJSONObject may examine in total.
@@ -658,7 +874,15 @@ func (rr *reviewRun) retryMessage(err error, problems []string) string {
 	if err != nil {
 		fmt.Fprintf(&b, "- %s\n", err.Error())
 	}
-	for _, p := range problems {
+	// Capped: a reviewer that emits fifty bad comments would otherwise have fifty
+	// lines sent back to it, which is a message nobody reads — least of all a
+	// model being asked to concentrate on fixing its format.
+	const maxProblems = 12
+	for i, p := range problems {
+		if i == maxProblems {
+			fmt.Fprintf(&b, "- and %d more of the same kind\n", len(problems)-maxProblems)
+			break
+		}
 		fmt.Fprintf(&b, "- %s\n", p)
 	}
 	b.WriteString(`
@@ -708,7 +932,16 @@ func (o *Orchestrator) finishReview(ctx context.Context, s *Session, v *Verdict)
 			// told us what it found, and throwing that away to report "unreadable"
 			// would be the one outcome nobody wants.
 			if rep2, problems2, err2 := rr.read(lastAssistantText(s)); err2 == nil {
-				rep, problems, err = rep2, problems2, nil
+				// MERGED, not replaced. The retry is asked for because something was
+				// wrong with the first answer, not because the first answer was
+				// imaginary: a reviewer that found three defects, placed two of them
+				// badly and then re-sent only the one it was sure of had the other two
+				// dropped on the floor — and the verdict with them, so a
+				// request_changes could come back as approve from a reviewer that
+				// never changed its mind. The union is taken and the STRICTER verdict
+				// wins, because a found defect does not become unfound by being
+				// restated badly.
+				rep, problems, err = mergeReviews(rep, rep2), problems2, nil
 			} else if err != nil {
 				err = err2
 			}
@@ -761,4 +994,80 @@ func reviewLines(rep *reviewReport, why string) []string {
 		out = append(out, fmt.Sprintf("  %s:%d  %s  %s", c.File, c.Line, c.Severity, firstLine(c.Body)))
 	}
 	return out
+}
+
+// mergeReviews is the first read and the retry's read as one review. Comments
+// are deduplicated on file, line and body — a reviewer re-sending the same
+// finding corrected is the normal case — and the order is the first answer's,
+// then whatever the second added. The verdict is the stricter of the two for the
+// reason the retry exists at all: the one direction this must never fail in is
+// "approve" for a review that found something.
+func mergeReviews(first, second *reviewReport) *reviewReport {
+	switch {
+	case first == nil:
+		return second
+	case second == nil:
+		return first
+	}
+	out := &reviewReport{Verdict: second.Verdict, Summary: strings.TrimSpace(second.Summary)}
+	if first.Verdict == reviewChanges || second.Verdict == reviewChanges {
+		out.Verdict = reviewChanges
+	}
+	if out.Summary == "" {
+		out.Summary = strings.TrimSpace(first.Summary)
+	}
+	seen := map[string]bool{}
+	out.Comments = []reviewComment{}
+	for _, c := range append(append([]reviewComment{}, first.Comments...), second.Comments...) {
+		key := fmt.Sprintf("%s:%d:%s", c.File, c.Line, strings.TrimSpace(c.Body))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out.Comments = append(out.Comments, c)
+	}
+	return out
+}
+
+// relToRoot turns the absolute path a model gets from its own file tools into
+// the repo-relative one the diff uses. Done before the suffix match rather than
+// instead of it, because a path from outside the project must NOT quietly match
+// a file inside it: /etc/passwd ends with "passwd" and so might a file in the
+// diff.
+func (cl *changedLines) relToRoot(p string) string {
+	p = strings.TrimSpace(p)
+	if cl == nil || cl.root == "" || !filepath.IsAbs(p) {
+		return p
+	}
+	if rel, err := filepath.Rel(cl.root, filepath.Clean(p)); err == nil && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	return p
+}
+
+// forComment is redaction for text a model wrote and a forge will publish. It is
+// deliberately NOT forPublication: that one runs stripANSI, which deletes
+// everything from an ESC to the next letter `m`, so a body containing an escape
+// — or the two characters ESC and `[` in a discussion ABOUT escapes — lost the
+// sentence after it silently. Here the escape is made visible instead: a comment
+// is prose, and prose that mentions a control character should still read as
+// prose. Secrets are removed exactly as everywhere else.
+func forComment(s string) string {
+	s = redactSecrets(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == 0x1b:
+			b.WriteString("^[") // the one byte that steers a terminal, shown rather than obeyed
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f:
+			// Other control characters have no meaning in a comment and a few of them
+			// (CR, backspace) rewrite the line a reader is looking at.
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
