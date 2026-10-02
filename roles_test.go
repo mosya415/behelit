@@ -735,8 +735,11 @@ func TestSandboxRejectedCheckIsErrorUpFront(t *testing.T) {
 	var coderCalls int
 	_, r := delegateOnce(t, testRoles, map[string]any{"role": "coder", "task": "x", "check_cmd": "srun pytest"},
 		func(n int) fakeReply { coderCalls++; return fakeReply{content: "done"} }, nil)
-	if r.Status != "error" || !strings.Contains(r.TestTail, "sandbox") || coderCalls != 0 {
-		t.Fatalf("want an immediate sandbox error without running the subagent: %+v (coder calls %d)", r, coderCalls)
+	// "refused before it ran" and not "sandbox": the same refusal now also
+	// carries the operator's deny rules, and what matters to the caller is that
+	// nothing was spent — the refusal arrives with the subagent never called.
+	if r.Status != "error" || !strings.Contains(r.TestTail, "refused before it ran") || !strings.Contains(r.TestTail, "srun") || coderCalls != 0 {
+		t.Fatalf("want an immediate refusal without running the subagent: %+v (coder calls %d)", r, coderCalls)
 	}
 }
 
