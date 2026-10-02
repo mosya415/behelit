@@ -42,6 +42,8 @@ type Config struct {
 	APIKeyEnv    string   // the NAME of the variable APIKey was read from (config.json api_key_env)
 	Approve      string   // approval posture: off | run | edit | web | all (config.json approve)
 	Theme        string   // dungeon | plain | auto — "" and "auto" both mean detect (config.json theme)
+	Engine       string   // which inference engine serves BaseURL: vllm | sglang | auto (LCA_ENGINE)
+	EngineProbe  bool     // doctor may ask the engine's own non-/v1 routes (LCA_ENGINE_PROBE; default on)
 
 	TransportOverride string // force a tool transport for the whole run (eval -transport)
 }
@@ -99,6 +101,10 @@ func defaultConfig() Config {
 		KeepSessions: 200,
 		Agent:        "build",
 		SubagentMax:  1,
+		// On by default and doctor-only: two GETs outside /v1 that tell an operator
+		// which parsers are actually loaded. An operator on a gateway that logs or
+		// refuses unknown paths turns it off.
+		EngineProbe: true,
 		Allowed: []string{
 			"ls", "cat", "pwd", "head", "tail", "wc",
 			"git", "go", "gofmt", "grep", "rg", "find", "echo",

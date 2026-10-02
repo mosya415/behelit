@@ -102,9 +102,11 @@ type RolesConfig struct {
 //	  kimi-k3:     {temperature: 1.0, top_p: 0.95, effort: max}
 //	  qwen3.8-27b: {temperature: 0.6, top_p: 0.95, top_k: 20}
 //	  some-model:  {transport: text}   # its native tool parser is broken
+//	  hy3:         {engine: sglang}    # one gateway url, two engines behind it
 type ModelOpts struct {
 	Transport   string
-	NoReplay    bool // reasoning_replay: off — this server won't take the field back
+	NoReplay    bool   // reasoning_replay: off — this server won't take the field back
+	Engine      string // vllm | sglang — which engine serves THIS model, when the endpoint fronts both
 	Temperature *float64
 	TopP        *float64
 	TopK        int
@@ -130,6 +132,16 @@ func (rc *RolesConfig) modelOpts(model string) *ModelOpts {
 		}
 	}
 	return nil
+}
+
+// engineOf is the engine roles.yaml names for one model, or "" when the file does
+// not say. It is tier 1 of the engine precedence: stronger than the endpoint's
+// own setting and stronger than any probe.
+func (rc *RolesConfig) engineOf(model string) string {
+	if o := rc.modelOpts(model); o != nil {
+		return o.Engine
+	}
+	return ""
 }
 
 // transportOf is the configured transport for a model ("" = the default).
@@ -264,6 +276,15 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 				}
 				if v := m.str("effort"); v != "" {
 					o.Effort = v
+				}
+				// The strongest engine source there is: an operator who had to write
+				// down which engine serves one model did so because the endpoint
+				// fronts both, and no probe may overrule that.
+				if v := m.str("engine"); v != "" {
+					if engineName(v) == "" {
+						return nil, fmt.Errorf("%s: models.%s.engine must be vllm or sglang, got %q", p, m.Key, v)
+					}
+					o.Engine = engineName(v)
 				}
 				switch m.str("reasoning_replay") {
 				case "off", "none", "false":
@@ -909,6 +930,9 @@ func (rc *RolesConfig) YAML() string {
 			}
 			if o.Effort != "" {
 				parts = append(parts, "effort: "+o.Effort)
+			}
+			if o.Engine != "" {
+				parts = append(parts, "engine: "+o.Engine)
 			}
 			if o.NoReplay {
 				parts = append(parts, "reasoning_replay: off")

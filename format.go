@@ -16,6 +16,11 @@ import (
 // one model per endpoint, whose id rarely matches a hand-typed guess). Returns
 // pre-colored display lines for the banner; never fatal.
 func reconcileModel(ps *Providers, client *Client, rec *Recorder) []string {
+	// Deferred, and registered before the first return: this is the -discover
+	// startup path, which never calls Providers.Learn, so without it the engine
+	// stays UNKNOWN exactly where the window is learned. After the defer, because
+	// the adopt branch below calls SetModel, which forgets both facts.
+	defer ps.applyEngine(client)
 	models, err := client.ListModels()
 	if err != nil {
 		ps.LearnWindows(client.Endpoint(), nil)

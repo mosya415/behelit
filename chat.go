@@ -86,6 +86,30 @@ func wire(msgs []Message, replay string) []wireMessage {
 	return out
 }
 
+// dropFinalReasoning blanks the reasoning on the LAST assistant message, for a
+// continuation against SGLang: there, only a plain-string assistant message with
+// no tool calls and no reasoning content can be continued — anything else renders
+// as a closed historical turn, the model starts a NEW assistant turn, and the
+// partial text we asked it to extend is orphaned. No error, no signal, which is
+// why it has to be fixed rather than hinted.
+//
+// Earlier turns keep theirs: the interleaved-thinking models are trained with
+// their own reasoning in the context, and this is a statement about the one
+// message being continued. It is also only bytes AFTER the cached prefix — the
+// last message changes every step anyway — so no KV hit is lost for it.
+//
+// It lives beside wire rather than inside it on purpose: wire's signature is the
+// transcript projection every other caller and test reads, and this is one
+// caller's concern.
+func dropFinalReasoning(ws []wireMessage) {
+	for i := len(ws) - 1; i >= 0; i-- {
+		if ws[i].Role == "assistant" {
+			ws[i].Reasoning = ""
+			return
+		}
+	}
+}
+
 // ToolSchema is a native function-calling tool definition.
 type ToolSchema struct {
 	Type     string         `json:"type"`
@@ -164,8 +188,14 @@ type APIError struct {
 	RetryAfter time.Duration
 	Endpoint   string
 	Type       string // error.type from the JSON body (berserk-gw: berserk_gw_overload, …)
-	Overload   bool   // X-Berserk-Overload: the model is up but at capacity
-	State      string // X-Berserk-State: paused | drained (admin-imposed, not serving)
+	// Envelope is the SHAPE the body arrived in: "wrapped" is {"error":{…}} (vLLM,
+	// or a gateway that re-wrapped), "flat" is {"object":"error","message":…,"code":…}
+	// (SGLang's own). It is doctor corroboration only and NEVER a source for
+	// Client.engine: a heuristic that is harmless as a label becomes load-bearing
+	// the moment a request field depends on it.
+	Envelope string
+	Overload bool   // X-Berserk-Overload: the model is up but at capacity
+	State    string // X-Berserk-State: paused | drained (admin-imposed, not serving)
 }
 
 func (e *APIError) Error() string {
@@ -189,9 +219,18 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 	if c.noReplay {
 		replay = ""
 	}
+	msgs := wire(req.Messages, replay)
+	// Source: serving_chat.py#L698-700 (sgl-project/sglang, v0.5.21 — byte-identical
+	// on main) — only a plain-string assistant message with no tool calls and no
+	// reasoning content can be continued; anything else renders as a closed
+	// historical turn. vLLM's behaviour here is not sourced, so vLLM and UNKNOWN
+	// keep today's body.
+	if req.ContinueFinal && c.engine == engineSGLang {
+		dropFinalReasoning(msgs)
+	}
 	b := map[string]any{
 		"model":    c.model,
-		"messages": wire(req.Messages, replay),
+		"messages": msgs,
 		"stream":   stream,
 	}
 	if stream {
@@ -228,7 +267,10 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 	case req.TopK != nil: // configured explicitly for this model
 		b["top_k"] = *req.TopK
 	case prof.TopK > 0 && c.provider.Local:
-		b["top_k"] = prof.TopK // non-standard: vLLM/SGLang accept it, hosted APIs may not
+		// Non-standard but accepted by both: vLLM's own field, and SGLang declares
+		// top_k: Optional[int] = None and maps it into its sampling params. A hosted
+		// API may refuse it, which is what the gate is for.
+		b["top_k"] = prof.TopK
 	}
 
 	// One place decides the reply budget, and /model reads it back from there:
@@ -242,7 +284,18 @@ func (c *Client) body(req ChatRequest, stream bool) ([]byte, error) {
 	}
 	if req.ContinueFinal && c.provider.Local {
 		b["continue_final_message"] = true
-		b["add_generation_prompt"] = false
+		// Source: protocol.py#L933 declares continue_final_message, and the whole
+		// non-OpenAI request block (protocol.py#L923-978) has no add_generation_prompt
+		// — serving_chat.py#L1792-1799 passes add_generation_prompt=True to the
+		// template as a literal instead (sgl-project/sglang, v0.5.21, byte-identical
+		// on main). So on SGLang the field is a silently dropped unknown key, and the
+		// engine suppresses the generation prompt from continue_final_message itself.
+		// On vLLM it is load-bearing, and on an engine nobody has named we keep
+		// today's pair: the status quo is not a new guess, and doctor says which
+		// engine it is going to.
+		if c.engine != engineSGLang {
+			b["add_generation_prompt"] = false
+		}
 	}
 	for k, v := range thinkingParams(c.provider, c.model, prof, req.Thinking, replay) {
 		b[k] = v
@@ -329,14 +382,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, sink StreamSink) (Ch
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		ae := &APIError{Status: resp.StatusCode, Body: string(raw), RetryAfter: retryAfter(resp.Header), Endpoint: c.baseURL,
 			Overload: resp.Header.Get("X-Berserk-Overload") != "", State: resp.Header.Get("X-Berserk-State")}
-		var eb struct {
-			Error struct {
-				Type string `json:"type"`
-			} `json:"error"`
-		}
-		if json.Unmarshal(raw, &eb) == nil {
-			ae.Type = eb.Error.Type
-		}
+		ae.Type, ae.Envelope = errorType(raw)
 		return res, ae
 	}
 
@@ -505,6 +551,38 @@ func retryAfter(h http.Header) time.Duration {
 		}
 	}
 	return 0
+}
+
+// errorType reads the error type out of a body in either envelope, because only
+// one of the two was ever parsed: SGLang answers FLAT
+// ({"object":"error","message":…,"type":"BadRequest","param":null,"code":400}) and
+// a gateway that passes the upstream body through verbatim hands that straight to
+// us, where a reader looking only for {"error":{"type"}} found an empty string.
+//
+// Note for anyone matching on the result: a chat error's type can be "Bad
+// Request" (the schema), "BadRequest" (a handler ValueError), "BadRequestError"
+// (request validation), "InternalServerError", or a bare status string — so match
+// on the status plus the message text, never on this.
+func errorType(raw []byte) (typ, envelope string) {
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(raw, &keys) != nil {
+		return "", "" // not JSON at all: a proxy's HTML page, say
+	}
+	if inner, ok := keys["error"]; ok {
+		var wrapped struct {
+			Type string `json:"type"`
+		}
+		json.Unmarshal(inner, &wrapped) // a string-valued "error" leaves the type empty
+		return wrapped.Type, "wrapped"
+	}
+	var flat struct {
+		Object string `json:"object"`
+		Type   string `json:"type"`
+	}
+	if json.Unmarshal(raw, &flat) == nil && flat.Object == "error" {
+		return flat.Type, "flat"
+	}
+	return "", ""
 }
 
 // Context-overflow detection (ported from opencode's provider-error.ts): the

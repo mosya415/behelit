@@ -1149,6 +1149,12 @@ func (r *Repl) cmdModel(arg string) bool {
 			row("profile", faint("no profile for %q (normalised %q) — nothing is overridden", s.client.Model(), normalizeModelID(s.client.Model())))
 		}
 		row("context", faint("%s"+gSep+"budget %s", srcNum(s.client.CtxLen(), s.client.CtxSrc()), kfmt(s.budget())))
+		// The engine, where the window's provenance is: both are facts about the
+		// running deployment that lca cannot invent, and an unknown one is a
+		// sentence and not a blank.
+		if s.client.selfHosted() {
+			row("engine", faint("%s", engineLine(s.client)))
+		}
 		// What this client will actually put in max_tokens, with the reason: the
 		// window clamp can rewrite a configured budget, and a number that is
 		// rewritten has to name its source like every other number here.
@@ -1228,7 +1234,8 @@ func (r *Repl) cmdModel(arg string) bool {
 		// ask this one's endpoint for the new one — unconditionally, not only
 		// under -discover: without it the window falls back to the table and the
 		// budget silently changes under the operator.
-		relearnCtxLen(local)
+		relearnCtxLen(r.orch.providers, local)
+		r.orch.applyModelEngine(local)
 	}
 	s.RefreshSystem()
 	r.orch.rec.Event("model_change", map[string]any{"from": prev, "to": arg})
@@ -1321,8 +1328,15 @@ func (r *Repl) cmdEndpoint(arg string) bool {
 	} else {
 		// The new endpoint may serve the same model id with a different
 		// --max-model-len; the old window was dropped with the old baseURL.
-		relearnCtxLen(client)
+		relearnCtxLen(r.orch.providers, client)
 	}
+	// Tier 1 last, after BOTH branches: SetEndpoint forgot the engine, and the
+	// two relearn paths above resolve only what the endpoint and its cards say.
+	// roles.yaml's models.<id>.engine is about the MODEL, which did not move
+	// unless the new endpoint named its own — so without this line a `/endpoint`
+	// switch silently drops the operator's per-model pin while the model it
+	// applies to is still loaded.
+	r.orch.applyModelEngine(client)
 	return false
 }
 
@@ -1358,10 +1372,18 @@ func (r *Repl) noteCarriedConversation(prev string) {
 // relearnCtxLen asks the current endpoint what window it serves the current model
 // at, and is silent when it cannot say. The table is the fallback, never the
 // override: the running deployment is the truth about the running deployment.
-func relearnCtxLen(c *Client) {
+// It relearns the ENGINE from the same answer, and from the same place: the
+// engine is a per-(endpoint, model) fact, both of which just moved, and this is
+// the last moment before the next request — which is the only moment it may be
+// decided, because the gateway keys its KV cache on the request prefix.
+func relearnCtxLen(ps *Providers, c *Client) {
 	models, err := c.ListModels()
 	if err != nil {
 		return
+	}
+	if ps != nil {
+		ps.LearnWindows(c.Endpoint(), models)
+		ps.applyEngine(c)
 	}
 	if info, ok := findModel(models, c.Model()); ok {
 		c.SetCtxLen(info.MaxLen)
@@ -1418,6 +1440,16 @@ func (r *Repl) cmdDiscover(string) bool {
 	}
 	table(nil, rows)
 	hint("/endpoint <n> switches to one (its model comes along)")
+	// A suggestion and never a source. The engine in that column is a substring
+	// match over a Slurm job log (discover.go), where a container image name
+	// mentioning either engine wins — so lca will not let it decide what a request
+	// body looks like. It is still the cheapest thing an operator has to type.
+	for _, m := range res.Models {
+		if eng := engineName(m.Engine); eng != "" && client.Engine() == "" {
+			hint("%s says the job on this port is %s — it is a log substring match, so lca does not act on it: /set engine %s", EngineFromSlurm, eng, eng)
+			break
+		}
+	}
 	return false
 }
 

@@ -173,7 +173,7 @@ func TestSixProfilesCarrySourcedValues(t *testing.T) {
 			t.Errorf("%s replay %q, want %q", tc.id, p.Replay, tc.replay)
 		case p.Src.Context != tc.ctxFrom:
 			t.Errorf("%s context provenance %v, want %v", tc.id, p.Src.Context, tc.ctxFrom)
-		case p.ToolParser == "" || p.ReasonParse == "":
+		case p.ToolParser.VLLM == "" || p.ReasonParse.VLLM == "":
 			t.Errorf("%s: doctor cannot name the engine flags: %+v", tc.id, p)
 		}
 	}

@@ -62,6 +62,18 @@ var settings = []setting{
 	{Key: "api_key_env", JSON: "api_key_env", Group: "endpoint", Kind: kEnvName,
 		Help: "the NAME of the variable holding the key; the file records the name, not the secret"},
 
+	// The engine is a property of the ENDPOINT, so it sits with the endpoint: one
+	// row, so /set, the env layer and config.json cannot disagree about what a
+	// valid value is. "auto" and "" both mean "read it from /v1/models"; an engine
+	// nobody can name means lca sends nothing engine-specific, which is a working
+	// configuration and not an error. Live, because this is an operator action and
+	// not a discovery-driven retry — it changes fields AFTER the cached prefix,
+	// exactly like /set effort.
+	{Key: "engine", JSON: "engine", Env: "LCA_ENGINE", Group: "endpoint", Kind: kEnum, Enum: []string{engineVLLM, engineSGLang, engineAuto}, Live: true,
+		Help: "which engine serves the endpoint: vllm | sglang | auto (read it from the endpoint)"},
+	{Key: "engine_probe", JSON: "engine_probe", Env: "LCA_ENGINE_PROBE", Group: "endpoint", Kind: kBool,
+		Help: "let doctor read the engine's own /model_info and /server_info (outside /v1)"},
+
 	{Key: "model", JSON: "model", Env: "LCA_MODEL", Group: "model", Kind: kStr, Live: true,
 		Help: "a served model id, or provider/model for a hosted API"},
 	{Key: "tier", JSON: "tier", Env: "LCA_TIER", Group: "model", Kind: kStr, Live: true,
@@ -278,6 +290,12 @@ func applySetting(c *Config, key, raw string) error {
 		if got := os.Getenv(v); got != "" {
 			c.APIKey = got
 		}
+	case "engine":
+		// Stored as typed, "auto" included: the file then records the operator's
+		// intent ("probe it") rather than today's probe result.
+		c.Engine = v
+	case "engine_probe":
+		c.EngineProbe, _ = parseBool(v)
 	case "model":
 		c.Model = v
 	case "tier":
@@ -354,6 +372,10 @@ func readSetting(c Config, ap *Approver, key string) string {
 			return faint("unset")
 		}
 		return c.APIKeyEnv
+	case "engine":
+		return orElse(c.Engine, "auto"+gSep+"read from the endpoint")
+	case "engine_probe":
+		return onOff(c.EngineProbe)
 	case "model":
 		return orUnset(c.Model)
 	case "tier":
@@ -553,6 +575,13 @@ func jsonValueOf(c Config, key string) (any, error) {
 		return c.APIKey, nil
 	case "api_key_env":
 		return c.APIKeyEnv, nil
+	case "engine":
+		if c.Engine == "" || c.Engine == engineAuto {
+			return nil, nil // nil deletes the key: "auto" is the absence of a pin
+		}
+		return c.Engine, nil
+	case "engine_probe":
+		return c.EngineProbe, nil
 	case "model":
 		return c.Model, nil
 	case "tier":

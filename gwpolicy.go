@@ -268,6 +268,14 @@ func (s *Session) useModel(i int) {
 	c := *s.orch.providers.local
 	c.model = s.models[i]
 	c.ctxLen, c.ctxSrc = 0, OriginUnset
+	// The engine is forgotten exactly where the window is, and for the same
+	// reason: both are facts about one (endpoint, model) pair, and this line
+	// changes the model. Without it the copy inherits the local client's answer —
+	// including a roles.yaml per-model pin, which is the STRONGEST source there
+	// is, so nothing below could take it back — and the one model an operator
+	// wrote `engine: sglang` down for would decide the body shape of every other
+	// model the same endpoint serves.
+	c.resetEngine()
 	// …and then learn this model's window from the deployment that serves it.
 	// Without this a chain client keeps ctxLen 0 forever — main.go reconciles
 	// only when the session IS the local client, which a chain session never is,
@@ -282,7 +290,23 @@ func (s *Session) useModel(i int) {
 			c.noReplay = o.NoReplay
 		}
 	}
+	// After Learn, so the file beats the probe: roles.yaml is the strongest engine
+	// source there is, and without this line a chain failover silently loses it —
+	// the one model on the other engine is the one an operator wrote it down for.
+	s.orch.applyModelEngine(&c)
 	s.client = &c
+}
+
+// applyModelEngine puts roles.yaml's models.<id>.engine — tier 1 of the engine
+// precedence, and the only source a probe may never overrule — onto a client. It
+// runs where a client's MODEL is decided and nowhere else: engine detection
+// happens once, before the first request, because the gateway keys its KV cache
+// on the request prefix and a body shape that changes mid-session loses every hit.
+func (o *Orchestrator) applyModelEngine(c *Client) {
+	if o == nil || o.roles == nil || c == nil {
+		return
+	}
+	c.setEngine(o.roles.engineOf(c.Model()), EngineFromModel)
 }
 
 // headers identify the conversation to the gateway: x-session-id is this

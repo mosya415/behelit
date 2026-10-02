@@ -410,6 +410,12 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 		mcpWarns = append(mcpWarns, registerMCPTools(mset)...)
 	}
 
+	// The team file is READ here, before the gateway section, and still REPORTED
+	// in its own section below: the gateway's engine row has to name a per-model
+	// engine the file set, and the file is two reads and no network, so -no-probe
+	// stays literally true.
+	roles, rerr := loadRoles(cfg)
+
 	section("gateway")
 	gw := NewClient(cfg)
 	applyRememberedWindow(cfg, gw)
@@ -429,12 +435,24 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 		}
 		okLine("up"+gSep+"%s listed", plural(len(models), "model", "models"))
 	}
+	// The engine, with its provenance, before the per-model report: it is a fact
+	// about the ENDPOINT, and every piece of advice below is spelled in its flags.
+	// gw is given the answer too, so a client copied from it starts with the engine
+	// a session would have had — the probes below narrow it per model.
+	native := readNativeInfo(ctx, gw, cfg)
+	// With its OWN source, not a flattened one: endpointEngine answers from
+	// cfg.Engine or from what the cards agreed on, and recording a card-derived
+	// answer at the endpoint tier would let one model's owned_by outrank another
+	// model's own card — the exact collapse the per-(endpoint, model) design exists
+	// to prevent. The ranking is the same one the runtime uses, so it decides.
+	gwEngine, gwSrc := endpointEngine(cfg, served)
+	gw.setEngine(gwEngine, gwSrc)
+	reportEngine(cfg, dfc, roles, served, native)
 	if len(served) > 0 {
-		reportProfiles(cfg, gw.Endpoint(), served)
+		reportProfiles(cfg, gw.Endpoint(), served, roles, gwEngine)
 	}
 
 	section("roles")
-	roles, rerr := loadRoles(cfg)
 	switch {
 	case rerr != nil:
 		fail("%v", rerr)
@@ -506,6 +524,15 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 			if window > 0 && r.Context > window {
 				warnLine("role %s: context %s is larger than %s's window %s (%s) — requests will be refused",
 					r.Name, kfmt(r.Context), model, ctxfmt(window), wsrc)
+			}
+			// The engine's own usable-input number, when it answered: it is strictly
+			// below the window (max_req_len - 5) and lca deliberately does NOT cap the
+			// budget with it — a budget that changes depending on whether a gateway
+			// proxies a path is worse than a stable one — so the warning is the whole
+			// of what lca does with it.
+			if native.maxReqInputLen > 0 && r.Context > native.maxReqInputLen {
+				warnLine("role %s: context %s is above the engine's own usable input %s (max_req_input_len) — the prompt is refused or silently truncated before the window matters",
+					r.Name, kfmt(r.Context), kfmt(native.maxReqInputLen))
 			}
 			if guessed {
 				// Say the placeholder out loud: a fallback that prints as a number
@@ -585,7 +612,7 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 
 	if !*noProbe && err == nil && rerr == nil && roles != nil && len(roles.Roles) > 0 {
 		section("tool calling")
-		type target struct{ role, model string }
+		type target struct{ role, model, engine string }
 		var targets []target
 		seen := map[string]bool{}
 		for _, r := range roles.Roles {
@@ -594,7 +621,8 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 					continue
 				}
 				seen[m] = true
-				targets = append(targets, target{r.Name, m})
+				e, _ := doctorEngine(cfg, roles, m, served[m])
+				targets = append(targets, target{r.Name, m, e})
 			}
 		}
 		results := make([]probeResult, len(targets))
@@ -610,7 +638,13 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 			wg.Add(1)
 			go func(i int, t target) {
 				defer wg.Done()
-				results[i] = probeModel(ctx, cfg, gw, roles, t.role, t.model)
+				// The engine resolved for THIS model travels in cfg.Engine: probeModel
+				// is handed the engine in force for the target it probes, so the flags
+				// it names are the ones that server's argparse accepts. The signature
+				// is unchanged, which keeps every caller — including the tests — as it was.
+				tcfg := cfg
+				tcfg.Engine = t.engine
+				results[i] = probeModel(ctx, tcfg, gw, roles, t.role, t.model)
 			}(i, t)
 		}
 		wg.Wait()
@@ -854,10 +888,17 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 	// is broken" into a line an operator can paste into the launch command — but
 	// only when a probe actually failed: advice next to a green line is noise.
 	prof := lookupProfile(model)
-	toolFix := "vLLM: --enable-auto-tool-choice --tool-call-parser <family>" + gSep + "SGLang: --tool-call-parser <family>"
-	if prof.ToolParser != "" {
-		toolFix = "vLLM: --enable-auto-tool-choice --tool-call-parser " + prof.ToolParser +
-			faint(" (the flag %s's vendor documents)", prof.Key)
+	// The engine serving THIS model, resolved before the first request and never
+	// after it: cfg.Engine carries what runDoctor resolved for this target, and
+	// roles.yaml's per-model key outranks it. Every flag named below is then in
+	// that engine's own spelling — a vLLM parser value fails SGLang's argparse and
+	// stops the server from starting, so cross-quoting is worse than silence.
+	c.setEngine(cfg.Engine, EngineFromEndpoint)
+	c.setEngine(roles.engineOf(model), EngineFromModel)
+	engine := c.Engine()
+	toolFix := engineAdvice(prof, engine)
+	if prof.Key != "" {
+		toolFix += faint(" (the flags %s's vendor documents)", prof.Key)
 	}
 	var effort string
 	for _, r := range roles.Roles {
@@ -922,7 +963,7 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 		case got == "ping":
 			res.status = "ok"
 			parts = append(parts, "native tool call")
-		case strings.Contains(out.Content, "ping") && strings.Contains(out.Content, "{"):
+		case unparsedToolCall(out.Content, "ping"):
 			res.status = "fail"
 			res.detail = "the call came back as text, not tool_calls — the engine's tool-call parser is off or wrong for this model"
 			res.fix = toolFix + gSep + "or models." + model + ".transport: text"
@@ -940,16 +981,18 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 		// Thinking arrived, but glued into content: the engine has no reasoning
 		// parser loaded, so the trace cannot be replayed as its own field.
 		parts = append(parts, "reasoning inline (<think>)")
-		if prof.ReasonParse != "" {
-			res.warns = append(res.warns, "the thinking came back inside content — vLLM: --reasoning-parser "+prof.ReasonParse+
-				faint(" (the flag %s's vendor documents)", prof.Key))
+		res.warns = append(res.warns, "the thinking came back inside content — no reasoning parser is loaded, so it cannot be replayed as its own field: "+engineAdvice(prof, engine))
+		if engine == engineSGLang {
+			// One cause, named: separate_reasoning defaults to true on SGLang and
+			// does nothing at all until the server was launched with a reasoning
+			// parser — which is a launch flag lca cannot set from a request.
+			res.warns = append(res.warns, faint("SGLang splits reasoning by default (separate_reasoning defaults to true), but only when --reasoning-parser was passed at launch"))
 		}
-	case prof.Reasoning && prof.ReasonParse != "" && thinkingExpected(prof, effort):
+	case prof.Reasoning && thinkingExpected(prof, effort):
 		// Only when thinking was actually asked for, or cannot be turned off:
 		// self-hosted hy3 answers without thinking by design, and a parser warning
 		// there would be advice for a problem the operator does not have.
-		res.warns = append(res.warns, "this model thinks, but no reasoning came back at all — vLLM: --reasoning-parser "+prof.ReasonParse+
-			faint(" (the flag %s's vendor documents)", prof.Key))
+		res.warns = append(res.warns, "this model thinks, but no reasoning came back at all — "+engineAdvice(prof, engine))
 	}
 	if out.Usage.TTFT > 0 {
 		parts = append(parts, "first token "+fmtDurShort(out.Usage.TTFT))
@@ -960,10 +1003,24 @@ func probeModel(ctx context.Context, cfg Config, gw *Client, roles *RolesConfig,
 		probeParser(ctx, &c, &res)
 	}
 	probeReplay(ctx, &c, roles, &res)
+	probeHy3Variant(ctx, &c, &res)
 	if len(res.notes) > 0 {
 		res.detail += gSep + "" + strings.Join(res.notes, gSep)
 	}
 	return res
+}
+
+// engineAdvice is engineFlags with the engine named, so a line an operator pastes
+// says which server it is for. With no engine known, engineFlags labels both
+// halves itself — and that generic string is the honest answer, not a fallback.
+func engineAdvice(prof ModelProfile, engine string) string {
+	switch engine {
+	case engineSGLang:
+		return "SGLang: " + prof.engineFlags(engine)
+	case engineVLLM:
+		return "vLLM: " + prof.engineFlags(engine)
+	}
+	return prof.engineFlags("")
 }
 
 // probeWindow asks a deployment that does not publish max_model_len how big its
@@ -997,14 +1054,54 @@ func probeWindow(ctx context.Context, c *Client, res *probeResult, gw *Client, c
 		// It accepted a billion-token completion, so it clamps silently instead of
 		// refusing. Nothing was learned and nothing is pretended.
 		res.warns = append(res.warns, "window unknown: the server accepted an impossible max_tokens instead of naming its limit — set it with /set context <n>")
+		if c.Engine() == engineSGLang {
+			// The cause, named: with --allow-auto-truncate SGLang logs "Truncating the
+			// input." and serves a silently shortened prompt, so "no refusal" never
+			// means "it fit" — and the shortened prompt is the one the model answers.
+			res.warns = append(res.warns, faint("on SGLang that is what --allow-auto-truncate does: an oversized prompt is truncated and served, not refused"))
+		}
 	default:
 		res.warns = append(res.warns, "window unknown: its refusal names no limit ("+truncate(shortErr(err), 80)+") — set it with /set context <n>")
 	}
 }
 
+// toolCallMarkers are the shapes a tool call takes when it reaches this client as
+// TEXT, i.e. when the engine's tool-call parser is off or is the wrong one for
+// the model. On SGLang that failure is an HTTP 200 with tool_calls null,
+// finish_reason "stop" and the raw markup left in content, so the markup is the
+// only evidence there is — and an engine with NO parser configured behaves
+// identically, because the parse is gated on the parser existing.
+//
+// hy3's markup is <tool_calls><tool_call>name<tool_sep><arg_key>…</arg_key>… and
+// GLM-5.3's is <tool_call>…<arg_key>…<arg_value>…: NEITHER contains a "{", so the
+// name-plus-brace heuristic this list replaces reported both of the operator's
+// most likely models as "answered without calling the tool" and hid the cause.
+var toolCallMarkers = []string{"<tool_call", "<tool_calls", "<arg_key", "<arg_value", "<tool_sep",
+	"<|tool_calls_begin|>", "[tool_calls]"}
+
+// unparsedToolCall reports whether a reply is a tool call that arrived as text.
+func unparsedToolCall(content, name string) bool {
+	low := strings.ToLower(content)
+	for _, m := range toolCallMarkers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	// The original heuristic, kept rather than replaced: it also catches the
+	// tool_choice "required" with no parser case, where the engine applies the
+	// json_schema constraint outside the parser gate and the model emits a
+	// well-formed JSON array INTO content, still with finish_reason "stop".
+	return name != "" && strings.Contains(content, name) && strings.Contains(content, "{")
+}
+
 // probeParser exercises what server-side tool-call parsers actually break on:
 // two calls in one reply, and an argument with nested JSON.
 func probeParser(ctx context.Context, c *Client, res *probeResult) {
+	// The nested parameter is declared as {"type":"object"}, and that is REQUIRED
+	// rather than tidy: hy3's hunyuan detector is schema-driven and keeps a
+	// JSON-looking value in a string-typed parameter as a literal string. Declare
+	// spec as a string and this probe reports a parser failure that is the probe's
+	// own schema omission. A test pins it.
 	schema := ToolSchema{Type: "function", Function: ToolSchemaFunc{Name: "note", Description: "Record one note.",
 		Parameters: map[string]any{"type": "object", "properties": map[string]any{
 			"spec": map[string]any{"type": "object", "properties": map[string]any{
@@ -1028,7 +1125,16 @@ func probeParser(ctx context.Context, c *Client, res *probeResult) {
 	case n == 1:
 		res.notes = append(res.notes, "one call per reply (the server or model won't batch them)")
 	default:
-		res.warns = append(res.warns, "asked for two tool calls, got none — the parser may drop batched calls")
+		if unparsedToolCall(out.Content, "note") {
+			// 100% unparsed, WITH markers: that is a configuration fault, not a
+			// batching one, and the two used to read the same.
+			res.warns = append(res.warns, "asked for two tool calls and got the raw markup in content — no tool-call parser is loaded, or the wrong one for this model")
+		} else {
+			res.warns = append(res.warns, "asked for two tool calls, got none — the parser may drop batched calls")
+		}
+		if c.Engine() == engineSGLang {
+			res.warns = append(res.warns, faint("SGLang also drops a call to a function that is not in tools, silently, unless the server has SGLANG_FORWARD_UNKNOWN_TOOLS=1"))
+		}
 		return
 	}
 	nested := false
@@ -1047,6 +1153,42 @@ func probeParser(ctx context.Context, c *Client, res *probeResult) {
 		res.notes = append(res.notes, "nested JSON args ok")
 	} else {
 		res.warns = append(res.warns, "nested JSON arguments came back malformed — see the raw arguments in the trace")
+	}
+}
+
+// probeHy3Variant answers the one question about hy3 that the OpenAI surface
+// cannot be asked. Two chat-template variants of this checkpoint are in
+// circulation, they disagree about what "no reasoning_effort" means — unset is
+// `high` on a hunyuan_effort template and NO thinking at all on an Hy3-preview
+// one — and both run under the same parser name, with nothing in /v1/models, in
+// an error message or in any header to tell them apart.
+//
+// So it is OBSERVED, and reported as an observation. One request with no level
+// on a one-word prompt is one sample, and the two directions are not equally
+// strong: reasoning that came back proves the deployment thinks with no level
+// sent, while reasoning that did not come back is also what a model that simply
+// had nothing to think about on "say done" looks like. Neither line names a
+// template variant as a finding — it names what was seen and what that would be
+// consistent with, because an identification from one negative sample is a claim
+// the sources explicitly list as UNKNOWN.
+//
+// lca sends an explicit level on every real request precisely so that this
+// default decides nothing — the probe exists to tell the operator which
+// deployment they may have, not to feed a default back into the request.
+func probeHy3Variant(ctx context.Context, c *Client, res *probeResult) {
+	if prof := c.Profile(); prof.Key != "hy3" || !c.selfHosted() {
+		return
+	}
+	out, err := c.Chat(ctx, ChatRequest{MaxTokens: 256,
+		Messages: []Message{{Role: "user", Content: "Reply with the single word: done."}},
+		Headers:  map[string]string{"x-session-id": "lca-doctor-variant-" + c.model, "x-root-session-id": "lca-doctor"}}, StreamSink{})
+	switch {
+	case err != nil:
+		res.warns = append(res.warns, "could not check what this hy3 deployment does with no reasoning_effort: "+shortErr(err))
+	case out.Reasoning != "" || reThinkBlock.MatchString(out.Content):
+		res.notes = append(res.notes, "hy3 with no reasoning_effort sent: it thought — consistent with a hunyuan_effort template, where unset means high")
+	default:
+		res.notes = append(res.notes, "hy3 with no reasoning_effort sent: it did NOT think on one trivial prompt — consistent with an Hy3-preview template (unset means no thinking), but one sample on \"say done\" does not identify the template")
 	}
 }
 
@@ -1137,10 +1279,21 @@ func allowlistOf(cfg Config, roles *RolesConfig) []string {
 // written numbers for is a warn, and doctor's exit code does not turn red because
 // a model is new. What it must never be is silent: a quiet "no numbers" is how
 // this class of bug hides.
-func reportProfiles(cfg Config, endpoint string, served map[string]ModelInfo) {
+// endpointEng is the fallback, for a card that names no engine of its own; roles
+// is read because the per-model engine is the whole reason this section is a loop
+// — one url can front hy3 on SGLang and the next model on vLLM, and advising a
+// pinned model the OTHER engine's flag spellings is advice its argparse refuses.
+func reportProfiles(cfg Config, endpoint string, served map[string]ModelInfo, roles *RolesConfig, endpointEng string) {
 	section("models", faint("what lca knows about each served model"))
 	for _, id := range sortedKeys(served) {
 		info, prof := served[id], lookupProfile(id)
+		// This model's OWN engine, resolved exactly as the runtime resolves it, so
+		// every flag and every switch name in this model's rows is the one the
+		// server that serves IT accepts.
+		engine := endpointEng
+		if e, _ := doctorEngine(cfg, roles, id, info); e != "" {
+			engine = e
+		}
 		norm := normalizeModelID(id)
 		label := id
 		if norm != strings.ToLower(id) {
@@ -1170,7 +1323,11 @@ func reportProfiles(cfg Config, endpoint string, served map[string]ModelInfo) {
 		case len(prof.Efforts) > 0:
 			effort = strings.Join(prof.Efforts, "|") + gSep + "default " + prof.EffortOn
 		}
-		row("thinking", faint("%s"+gSep+"replay %s"+gSep+"effort %s", reasoningSwitchName(prof), replayName(prof.Replay), effort))
+		row("thinking", faint("%s"+gSep+"replay %s"+gSep+"effort %s", reasoningSwitchName(prof, engine), replayName(prof.Replay), effort))
+		// One renderer, so the flags doctor reports and the flags doctor advises
+		// after a failed probe cannot drift — and in the resolved engine's own
+		// spelling, because the values are not interchangeable.
+		row("engine flags", faint("%s", prof.engineFlags(engine)))
 		if prof.Note != "" {
 			row("caveat", faint("%s", prof.Note))
 		}
@@ -1209,8 +1366,8 @@ func reportWindow(id string, info ModelInfo, prof ModelProfile, learned int) {
 
 // reportReplyBudget says when a configured max_tokens will not be sent as
 // configured. body() clamps the reply budget to a quarter of the window the
-// deployment reports, because vLLM refuses a larger one outright with an error
-// the overflow retry does not recognise — but an operator's own number being
+// deployment reports, because BOTH engines refuse a larger one outright — each
+// with its own message, and neither recognised by the overflow retry — but an operator's own number being
 // rewritten to a different one was the last silent reconciliation on this path,
 // and this file's rule is that a number names where it came from.
 func reportReplyBudget(cfg Config, id string, info ModelInfo) {
@@ -1219,13 +1376,17 @@ func reportReplyBudget(cfg Config, id string, info ModelInfo) {
 	}
 	warnLine("%s: the configured max_tokens %s is more than a quarter of the deployment's %s window — lca sends %s instead",
 		id, kfmt(cfg.MaxTokens), ctxfmt(info.MaxLen), kfmt(info.MaxLen/4))
-	hint("the clamp is deliberate (the engine refuses a reply budget it cannot honour); lower LCA_MAX_TOKENS or raise --max-model-len to make the two agree")
+	// Both engines refuse it, each with its own message: "vLLM refuses" was a
+	// vLLM-shaped sentence about a clamp that is not vLLM-specific.
+	hint("the clamp is deliberate (vLLM and SGLang both refuse a reply budget they cannot honour, each with its own message); lower LCA_MAX_TOKENS or raise --max-model-len / --context-length to make the two agree")
 }
 
 // reasoningSwitchName names the switch this model's own chat template reads, so
 // an operator can see that the four served models the vLLM dialect used to send
-// enable_thinking to are now sent what they actually read.
-func reasoningSwitchName(prof ModelProfile) string {
+// enable_thinking to are now sent what they actually read. The engine matters to
+// the sentence and not to the key: SGLang pops chat_template_kwargs.reasoning_effort
+// and promotes it to the top level itself, so one key covers both carriers there.
+func reasoningSwitchName(prof ModelProfile, engine string) string {
 	sw := prof.Switch
 	switch {
 	case sw.Kwarg != "" && sw.Effort != "":
@@ -1234,6 +1395,12 @@ func reasoningSwitchName(prof ModelProfile) string {
 		return "chat_template_kwargs." + sw.Kwarg
 	case sw.Effort != "" && sw.TopLevel:
 		return "top-level " + sw.Effort + " (no on/off switch)"
+	case sw.Effort != "" && engine == engineSGLang:
+		// Sourced: SGLang pops the kwarg, assigns request.reasoning_effort by plain
+		// attribute set (bypassing its own tier validation) and re-injects it as a
+		// template kwarg verbatim — so the one key lca sends reaches the template
+		// whichever carrier the engine prefers.
+		return "chat_template_kwargs." + sw.Effort + faint(" (SGLang promotes it to the top level itself)")
 	case sw.Effort != "":
 		return "chat_template_kwargs." + sw.Effort
 	case prof.Reasoning:

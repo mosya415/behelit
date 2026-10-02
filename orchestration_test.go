@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,19 +58,57 @@ type fakeServer struct {
 	// windows lets /models report max_model_len per id. Window provenance —
 	// "262k (server)" versus "200k (card)" — cannot be tested at all without it.
 	windows map[string]int
+	// The engine-shaped knobs, all zero by default so every existing test sees
+	// exactly the server it saw before: what the cards claim in owned_by, SGLang's
+	// flat error envelope, what the engine's own non-/v1 routes answer, whether a
+	// LoRA card is listed beside the base one, and a gateway that proxies /v1 and
+	// 404s the rest.
+	ownedBy string
+	flatErr bool
+	native  map[string]string // "/model_info" | "/server_info" | "/get_*" → JSON body
+	lora    string            // a LoRA adapter's id, listed with parent set and max_model_len null
+	v1Only  bool
 }
+
+// nativePaths are the two SGLang informational routes that live OUTSIDE /v1,
+// plus their deprecated aliases. The fixture answers one only when the test said
+// so and 404s it otherwise, which is what a gateway that does not proxy them does.
+var nativePaths = map[string]bool{"/model_info": true, "/get_model_info": true, "/server_info": true, "/get_server_info": true}
 
 func newFakeServer(t *testing.T, respond func(req fakeRequest, n int) fakeReply) *fakeServer {
 	fs := &fakeServer{respond: respond}
 	fs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fs.v1Only && !strings.HasPrefix(r.URL.Path, "/v1") {
+			http.NotFound(w, r)
+			return
+		}
+		if nativePaths[r.URL.Path] {
+			body, ok := fs.native[r.URL.Path]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, body)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			var data []map[string]any
 			for _, m := range fs.models {
-				row := map[string]any{"id": m, "object": "model"}
+				row := map[string]any{"id": m, "object": "model", "created": 1759363200, "root": m, "parent": nil}
 				if n := fs.windows[m]; n > 0 {
 					row["max_model_len"] = n
 				}
+				if fs.ownedBy != "" {
+					row["owned_by"] = fs.ownedBy
+				}
 				data = append(data, row)
+			}
+			if fs.lora != "" {
+				// A LoRA card: parent set, max_model_len null. It must never become the
+				// base model's window.
+				data = append(data, map[string]any{"id": fs.lora, "object": "model", "created": 1759363200,
+					"owned_by": fs.ownedBy, "root": "/lora/" + fs.lora, "parent": fs.models[0], "max_model_len": nil})
 			}
 			json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 			return
@@ -108,6 +147,12 @@ func newFakeServer(t *testing.T, respond func(req fakeRequest, n int) fakeReply)
 				}
 			}
 			w.WriteHeader(rep.status)
+			if fs.flatErr {
+				// SGLang's envelope: flat, no "error" object. A gateway that passes the
+				// upstream body through verbatim is what lca then has to read.
+				io.WriteString(w, `{"object":"error","message":"`+rep.content+`","type":"BadRequest","param":null,"code":`+strconv.Itoa(rep.status)+`}`)
+				return
+			}
 			io.WriteString(w, `{"error":{"message":"`+rep.content+`"}}`)
 			return
 		}

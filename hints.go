@@ -26,8 +26,21 @@ func errorHint(err error) string {
 			return "wrong URL? the endpoint must include the API base path — /set endpoint http://node:18080/v1 (or LCA_BASE_URL)"
 		case isContextOverflow(err):
 			return "the conversation no longer fits — /compact summarizes it, /reset starts over"
+		case ae.Status >= 500 && strings.Contains(msg, "failed to parse reasoning content"):
+			// SGLang's own message, with type "InternalServerError" and status 500:
+			// the signature of a --reasoning-parser that does not match this model's
+			// output, and identifiable from the body alone — which is why it belongs
+			// here, where there is no provider and no profile and neither is needed.
+			return "the server's --reasoning-parser doesn't match this model's output — on SGLang set it to auto (/doctor names the value)"
+		case ae.Status == 400 && strings.Contains(msg, "function.arguments must be"):
+			// SGLang raises on history tool-call arguments that are not valid JSON
+			// OBJECTS, and lca replays tc.Function.Arguments verbatim — so a blob the
+			// model emitted once, and the engine accepted once, 400s on the next turn.
+			// Deliberately not rewritten to {} behind the operator: that would edit
+			// the history they are looking at.
+			return "the model emitted tool-call arguments that are not a JSON object; SGLang refuses them when they are replayed in the history — /compact drops that turn"
 		case ae.Status == 400 && (strings.Contains(msg, "tool") || strings.Contains(msg, "auto")):
-			return "the engine refused tool calling — enable its tool-call parser, or set transport: text for this model (/doctor checks it)"
+			return "the engine refused tool calling — enable its tool-call parser (vLLM: --enable-auto-tool-choice --tool-call-parser <family>; SGLang: --tool-call-parser auto), or set transport: text for this model (/doctor checks it)"
 		}
 		return ""
 	}

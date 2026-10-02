@@ -6,11 +6,18 @@
 entry: lead            # role of the REPL / one-shot session
 transport: native      # tool calling through the gateway: native | text
                        # native needs the engines' tool-call parser enabled
-                       # (vLLM: --enable-auto-tool-choice --tool-call-parser <family>)
+                       # (vLLM:   --enable-auto-tool-choice --tool-call-parser <family>)
+                       # (SGLang: --tool-call-parser auto — it has no
+                       #  --enable-auto-tool-choice, and argparse refuses one)
+                       # add --reasoning-parser on either to get reasoning_content
 
-# per-model settings — e.g. a model whose native tool parser is broken on the engine:
+# per-model settings — e.g. a model whose native tool parser is broken on the
+# engine, or the one model on the other engine when one gateway url fronts both
+# (engine: outranks LCA_ENGINE and /v1/models' owned_by; the parser VALUES differ
+# per engine, so lca doctor names them in that engine's own spelling):
 # models:
 #   some-model: {transport: text}
+#   hy3:        {engine: sglang}
 
 # ── the fleet this build carries profiles for ────────────────────────────────
 # The six models the operator's gateway serves. lca already knows each one's

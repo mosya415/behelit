@@ -355,7 +355,11 @@ handled:
   `thinking:{type}` (Kimi K2.5+), `thinking:{type:"enabled", clear_thinking:false}`
   (Z.ai, on by default), `enable_thinking` (DashScope, on for reasoning models),
   `reasoning_effort` (Tencent hy3), `reasoning:{effort}` (OpenRouter), and
-  `chat_template_kwargs` for local vLLM/SGLang.
+  `chat_template_kwargs` for a local vLLM/SGLang endpoint — sourced on both:
+  SGLang declares `chat_template_kwargs` and splats it into
+  `apply_chat_template`, and it additionally pops a `reasoning_effort` kwarg and
+  promotes it to the top level itself, so the one key lca sends reaches the
+  template whichever carrier the engine prefers.
 
 Failures are handled per model call by the [gateway failure
 policy](#gateway-failure-policy): `Retry-After` is honoured, waiting is capped by
@@ -778,8 +782,25 @@ marked void.
 own tool-call format — the one it was RL-trained on — so the engines behind
 the gateway need their tool-call parser enabled (vLLM
 `--enable-auto-tool-choice --tool-call-parser <family>`, SGLang
-`--tool-call-parser <family>`), and a `--reasoning-parser` to get
-`reasoning_content` separately. `text` (the agent's own tag protocol) is a
+`--tool-call-parser auto` or an explicit registry name, and **no**
+`--enable-auto-tool-choice`: SGLang has no such flag and argparse refuses the
+launch), and a `--reasoning-parser` — that flag, and only that flag, is what
+makes the engine return `reasoning_content` as its own field instead of leaving
+the thinking inside `content`. The parser VALUES are not interchangeable between
+the two engines (hy3 is `hy_v3` on vLLM and `hunyuan` on SGLang; GLM-5.3's
+reasoning parser is `glm47` on vLLM and `glm45` on SGLang), and a value an
+engine does not know fails server startup — so `lca doctor` names the flags in
+the spelling of whichever engine it resolved, and says so when it cannot resolve
+one.
+
+Which engine serves the endpoint is a per-(endpoint, model) fact, because one
+gateway url can front both: `engine:` in `config.json` / `LCA_ENGINE` /
+`/set engine` names it for the endpoint, `models.<id>.engine:` in `roles.yaml`
+names it for one model and outranks everything else, and `/v1/models`'
+`owned_by` is read only when it is exactly `sglang` or `vllm`. When nobody has
+said, lca sends nothing engine-specific and `lca doctor` says what that means.
+It is decided once, before the first request: the gateway keys its KV cache on
+the request prefix. `text` (the agent's own tag protocol) is a
 per-model fallback for a model whose native parser is missing or broken on
 your engine:
 

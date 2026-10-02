@@ -32,11 +32,22 @@ type Provider struct {
 	Key       string   // explicit key (config)
 	Dialect   string   // thinking-parameter dialect (models.go)
 	Transport string   // transportNative | transportText
-	Local     bool     // the LCA_BASE_URL endpoint (vLLM/SGLang): vLLM-only extras allowed
-	Models    []string // suggested model ids (completion / listing)
-	Headers   map[string]string
-	Extra     map[string]any // extra request-body fields
+	Local     bool     // the LCA_BASE_URL endpoint (vLLM/SGLang): self-host-only extras allowed
+	// Engine is the inference engine this ENDPOINT is configured to be served by
+	// ("sglang" | "vllm" | ""): LCA_ENGINE, providers.<id>.engine, /set engine. It
+	// is the per-endpoint default; the per-(endpoint, model) fact in force lives on
+	// the Client, because one gateway fronts both engines at once.
+	Engine  string
+	Models  []string // suggested model ids (completion / listing)
+	Headers map[string]string
+	Extra   map[string]any // extra request-body fields
 }
+
+// selfHosted is "this is the operator's own vLLM or SGLang", the question three
+// sites used to ask as `Dialect == "vllm"`. Naming an engine for an endpoint is
+// itself a statement that the endpoint is self-hosted — there is no hosted API
+// whose engine lca would be told.
+func (p *Provider) selfHosted() bool { return p != nil && (p.Local || p.Engine != "") }
 
 func (p *Provider) apiKey() string {
 	if p.Key != "" {
@@ -99,7 +110,13 @@ func localProvider(cfg Config) *Provider {
 	if cfg.Tools == transportNative {
 		t = transportNative
 	}
-	return &Provider{ID: "local", Name: "local endpoint", BaseURL: cfg.BaseURL, Dialect: "vllm", Transport: t, Local: true}
+	// Engine carries the operator's own answer (LCA_ENGINE / config.json engine)
+	// for the whole endpoint; "auto" and "" both mean "read it from /v1/models".
+	eng := strings.ToLower(strings.TrimSpace(cfg.Engine))
+	if eng == engineAuto {
+		eng = ""
+	}
+	return &Provider{ID: "local", Name: "local endpoint", BaseURL: cfg.BaseURL, Dialect: "vllm", Transport: t, Local: true, Engine: eng}
 }
 
 // Providers resolves model refs to clients. Clients for hosted models are
@@ -117,6 +134,12 @@ type Providers struct {
 	// max_model_len. An endpoint that could not answer is stored as an empty map,
 	// so "asked already" and "serves nothing" are the same fast answer.
 	windows map[string]map[string]int
+	// Which engine each endpoint's own cards claimed: endpoint → normalised model
+	// id → "sglang" | "vllm". Learned from the SAME /v1/models response as the
+	// window, and only when owned_by is exactly one of those two words — anything
+	// else (a router's "local", an org name) leaves the model UNKNOWN rather than
+	// voting.
+	engines map[string]map[string]string
 	// learned: what a deployment's own refusal told us, endpoint → normalised model
 	// id → window. Kept in a file beside the state so the lesson outlives the
 	// session that paid for it, and treated as server truth because it came from
@@ -260,7 +283,7 @@ func (ps *Providers) LearnedWindow(endpoint, model string) int {
 
 func NewProviders(cfg Config, fc *FileConfig, local *Client) *Providers {
 	ps := &Providers{cfg: cfg, local: local, byID: map[string]*Provider{}, clients: map[string]*Client{},
-		windows: map[string]map[string]int{}, shared: &http.Client{Timeout: 30 * time.Minute}}
+		windows: map[string]map[string]int{}, engines: map[string]map[string]string{}, shared: &http.Client{Timeout: 30 * time.Minute}}
 	for _, p := range presetProviders() {
 		ps.add(p)
 	}
@@ -312,14 +335,59 @@ func (ps *Providers) Split(ref string) (p *Provider, model string, ok bool) {
 // nothing, so a failover does not pay a round-trip per retry.
 func (ps *Providers) LearnWindows(endpoint string, ms []ModelInfo) {
 	w := map[string]int{}
+	e := map[string]string{}
 	for _, m := range ms {
 		if m.MaxLen > 0 {
 			w[normalizeModelID(m.ID)] = m.MaxLen
+		}
+		if eng := engineName(m.OwnedBy); eng != "" {
+			e[normalizeModelID(m.ID)] = eng
 		}
 	}
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	ps.windows[strings.TrimRight(endpoint, "/")] = w
+	ps.engines[strings.TrimRight(endpoint, "/")] = e
+}
+
+// engineName is the ONLY way a string becomes an engine, for every source: the
+// comparison is exact (after lower-casing) and anything else is UNKNOWN.
+//
+// Applied to /v1/models' owned_by — the one engine signal that lives inside /v1,
+// the only informational route a gateway is sure to proxy — that exactness is the
+// whole point: SGLang's ModelCard defaults owned_by to "sglang" and vLLM's to
+// "vllm", while "local" (what SGLang's own router synthesizes), "organization_owner"
+// or a company name says nothing. A heuristic that is harmless as a label becomes
+// load-bearing the moment a request field depends on it.
+func engineName(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case engineSGLang:
+		return engineSGLang
+	case engineVLLM:
+		return engineVLLM
+	}
+	return ""
+}
+
+// applyEngine resolves tiers 2 and 3 of the engine precedence onto a client:
+// what the endpoint is configured to be (providers.<id>.engine / LCA_ENGINE /
+// /set engine), then what its own card claimed in owned_by. Tier 1 —
+// roles.yaml models.<id>.engine — is applied by the caller that knows the roles
+// file, and UNKNOWN is left UNKNOWN.
+//
+// It is called exactly where the window is learned and NEVER on the request path:
+// the gateway keys its KV cache on the request prefix, so the body shape of a
+// running session must not change under it. One decision, before the first
+// request.
+func (ps *Providers) applyEngine(c *Client) {
+	if c == nil || c.provider == nil || !c.provider.selfHosted() {
+		return // a hosted API's engine is not ours to know, and nothing reads it
+	}
+	ps.mu.Lock()
+	eng := ps.engines[strings.TrimRight(c.Endpoint(), "/")][normalizeModelID(c.Model())]
+	ps.mu.Unlock()
+	c.setEngine(eng, EngineFromOwnedBy)
+	c.setEngine(c.provider.Engine, EngineFromEndpoint)
 }
 
 // Learn points a client at the window its own endpoint reports for its own
@@ -344,6 +412,9 @@ func (ps *Providers) Learn(c *Client) {
 		w = ps.windows[ep]
 		ps.mu.Unlock()
 	}
+	// The engine is a fact about the same (endpoint, model) learned from the same
+	// response, so it is resolved here and not in a second round-trip.
+	ps.applyEngine(c)
 	if n := w[normalizeModelID(c.Model())]; n > 0 {
 		c.SetCtxLen(n)
 		return
@@ -371,6 +442,7 @@ func (ps *Providers) Client(ref string) (*Client, error) {
 		c := *ps.local
 		c.model = model
 		c.ctxLen, c.ctxSrc = 0, OriginUnset
+		c.resetEngine()
 		// A subagent, a delegate or an `lca run` step on another served model is
 		// a new model on the SAME deployment, so its window is knowable — and
 		// nothing else on this path would ever ask.
@@ -388,6 +460,12 @@ func (ps *Providers) Client(ref string) (*Client, error) {
 	}
 	c := &Client{http: ps.shared, provider: p, baseURL: strings.TrimRight(p.BaseURL, "/"), endpoints: []string{p.BaseURL},
 		epModel: map[string]string{}, model: model, apiKey: key, temp: tempOrNil(ps.cfg.Temperature), maxTokens: ps.cfg.MaxTokens}
+	// providers.<id>.engine reaches the client HERE, inline, and not through
+	// applyEngine: this path holds ps.mu, and the only tier applyEngine could add
+	// is owned_by, which is learned per endpoint and never learned for one of these
+	// — Learn asks only the local deployment. Without this line the key doctor
+	// tells an operator to move `dialect:` into would have had no effect at all.
+	c.setEngine(p.Engine, EngineFromEndpoint)
 	ps.clients[ref] = c
 	return c, nil
 }

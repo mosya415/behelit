@@ -20,7 +20,7 @@ import (
 //	  "thinking": "high",
 //	  "subagent_depth": 2,
 //	  "providers": {
-//	    "gpu2": {"base_url": "http://gpu2:8000/v1", "tools": "native", "dialect": "vllm",
+//	    "gpu2": {"base_url": "http://gpu2:8000/v1", "tools": "native", "engine": "sglang",
 //	             "models": ["Qwen3-Coder-480B"]}
 //	  },
 //	  "agents": {
@@ -55,15 +55,20 @@ type FileConfig struct {
 }
 
 type ProviderConfig struct {
-	Name      string            `json:"name"`
-	BaseURL   string            `json:"base_url"`
-	APIKey    string            `json:"api_key"`
-	APIKeyEnv string            `json:"api_key_env"`
-	Dialect   string            `json:"dialect"`
-	Tools     string            `json:"tools"`
-	Models    []string          `json:"models"`
-	Headers   map[string]string `json:"headers"`
-	Extra     map[string]any    `json:"extra"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	APIKeyEnv string `json:"api_key_env"`
+	Dialect   string `json:"dialect"`
+	// Engine is the INFERENCE ENGINE behind this endpoint ("sglang" | "vllm"),
+	// which is not the same question as Dialect (the vendor's HTTP dialect) even
+	// though one value spells both. A file that wrote dialect: "sglang" meant this
+	// field, so apply translates it rather than refusing it.
+	Engine  string            `json:"engine"`
+	Tools   string            `json:"tools"`
+	Models  []string          `json:"models"`
+	Headers map[string]string `json:"headers"`
+	Extra   map[string]any    `json:"extra"`
 }
 
 func (pc ProviderConfig) apply(p *Provider) {
@@ -81,6 +86,17 @@ func (pc ProviderConfig) apply(p *Provider) {
 	}
 	if pc.Dialect != "" {
 		p.Dialect = pc.Dialect
+	}
+	// dialect: "sglang" | "vllm" names an ENGINE, and until now it was accepted and
+	// silently harmful: "sglang" is no dialect lca speaks, so thinkingParams fell
+	// into its generic arm and sent hy3 a bare top-level reasoning_effort — the one
+	// shape its Jinja template raises on. Translating it keeps every existing file
+	// working and makes it mean what it says; doctor names the key to move to.
+	if eng := engineName(pc.Dialect); eng != "" {
+		p.Engine = eng
+	}
+	if eng := engineName(pc.Engine); eng != "" {
+		p.Engine = eng
 	}
 	if pc.Tools != "" {
 		p.Transport = pc.Tools

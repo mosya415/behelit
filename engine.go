@@ -335,6 +335,9 @@ func (s *Session) SetModel(ref string) error {
 	}
 	s.client = c
 	s.models, s.modelIdx = nil, 0 // an explicit model replaces the role chain
+	// The same tier-1 engine rule useModel applies: a single-agent session on a
+	// model roles.yaml named an engine for must send that engine's body shape.
+	s.orch.applyModelEngine(c)
 	return nil
 }
 

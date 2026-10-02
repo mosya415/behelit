@@ -29,8 +29,12 @@ import (
 //   - Switch: the chat-template switch the model's OWN template reads. This is a
 //     property of the checkpoint, not of the engine, so it lives here and not in
 //     the provider's dialect.
-//   - ToolParser/ReasonParser: the engine flags the vendor documents, so doctor
-//     can name them when a probe shows tool calling or reasoning is not working.
+//   - ToolParser/ReasonParse: the --tool-call-parser / --reasoning-parser VALUE
+//     each ENGINE documents for this model, so doctor can name the flag when a
+//     probe shows tool calling or reasoning is not working. The flag names are the
+//     same on vLLM and SGLang; the values are not interchangeable, and a value one
+//     engine's argparse rejects fails server STARTUP — so they are recorded per
+//     engine and never borrowed across.
 type ModelProfile struct {
 	Family      string
 	Context     int
@@ -50,8 +54,8 @@ type ModelProfile struct {
 	EffortOn     string // the level to send for a bare "think" (the vendor default where there is one)
 	EffortOff    string // the level that means "don't think" ("" = use Switch.Off)
 	Switch       ThinkSwitch
-	ToolParser   string // vLLM --tool-call-parser the vendor documents
-	ReasonParse  string // vLLM --reasoning-parser the vendor documents
+	ToolParser   ParserNames // --tool-call-parser, per engine
+	ReasonParse  ParserNames // --reasoning-parser, per engine
 	// The card's sampling describes a SELF-HOST and the vendor's own hosted API
 	// fixes these values server-side while documenting that they be omitted, so
 	// chat.go sends them to a local endpoint only (top_k is gated the same way).
@@ -72,6 +76,37 @@ type ThinkSwitch struct {
 	TopLevel bool   // Effort is a top-level field, not a chat_template_kwargs entry
 	Keep     string // kwarg that preserves reasoning history ("" = none)
 	KeepVal  any    // the value of that kwarg which means "keep"
+}
+
+// ParserNames is the --tool-call-parser / --reasoning-parser VALUE each engine
+// documents for this model. Empty = nothing is sourced for that engine, so doctor
+// names `auto` and says so rather than borrowing the other engine's token: the
+// values are registry members on each side and a name that is not in the registry
+// is a hard failure at launch (vLLM and SGLang both pass them through argparse
+// `choices`), not a silently ignored flag.
+//
+// The SGLang values are spellings from SGLang's own registry modules
+// (function_call/parser_names.py and parser/reasoning_parser_names.py). Those
+// modules are quoted at `main`, which is the only revision there is a quote of —
+// so a name here is known to be spelled SGLang's way and is NOT known to be in
+// the operator's released tag. Which tag they run is unknown (no /v1 route
+// reports a version), which is why the advice leads with `auto` and names an
+// explicit value only in brackets.
+type ParserNames struct{ VLLM, SGLang string }
+
+// forEngine is the value this flag takes on ONE engine, with that engine named so
+// a line an operator reads says which server it is for. With no engine named
+// there is no answer at all: the two spellings are not interchangeable — each is
+// a value the other engine's argparse refuses — so nothing is compared and
+// nothing is advised, rather than one of them being picked by the reader.
+func (p ParserNames) forEngine(engine string) (value, who string) {
+	switch engine {
+	case engineSGLang:
+		return p.SGLang, "SGLang"
+	case engineVLLM:
+		return p.VLLM, "vLLM"
+	}
+	return "", "an engine nobody has named"
 }
 
 // Origin is where a profile number came from, so /model and doctor can say
@@ -144,8 +179,8 @@ var canonicalProfiles = []canonProfile{
 		Efforts:     []string{"low", "high", "max"},
 		EffortOn:    "max", // card: the vendor's own default
 		Switch:      ThinkSwitch{Effort: "reasoning_effort", TopLevel: true},
-		ToolParser:  "kimi_k3",
-		ReasonParse: "kimi_k3",
+		ToolParser:  ParserNames{VLLM: "kimi_k3", SGLang: "kimi_k3"},
+		ReasonParse: ParserNames{VLLM: "kimi_k3", SGLang: "kimi_k3"},
 		// api: platform.kimi.ai's K3 quickstart fixes temperature 1.0 / top_p 0.95
 		// server-side and says to omit both — and the agentic top_p above is 1.0,
 		// i.e. not even the value it fixes. So the card's numbers go to a
@@ -179,10 +214,15 @@ var canonicalProfiles = []canonProfile{
 		EffortOn:     "high", // api: the server's own default
 		EffortOff:    "none",
 		Switch:       ThinkSwitch{Kwarg: "thinking", On: true, Off: false, Effort: "reasoning_effort"},
-		ToolParser:   "deepseek_v41",
-		ReasonParse:  "deepseek_v41",
-		Note:         "replay is mandatory with tools (the API returns 400 without reasoning_content); on SGLang thinking is off by default and the effort field doubles as the switch",
-		Src:          Src{Context: OriginCard, Output: OriginAPI, Temperature: OriginCard, TopP: OriginCard},
+		// Nothing is recorded for SGLang: no source maps THIS checkpoint to a
+		// parser name there. A `deepseekv41` is in the registry, but a name that
+		// looks like the model is not a statement that it detects the model's
+		// format — and inheriting deepseekv4's value is the sibling guess this file
+		// forbids. So doctor prints `auto` and says nothing is sourced.
+		ToolParser:  ParserNames{VLLM: "deepseek_v41"},
+		ReasonParse: ParserNames{VLLM: "deepseek_v41"},
+		Note:        "replay is mandatory with tools (the API returns 400 without reasoning_content); lca sends the thinking kwarg AND the effort explicitly, so the request does not depend on either engine's default for thinking",
+		Src:         Src{Context: OriginCard, Output: OriginAPI, Temperature: OriginCard, TopP: OriginCard},
 	}},
 
 	// ── GLM-5.3 (Z.ai / Zhipu) ─────────────────────────────────────────────
@@ -200,9 +240,12 @@ var canonicalProfiles = []canonProfile{
 		Efforts:     []string{"low", "high", "max"},
 		EffortOn:    "max", // api: the vendor's default, and "for coding we recommend max"
 		// no EffortOff: thinking.type accepts only "enabled" — "disabled" fails the request.
-		Switch:      ThinkSwitch{Effort: "reasoning_effort", Keep: "clear_thinking", KeepVal: false},
-		ToolParser:  "glm47", // engine docs: glm45 as the TOOL-call parser silently breaks tool calling
-		ReasonParse: "glm47",
+		Switch: ThinkSwitch{Effort: "reasoning_effort", Keep: "clear_thinking", KeepVal: false},
+		// glm45 as the TOOL-call parser silently breaks tool calling, and on SGLang
+		// `glm47` is a TOOL-call parser only: it is in function_call's registry and
+		// not in the reasoning one, so --reasoning-parser glm47 fails startup there.
+		ToolParser:  ParserNames{VLLM: "glm47", SGLang: "glm47"},
+		ReasonParse: ParserNames{VLLM: "glm47", SGLang: "glm45"},
 		Note:        "temperature is clamped to [0,1]; thinking cannot be disabled; an effort level outside low|high|max is silently promoted to max",
 		Src:         Src{Context: OriginCard, Output: OriginAPI, Temperature: OriginCard, TopP: OriginCard},
 	}},
@@ -221,8 +264,8 @@ var canonicalProfiles = []canonProfile{
 		Reasoning:   true,
 		EffortNone:  true, // reasoning_effort is documented for Qwen3.8 only; 3.6's analogue is thinking_budget, a token cap
 		Switch:      ThinkSwitch{Kwarg: "enable_thinking", On: true, Off: false, Keep: "preserve_thinking", KeepVal: true},
-		ToolParser:  "qwen3_coder", // card's own flags, not vLLM's generic doc
-		ReasonParse: "qwen3",
+		ToolParser:  ParserNames{VLLM: "qwen3_coder", SGLang: "qwen3_coder"}, // card's own flags, not vLLM's generic doc
+		ReasonParse: ParserNames{VLLM: "qwen3", SGLang: "qwen3"},
 		Note:        "no reasoning_effort exists for 3.6; presence_penalty is left out because the 27B and 35B-A3B cards disagree (0.0 vs 1.5); the 1,010,000 YaRN window is not the served default",
 		Src:         Src{Context: OriginCard, Output: OriginCard, Temperature: OriginCard, TopP: OriginCard, TopK: OriginCard},
 	}},
@@ -241,18 +284,22 @@ var canonicalProfiles = []canonProfile{
 		Reasoning:   true,
 		// api: "only MiniMax-M3.1-Flash-Preview supports real thinking-depth
 		// tuning; other models ignore this field."
-		EffortNone:  true,
-		Switch:      ThinkSwitch{Kwarg: "thinking_mode", On: "enabled", Off: "disabled"},
-		ToolParser:  "minimax_m3", // plus a mandatory --block-size 128 on vLLM
-		ReasonParse: "minimax_m3",
-		Note:        "top_k 40 is engine docs, not the card, so it goes to a local server only; reasoning_effort is ignored by M3; the hosted API's 1,000,000 window counts input+output together",
+		EffortNone: true,
+		Switch:     ThinkSwitch{Kwarg: "thinking_mode", On: "enabled", Off: "disabled"},
+		// SGLang spells it with a HYPHEN in both registries; lca's underscore is
+		// vLLM's spelling and fails SGLang's argparse. vLLM additionally needs a
+		// mandatory --block-size 128, which is vLLM-only.
+		ToolParser:  ParserNames{VLLM: "minimax_m3", SGLang: "minimax-m3"},
+		ReasonParse: ParserNames{VLLM: "minimax_m3", SGLang: "minimax-m3"},
+		Note:        "top_k 40 is engine docs, not the card, so it goes to a local server only; reasoning_effort is ignored by M3; vLLM also needs --block-size 128, which SGLang has no equivalent of; the hosted API's 1,000,000 window counts input+output together",
 		Src:         Src{Context: OriginCard, Output: OriginAPI, Temperature: OriginCard, TopP: OriginCard, TopK: OriginEngine},
 	}},
 
 	// ── Hunyuan 3 (Tencent) ────────────────────────────────────────────────
 	// The sharpest edge of the six: reasoning_effort IS the switch, it must go
-	// through chat_template_kwargs, and anything outside no_think|low|high raises
-	// inside the Jinja template — a 500 on every turn.
+	// through chat_template_kwargs, and anything outside no_think|low|high reaches
+	// the Jinja template and fires its raise_exception — an error on every turn
+	// (SGLang surfaces a template render failure as a 400).
 	// hy3 IS Hunyuan 3 (HF tencent/HY3, config.json model_type "hy_v3"), so the
 	// spellings an operator may serve it under belong here: "hunyuan-3" used to
 	// fall through to the Hunyuan-2-era generic rule and take half the window,
@@ -266,15 +313,26 @@ var canonicalProfiles = []canonProfile{
 		Replay:      "all",    // card: the template sets preserved_thinking=true whenever tools are passed, which is this agent's normal case
 		Reasoning:   true,
 		Efforts:     []string{"no_think", "low", "high"},
-		// policy, not a vendor default: hy3's own template defaults
-		// reasoning_effort to no_think, and high is the only deep level it
-		// accepts — so a bare "think" picks the deeper of the two, by our choice.
-		EffortOn:    "high",
-		EffortOff:   "no_think",
-		Switch:      ThinkSwitch{Effort: "reasoning_effort"},
-		ToolParser:  "hy_v3",
-		ReasonParse: "hy_v3",
-		Note:        "self-hosted hy3 does NOT think unless reasoning_effort is sent; only no_think|low|high are safe — vLLM's top-level field accepts medium/max and the template then raises",
+		// policy, not a vendor default: high is the only deep level this template
+		// accepts, so a bare "think" picks the deeper of the two, by our choice.
+		// What "no level at all" means is NOT a fact about hy3 but about the
+		// deployment's template variant (see Note), which is why lca always names
+		// a level and never relies on the default.
+		EffortOn:  "high",
+		EffortOff: "no_think",
+		// Effort and nothing else. A `preserved_thinking: true` kwarg was proposed
+		// here and is NOT sent: no source names it, and the template's own default
+		// (true whenever tools are present) is what the Replay comment above already
+		// records — so naming it would have been a guess at the wire in exchange for
+		// nothing, and admitting it required weakening the two assertions in
+		// models_test.go that say hy3 is sent NOTHING outside no_think|low|high.
+		Switch: ThinkSwitch{Effort: "reasoning_effort"},
+		// `hy_v3` is the model_type and vLLM's own parser name; SGLang registers
+		// this checkpoint under `hunyuan` in BOTH registries and has no hy_v3 in
+		// either, so the two spellings are not interchangeable.
+		ToolParser:  ParserNames{VLLM: "hy_v3", SGLang: "hunyuan"},
+		ReasonParse: ParserNames{VLLM: "hy_v3", SGLang: "hunyuan"},
+		Note:        "only no_think|low|high are safe on BOTH engines (the wider minimal|medium|xhigh|max set is folded by SGLang >=0.5.20 and only with the hunyuan_effort template, which no /v1 route reveals); whether hy3 thinks when no level is sent depends on the deployment's template variant — unset means high on a hunyuan_effort template and no thinking at all on an Hy3-preview one, both served as --reasoning-parser hunyuan, so lca always sends a level and doctor probes which variant answered",
 		Src:         Src{Context: OriginCard, Output: OriginAPI, Temperature: OriginCard, TopP: OriginCard},
 		// TopK is deliberately unset: generation_config.json says -1 (disabled),
 		// which the TopK int field cannot express and must not be rounded to 0.
@@ -601,17 +659,62 @@ func srcFloat(v *float64, o Origin) string {
 	return strconv.FormatFloat(*v, 'f', -1, 64) + " (" + o.String() + ")"
 }
 
-// engineFlags is the launch flags the vendor documents for this model, so doctor
-// can turn "tool calling is broken" into a line an operator can paste.
-func (p ModelProfile) engineFlags() string {
-	var f []string
-	if p.ToolParser != "" {
-		f = append(f, "--tool-call-parser "+p.ToolParser)
+// engineFlags is the launch flags THIS engine documents for this model, so doctor
+// can turn "tool calling is broken" into a line an operator can paste. One
+// renderer for the advice and the report, because the three places that spelled
+// these flags out independently meant an engine fix made twice was a fix not made.
+//
+// engine == "" is the honest answer when nobody has said which engine serves the
+// endpoint: both, labelled. It is never a guess at one of them.
+func (p ModelProfile) engineFlags(engine string) string {
+	switch engine {
+	case engineSGLang:
+		return p.sglangFlags()
+	case engineVLLM:
+		return p.vllmFlags()
 	}
-	if p.ReasonParse != "" {
-		f = append(f, "--reasoning-parser "+p.ReasonParse)
+	return "vLLM: " + p.vllmFlags() + gSep + "SGLang: " + p.sglangFlags()
+}
+
+// vllmFlags is what it has always been, including --enable-auto-tool-choice,
+// which vLLM requires before it will consider a tool-call parser at all.
+func (p ModelProfile) vllmFlags() string {
+	return "--enable-auto-tool-choice --tool-call-parser " + parserValue(p.ToolParser.VLLM) +
+		" --reasoning-parser " + parserValue(p.ReasonParse.VLLM) + p.noValueNote(p.ToolParser.VLLM, p.ReasonParse.VLLM, "vLLM")
+}
+
+// sglangFlags leads with `auto`, which is sourced ("Use 'auto' to detect from
+// chat template", a member of --tool-call-parser's and --reasoning-parser's
+// choices at v0.5.20 and main) and is what both the Hy3 and GLM-5.3 cookbooks'
+// own verified launch cells use. It NEVER emits --enable-auto-tool-choice: that
+// flag does not exist in SGLang, and argparse fails the launch with
+// "unrecognized arguments" — advice that stops the server from starting.
+func (p ModelProfile) sglangFlags() string {
+	out := "--tool-call-parser auto --reasoning-parser auto"
+	tool, reason := p.ToolParser.SGLang, p.ReasonParse.SGLang
+	if tool != "" && reason != "" {
+		out += faint(" (or --tool-call-parser %s --reasoning-parser %s)", tool, reason)
 	}
-	return strings.Join(f, " ")
+	return out + p.noValueNote(tool, reason, "SGLang")
+}
+
+// parserValue names the flag with a placeholder when nothing is recorded for that
+// engine. The placeholder is deliberate: the other engine's token is a value this
+// engine's argparse refuses, so printing it would be advice that breaks the launch.
+func parserValue(v string) string {
+	if v == "" {
+		return "<family>"
+	}
+	return v
+}
+
+// noValueNote says so when a value is missing, rather than letting <family> read
+// as an oversight. This is the no-guessing rule applied to advice.
+func (p ModelProfile) noValueNote(tool, reason, engine string) string {
+	if tool != "" && reason != "" {
+		return ""
+	}
+	return faint(" (no parser value is recorded for %s on %s)", firstNonEmpty(p.Key, "this model"), engine)
 }
 
 // thinkingParams returns the request fields that switch reasoning on/off or set
@@ -630,13 +733,25 @@ func thinkingParams(p *Provider, model string, prof ModelProfile, mode, replay s
 	named := mode != "" && !on && !off
 	lvl := ""
 	if named {
-		if p.Dialect == "vllm" {
+		if p.selfHosted() {
+			// The narrower list is the CHECKPOINT TEMPLATE's, not vLLM's: a hosted
+			// API resolves its own compat spellings and a Jinja template resolves
+			// nothing, on either engine.
 			lvl = prof.effortForLocal(mode)
 		} else {
 			lvl = prof.effortFor(mode)
 		}
 	}
 	id := strings.ToLower(model)
+
+	// Self-hosted first, ABOVE the per-vendor dialect switch: the switch a model
+	// gets must come from its own chat template whatever the Dialect field happens
+	// to hold, and while this was one arm of that switch, any other value —
+	// including the "sglang" an operator could write in a config file — bypassed it
+	// and sent a bare top-level reasoning_effort.
+	if p.selfHosted() {
+		return localThinking(prof, on, off, named, lvl, replay)
+	}
 
 	switch p.Dialect {
 	case "deepseek":
@@ -710,8 +825,6 @@ func thinkingParams(p *Provider, model string, prof ModelProfile, mode, replay s
 		case on:
 			return map[string]any{"reasoning": map[string]any{"enabled": true}}
 		}
-	case "vllm":
-		return localThinking(prof, on, off, named, lvl, replay)
 	default:
 		if lvl != "" {
 			return map[string]any{"reasoning_effort": lvl}

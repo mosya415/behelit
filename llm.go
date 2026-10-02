@@ -29,7 +29,90 @@ type Client struct {
 	ctxLen    int    // active model's context window (max_model_len), 0 if unknown
 	ctxSrc    Origin // where ctxLen came from; only ever OriginServer or unset
 	transport string // per-session override of the provider's transport ("" = provider's)
+	// Which inference engine serves THIS (endpoint, model) — "sglang", "vllm", or
+	// "" for "nobody has said". Per (endpoint, model) and not per provider because
+	// one gateway URL fronts both: hy3 on SGLang and the next model on vLLM is the
+	// deployment this client was written for, and `c := *ps.local` copies the
+	// Client while sharing the Provider, so a per-provider field would rewrite
+	// every model on the endpoint.
+	engine    string
+	engineSrc EngineSrc
 }
+
+// EngineSrc is WHO decided which engine serves this (endpoint, model), so doctor
+// names a winner instead of asserting one. Ascending by authority: a weaker
+// source may never overwrite a stronger one, which is what keeps Providers.Learn
+// from clobbering what the operator typed.
+type EngineSrc uint8
+
+const (
+	EngineUnset        EngineSrc = iota
+	EngineFromSlurm              // /discover's substring match over job logs — a doctor HINT, never set
+	EngineFromOwnedBy            // the card's own owned_by, compared exactly
+	EngineFromEndpoint           // LCA_ENGINE / providers.<id>.engine / /set engine
+	EngineFromModel              // roles.yaml models.<id>.engine
+)
+
+// The two engines lca can name, and the word that means "read it from the
+// endpoint". Nothing else is ever stored in Client.engine: an unrecognised value
+// is UNKNOWN, which means "send nothing engine-specific".
+const (
+	engineVLLM   = "vllm"
+	engineSGLang = "sglang"
+	engineAuto   = "auto"
+)
+
+// String is how doctor and /model name the source, in the same style the window's
+// provenance is named.
+func (s EngineSrc) String() string {
+	switch s {
+	case EngineFromSlurm:
+		return "/discover's log scan"
+	case EngineFromOwnedBy:
+		return "the endpoint's own owned_by"
+	case EngineFromEndpoint:
+		return "configured for this endpoint"
+	case EngineFromModel:
+		return "roles.yaml models.<id>.engine"
+	}
+	return "nobody has said"
+}
+
+// Engine is the engine serving this (endpoint, model), or "" for unknown. UNKNOWN
+// is a real answer and means "send nothing engine-specific" — never a guess.
+func (c *Client) Engine() string { return c.engine }
+
+// EngineSrc is who decided that, for doctor and /model.
+func (c *Client) EngineSrc() EngineSrc { return c.engineSrc }
+
+// setEngine records an engine only when its source outranks the one in force, so
+// the order the call sites happen to run in cannot decide the answer. An engine
+// lca does not know how to speak to is dropped rather than stored: a name we
+// cannot act on is UNKNOWN wearing a label.
+func (c *Client) setEngine(e string, src EngineSrc) {
+	if e = engineName(e); e == "" {
+		return // "", "auto" and anything unrecognised all mean UNKNOWN
+	}
+	if src < c.engineSrc {
+		return // a weaker source never overwrites a stronger one
+	}
+	c.engine, c.engineSrc = e, src
+}
+
+// engineLine is how the engine is printed wherever the window's provenance is
+// printed: the winner and who named it, or a sentence saying what lca therefore
+// does. "unknown" is a real answer here and the sentence beside it is the point —
+// a blank would read as a failure, and it is a working configuration.
+func engineLine(c *Client) string {
+	if c == nil || c.Engine() == "" {
+		return "unknown" + gSep + "lca sends nothing engine-specific"
+	}
+	return c.Engine() + faint(" (%s)", c.EngineSrc())
+}
+
+// resetEngine forgets what was learned, for the two moments the fact itself
+// changes: the model or the endpoint moved, or the operator asked for `auto`.
+func (c *Client) resetEngine() { c.engine, c.engineSrc = "", EngineUnset }
 
 func NewClient(cfg Config) *Client {
 	eps := cfg.Endpoints
@@ -120,8 +203,11 @@ func (c *Client) SetEndpoint(u string) {
 	}
 	c.baseURL = u
 	// A window learned from another machine says nothing about this one, and the
-	// same model id can be served with a different --max-model-len on each.
+	// same model id can be served with a different --max-model-len on each. Nor
+	// does an engine: the same model id behind two gateways may be served by two
+	// different engines, so both facts are forgotten and learned again here.
 	c.ctxLen, c.ctxSrc = 0, OriginUnset
+	c.resetEngine()
 	for _, e := range c.endpoints {
 		if e == u {
 			return
@@ -138,14 +224,19 @@ func (c *Client) Endpoint() string { return c.baseURL }
 // model-before-last's max_model_len and report it as glm5.3's — between the six
 // served models that is a swing from 262,144 to 1,048,576, i.e. the agent either
 // compacts four times too early or builds prompts the server refuses.
+// The engine goes with it, for the same reason: one gateway URL can front hy3 on
+// SGLang and the next model on vLLM, so a learned engine says nothing about the
+// model that replaces it.
 func (c *Client) SetModel(m string) {
 	c.model = m
 	c.ctxLen, c.ctxSrc = 0, OriginUnset
+	c.resetEngine()
 }
 
 // SetCtxLen records the window the running deployment reports. Two guards, both
 // load-bearing: a server that omits max_model_len sends 0 and must not clobber a
-// window we already know (SGLang frequently omits it), and only a local endpoint
+// window we already know (an aggregating gateway in front of either engine does
+// omit it — the engines themselves do not), and only a local endpoint
 // can speak for a deployment — a hosted /v1/models has no max_model_len, so a
 // hosted client's window must keep reading card/api and never "server".
 func (c *Client) SetCtxLen(n int) {
@@ -235,15 +326,19 @@ func (c *Client) Profile() ModelProfile { return lookupProfile(c.model) }
 // hosted API's everywhere else. /model and doctor must quote the list the
 // request actually checks against, or they promise a level the server drops.
 func (c *Client) EffortFor(level string) string {
-	if c.localDialect() {
+	if c.selfHosted() {
 		return c.Profile().effortForLocal(level)
 	}
 	return c.Profile().effortFor(level)
 }
 
-func (c *Client) EffortVocab() []string { return c.Profile().effortVocab(c.localDialect()) }
+func (c *Client) EffortVocab() []string { return c.Profile().effortVocab(c.selfHosted()) }
 
-func (c *Client) localDialect() bool { return c.provider != nil && c.provider.Dialect == "vllm" }
+// selfHosted is "this endpoint is the operator's own vLLM or SGLang", which is
+// the question every caller here was really asking. It used to be spelled
+// `Dialect == "vllm"`: a VENDOR HTTP dialect standing in for "self-hosted", which
+// made `dialect: "sglang"` in a config file mean the opposite of what it says.
+func (c *Client) selfHosted() bool { return c.provider != nil && c.provider.selfHosted() }
 
 // Native reports whether this client uses the API's native function calling
 // (true) or the line-anchored text tag protocol (false).
@@ -255,8 +350,12 @@ func (c *Client) Native() bool {
 }
 
 // ModelInfo is what we surface about a served model. Fields beyond ID are
-// best-effort: vLLM populates owned_by and max_model_len; leaner servers (e.g.
-// SGLang) may omit them, in which case they read as empty/0 and are hidden.
+// best-effort, but NOT because an engine is lean: SGLang's ModelCard has
+// defaulted owned_by to "sglang" since v0.3.6 and has carried max_model_len
+// (model_config.context_len) since v0.4.5, and vLLM's says "vllm". What omits
+// them is the AGGREGATING GATEWAY in front of them — SGLang's own Rust router
+// synthesizes {"id","object","owned_by":"local"} with no max_model_len — so an
+// empty field is a fact about the proxy and never a tiebreak about the engine.
 type ModelInfo struct {
 	ID      string
 	OwnedBy string
@@ -317,6 +416,48 @@ func (c *Client) ProbeModels(baseURL string) ([]ModelInfo, error) {
 		}
 	}
 	return infos, nil
+}
+
+// getJSON is a best-effort GET of one absolute URL on this client's HTTP client,
+// for doctor's reads of routes OUTSIDE /v1 (SGLang's /model_info and
+// /server_info). The error is typed so the caller can tell a 404 — "the gateway
+// does not proxy this path" — from a timeout, and nothing here is ever allowed to
+// influence a request body: the two callers are diagnostics.
+func (c *Client) getJSON(ctx context.Context, url string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{Status: resp.StatusCode, Body: string(raw), Endpoint: url}
+	}
+	return raw, nil
+}
+
+// engineRoot is BaseURL with a trailing /v1 trimmed, case-insensitively — the
+// prefix an engine's own informational routes would hang off. It is "" when
+// BaseURL does not end in /v1: lca cannot know a gateway's mount prefix, and
+// guessing one would send a request to a path nobody published.
+func engineRoot(baseURL string) string {
+	u := strings.TrimRight(baseURL, "/")
+	if len(u) < 3 || !strings.EqualFold(u[len(u)-3:], "/v1") {
+		return ""
+	}
+	return u[:len(u)-3]
 }
 
 // ProbeHealth checks whether an endpoint is reachable, independent of the model

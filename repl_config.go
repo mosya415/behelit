@@ -521,6 +521,11 @@ func (r *Repl) applyLive(s *setting, value string) error {
 		r.cfg = next
 		r.syncCfg()
 		return r.setTier(value)
+	case "engine":
+		r.cfg = next
+		r.syncCfg()
+		r.applyEngineChoice(next.Engine)
+		return nil
 	case "show_thinking":
 		r.sess.ShowThink = next.ShowThinking
 	case "loop":
@@ -536,6 +541,38 @@ func (r *Repl) applyLive(s *setting, value string) error {
 	r.syncCfg()
 	r.sess.RefreshSystem()
 	return nil
+}
+
+// applyEngineChoice puts /set engine in force now, on the endpoint and on the
+// clients already pointed at it. It is the operator's own answer, so it outranks
+// what /v1/models claimed — but not roles.yaml's models.<id>.engine, which is
+// also theirs and is about one model rather than the endpoint; when that is what
+// wins, the command says so instead of reporting a change that did not happen.
+//
+// "auto" forgets the setting and asks the endpoint again. Every other setting
+// here changes fields AFTER the cached prefix, and so does this one: the system
+// prompt and the tool schemas are byte-identical whatever the engine is.
+func (r *Repl) applyEngineChoice(v string) {
+	want := engineName(v)
+	if r.local != nil && r.local.provider != nil {
+		r.local.provider.Engine = want // the endpoint's own default, for every client built from it
+	}
+	for _, c := range []*Client{r.local, r.sess.client} {
+		if c == nil || c.provider == nil || !c.provider.selfHosted() {
+			continue
+		}
+		if want == "" {
+			c.resetEngine()
+			r.orch.providers.applyEngine(c)
+			r.orch.applyModelEngine(c) // the file still outranks the probe it just re-ran
+			continue
+		}
+		c.setEngine(want, EngineFromEndpoint)
+	}
+	if c := r.sess.client; want != "" && c != nil && c.Engine() != want {
+		hint("roles.yaml models.%s.engine says %s, and a per-model setting outranks the endpoint's — this session keeps %s",
+			c.Model(), c.Engine(), c.Engine())
+	}
 }
 
 // syncCfg pushes the session's configuration into the orchestrator every child
