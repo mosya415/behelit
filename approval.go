@@ -63,9 +63,35 @@ type Approver struct {
 	trusted  map[string]bool // trusted classes: "edit", "run", "web", …
 	all      bool            // "a" / -y: trust every class, including ones not listed
 	quiet    bool            // don't print auto-approvals (unattended runs: eval)
+	// noAsk is why there is nobody to ask: "stdin is not a terminal", "-json".
+	// Non-empty turns every question into an immediate refusal — see Confirm.
+	noAsk string
 	// interrupted: Ctrl-C was pressed at a question. The turn ends; the loop takes
 	// this with TakeInterrupt.
 	interrupted atomic.Bool
+}
+
+// Unattended records that no human can answer a question on this run, with the
+// reason to put in the refusal. Set from stdin not being a terminal, or from
+// -json, or by eval and workflow, which are unattended by construction.
+//
+// It is NOT the same thing as trust. -y grants edits, commands and fetches and
+// deliberately withholds mcp_write (see allClasses); a run with -y and nobody
+// watching still reached a door for a ticket write, and a door with no keyboard
+// behind it is a hang — in a cron job, a claimed ticket and a held worktree until
+// somebody notices in the morning. So the two live side by side: trust decides
+// what needs no answer, this decides what happens to the questions that remain.
+func (a *Approver) Unattended(why string) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.noAsk = why
+}
+
+// unattendedWhy is the reason, or "" when there is a human to ask.
+func (a *Approver) unattendedWhy() string {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	return a.noAsk
 }
 
 // TakeInterrupt reports (once) that the operator pressed Ctrl-C at a question.
@@ -157,6 +183,19 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 			sayLine(fmt.Sprintf(" %s%s %s  %s(auto-approved)%s", cFaint, gNone, header, cFaint, cReset))
 		}
 		return true, true
+	}
+	// No keyboard: refuse here, before a byte is read and before the door is
+	// drawn. This is the whole of "never wait for a human" — every question in the
+	// program that is a tool approval comes through here, and the ones that are
+	// not (the pickers, the wizard's yes/no, its text fields) refuse on
+	// in.IsTTY() before they read either. The caller turns this into the error the
+	// model sees and writes the audit line; this is the operator's copy, in the
+	// transcript, where "why did it not do the thing" gets answered.
+	if why := a.unattendedWhy(); why != "" {
+		if !a.quiet {
+			sayLine(fmt.Sprintf(" %s%s %s  %s(refused — %s)%s", cFaint, gDown, header, cFaint, why, cReset))
+		}
+		return false, false
 	}
 	// Hold the terminal while waiting, so concurrent subagent output can't
 	// scroll the prompt away.

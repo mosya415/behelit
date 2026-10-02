@@ -378,7 +378,16 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	all := fs.Bool("all", false, "probe every model in every chain, not just the first of each role")
 	tierFlag := fs.String("tier", "", "run every tier-declaring role on that chain (roles.yaml tiers:)")
 	memberFlag := fs.String("member", "", "probe only this member (roles.yaml members:)")
+	roleFlag := fs.String("role", "", "also print the sandbox, the budgets and the permission rules in force for this role")
 	mcpRefresh := fs.Bool("mcp-refresh", false, "rewrite .lca/mcp.lock.json from what each mcp server serves now")
+	// -y, because an `ask` verdict means two opposite things and the pipeline's own
+	// command line is the one where it means "allowed". Approver.Confirm checks
+	// Trusts() BEFORE it checks "nobody is here to ask", so with -y an ask is
+	// approved, not refused — and doctor, the tool the acceptance criterion names
+	// for reading a profile back, printed "asks — and an unattended run refuses
+	// every question" for exactly that case. An operator read it, concluded
+	// `git -C . push` would be refused, and shipped a run that pushes.
+	yesFlag := fs.Bool("y", false, "answer as `lca -y` would: an ask becomes an allow")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -592,6 +601,23 @@ func runDoctor(ctx context.Context, cfg Config, args []string) int {
 	// ask questions about a member, and two orchestrators could answer them
 	// differently.
 	orch := doctorOrchestrator(cfg, roles, mset)
+
+	// -role: the permissions in force, for the one role the operator asked about.
+	// A profile is only worth including if you can read back what it granted, and
+	// until now the only way to find out was to run the agent and see what it did.
+	if *roleFlag != "" {
+		switch {
+		case rerr != nil:
+			// The team file is already red above. Saying "no role coder" here as well
+			// would send the operator looking for a missing role when what they have is
+			// a file that does not parse.
+			section("permissions", faint("role %s", *roleFlag))
+			errLine("the team file did not load, so there are no role rules to report — fix the roles error above")
+			failed = true
+		case !reportPermissions(orch, roles, dfc, *roleFlag, *yesFlag):
+			failed = true
+		}
+	}
 
 	// A role's check_cmd meets the sandbox of the machine that role works on, not
 	// the team's: a verifier the allowlist refuses fails every delegation to that
@@ -1248,6 +1274,10 @@ func doctorOrchestrator(cfg Config, roles *RolesConfig, mset *MCPSet) *Orchestra
 		}
 	}
 	o.setFleet(roles)
+	// The run budgets as a run would resolve them with no flags: doctor's whole job
+	// is printing what is in force, and defaults.timeout is in force whether or not
+	// anybody remembers writing it.
+	o.budget, _ = newRunBudget(roles, 0, 0, 0)
 	jl, err := NewJail(cfg.Root, allowlistOf(cfg, roles), cfg.Unsafe)
 	if err != nil {
 		return nil
@@ -1469,4 +1499,177 @@ func thinkingExpected(prof ModelProfile, effort string) bool {
 		return false // hy3's no_think
 	}
 	return true
+}
+
+// permissionKeys is every permission a rule can name (permission.go), in the
+// order a reader wants them: what it may read and change, what it may run, what
+// it may reach, then the orchestration keys. doctor prints a row per key, so a
+// key missing from this list is a grant nobody can see.
+var permissionKeys = []string{
+	"read", "edit", "run", "web",
+	"mcp", "mcp_read", "mcp_write",
+	"task", "delegate", "skill", "todo", "doom_loop",
+}
+
+// reportPermissions is `lca doctor -role <name>`: the sandbox and the permission
+// rules in force for one role, in precedence order, with the layer each rule
+// came from.
+//
+// It exists because a sandbox profile you cannot read back is a profile nobody
+// should trust. Including examples/pipeline.roles.yaml is one line; being able to
+// answer "so can it push?" without running an agent and watching what it does is
+// what makes that line safe to type. The answer is computed by the SAME functions
+// the runtime uses — Evaluate, runAction, Disabled, the member's own jail — so a
+// row here that says deny is the decision a tool call will get, not a second
+// implementation of it that can drift.
+func reportPermissions(orch *Orchestrator, roles *RolesConfig, fc *FileConfig, role string, trustAll bool) bool {
+	section("permissions", faint("role %s", role))
+	if orch == nil {
+		errLine("cannot resolve the sandbox for this project")
+		return false
+	}
+	ag := orch.agents[role]
+	if ag == nil {
+		var names []string
+		if roles != nil {
+			for _, r := range roles.Roles {
+				names = append(names, r.Name)
+			}
+		}
+		errLine("no role %q", role)
+		if len(names) > 0 {
+			hint("roles.yaml defines: %s", strings.Join(names, ", "))
+		} else {
+			hint("this project has no roles.yaml — %s", "in a session: /setup"+gSep+"from the shell: lca init")
+		}
+		return false
+	}
+	// The user's global rules, from config.json. doctorOrchestrator does not carry
+	// them (it answers questions about members, not about permissions), so they are
+	// taken straight from the file config the caller already read — the same value
+	// NewOrchestrator assigns to o.userRules.
+	var userRules Ruleset
+	if fc != nil {
+		userRules = Ruleset(fc.Permission)
+	}
+	// The layers exactly as Session.rules() stacks them, lowest precedence first.
+	// The isolation layer is left out on purpose: it applies inside a delegate's
+	// scratch worktree, and what -role is asked about is the role as the pipeline
+	// calls it — a primary session in the project tree.
+	layers := []struct {
+		name string
+		set  Ruleset
+	}{
+		{"default", defaultRules()},
+		{"agent", ag.BaseRules},
+		{"config.json", userRules},
+		{"role", ag.Rules},
+	}
+	var sets []Ruleset
+	for _, l := range layers {
+		sets = append(sets, l.set)
+	}
+
+	mem := orch.memberFor(ag)
+	jl := orch.policyOf(mem)
+	row("member", mem.MemberName())
+	if jl != nil {
+		row("sandbox", strings.Join(jl.Allowed, ", "))
+		switch {
+		case jl.Unsafe:
+			warnLine("the sandbox is LIFTED (-unsafe): any path, any command")
+		case jl.Shell:
+			row("shell", "on"+faint(" — commands run through sh; every segment is still allowlisted"))
+		default:
+			row("shell", "off"+faint(" — one argv, no pipes or redirects"))
+		}
+	}
+	if orch.budget != nil {
+		row("budgets", orch.budget.describe())
+	}
+	// Whether a tool is offered to the model at all, which is a stronger statement
+	// than any one rule: a key denied outright is not in the request prefix.
+	var off []string
+	for _, k := range permissionKeys {
+		if Disabled(k, sets...) {
+			off = append(off, k)
+		}
+	}
+	if len(off) > 0 {
+		row("disabled", strings.Join(off, ", ")+faint(" — these tools are not offered to the model"))
+	}
+
+	// The standing posture per key: what an action nobody wrote a narrower rule
+	// about gets. "ask" in an unattended run is a refusal, which is why it is
+	// spelled out rather than left as the absence of a rule.
+	// The posture an actual Approver would take, asked of an actual Approver: -y
+	// is TrustAll(), and "does -y grant this class" has one answer, in
+	// Approver.Trusts. Reimplementing the rule here — "is it in allClasses" —
+	// gets doom_loop, task and skill wrong, because -y trusts every class except
+	// mcp_write and allClasses is only what the "a" key lists.
+	ap := NewApprover(newStringInput(""))
+	if trustAll {
+		ap.TrustAll()
+	}
+	ap.Unattended("doctor is reporting what an unattended run would get")
+	var rows [][]string
+	for _, k := range permissionKeys {
+		act := Evaluate(k, "*", sets...)
+		rows = append(rows, []string{k, string(act), permNote(k, act, ap)})
+	}
+	table([]string{"permission", "action for *", "note"}, rows, 0)
+	if !trustAll {
+		hint("this is the posture WITHOUT -y; `lca doctor -role %s -y` shows what the pipeline's own command line grants", role)
+	}
+
+	// Then every rule, in the order the runtime reads them, with its layer. Last
+	// match wins, so the bottom of this table is the policy and the top is what it
+	// overrides — which is the one thing a profile's author has to get right.
+	rows = nil
+	for _, l := range layers {
+		for _, r := range l.set {
+			rows = append(rows, []string{l.name, r.Permission, r.Pattern, string(r.Action)})
+		}
+	}
+	if len(rows) == 0 {
+		warnLine("no rules at all — every side effect asks, which in an unattended run is a refusal")
+		return true
+	}
+	table([]string{"layer", "permission", "pattern", "action"}, rows, 0)
+	hint("last match wins: a rule lower in this table overrides one above it")
+	// The member leg crosses a login shell, so a line's segments are each
+	// evaluated there (permission.go runAction). Saying so is the difference
+	// between "git push is denied" and "git push is denied wherever this role runs".
+	if mem != nil && !mem.IsLocal() {
+		hint("on member %s a shell splits the command line, so every segment of it is checked against these rules", mem.MemberName())
+	}
+	return true
+}
+
+// permNote says what an action MEANS for the key, where that is not obvious from
+// the word. Only where it is not obvious: a note on every row is a column nobody
+// reads.
+func permNote(key string, act Action, ap *Approver) string {
+	// An `ask` is the one row that must not read like a refusal when it is not
+	// one. Confirm consults TRUST before it consults "there is nobody here to
+	// ask", so under -y an ask for a trusted class is an ALLOW — and the
+	// pipeline's own command line is `lca -y …`. mcp_write is the deliberate
+	// exception (approval.go): -y does not grant it, so an ask there really is
+	// refused in an unattended run. The question is put to an Approver rather than
+	// answered here, so this cannot drift from what a tool call gets.
+	asked := "asks — and an unattended run refuses every question"
+	if ap != nil && ap.Trusts(key) {
+		asked = "ALLOWED — -y trusts this class, and trust is consulted before \"nobody is here to ask\""
+	}
+	switch {
+	case act == Deny && key == "web":
+		return faint("webfetch is off")
+	case act == Deny:
+		return faint("refused, and the model is told so")
+	case act == Ask:
+		return faint("%s", asked)
+	case key == "mcp_write" && act == Allow:
+		return faint("writes through MCP run unasked — check this is what you meant")
+	}
+	return ""
 }

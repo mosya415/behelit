@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	// The theme is resolved before anything can print. usage() and fatal() write
+	// The theme is resolved before anything can print. usage() and fatalCode() write
 	// chrome to stderr and can fire before the config is read, and a run whose
 	// stdout is a pipe must not have put an escape in it by then.
 	applyTheme("")
@@ -32,6 +32,8 @@ func main() {
 			os.Exit(runDoctor(context.Background(), cfg, os.Args[2:]))
 		case "report":
 			os.Exit(runReport(cfg, os.Args[2:]))
+		case "version", "--version":
+			os.Exit(runVersion(cfg, os.Args[2:]))
 		// clean and merge are the two things only a human does, so they are
 		// subcommands and not tools: removing what a session left behind, and
 		// finishing a merge a model was told to hand over. Neither of them talks to
@@ -55,9 +57,73 @@ func main() {
 	modelFlag := flag.String("model", "", "")
 	checkFlag := flag.String("check", "", "")
 	tierFlag := flag.String("tier", "", "")
+	// A flag.Value and not flag.String, so a SECOND -prompt-file is a usage error
+	// rather than the quiet winner. A wrapper whose base command already carries
+	// `-prompt-file ticket.md` and which appends a per-role `-prompt-file
+	// review.md` ran the review prompt against the ticket's worktree, reported
+	// `passed` on a green check, and had the wrapper commit, push and open a merge
+	// request for work nobody asked for. The sibling mistake — -prompt-file plus a
+	// positional — was already refused, and resolvePrompt's own comment gives the
+	// principle: a wrapper that passes both has a bug.
+	promptFile := &oncePath{flag: "-prompt-file"}
+	flag.Var(promptFile, "prompt-file", "")
+	jsonFlag := flag.Bool("json", false, "")
+	// The run's budgets and its closing summary. -timeout and -summary describe
+	// one RUN and are refused below when there is no task: a -timeout silently
+	// ignored by an interactive session is the kind of flag a wrapper keeps passing
+	// for a year while nothing enforces it. The two ceilings are meaningful in a
+	// session too — they bound each turn and its subagents — so they are not.
+	timeoutFlag := flag.Duration("timeout", 0, "")
+	maxStepsFlag := flag.Int("max-steps", 0, "")
+	maxTokensFlag := flag.Int("max-tokens", 0, "")
+	summaryFlag := flag.String("summary", "", "")
 	flag.Usage = usage
+	// flag's own parse failure already exits 2, which is the table's "lca was
+	// called wrong" — the same code the two usage errors below produce.
 	flag.Parse()
-	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
+
+	// Under -json stdout belongs to the caller's parser and to nothing else. The
+	// whole tree prints through fmt.Print*, which reaches os.Stdout as a variable,
+	// so moving the variable moves every note, warning, door, tool line and the
+	// model's own prose to stderr in one move — and the result object is written to
+	// the descriptor stdout WAS. Colour goes too: a program reading stderr for a
+	// log should not have to strip escapes.
+	result := os.Stdout
+	if *jsonFlag {
+		os.Stdout = os.Stderr
+		applyTheme(themePlain)
+	}
+
+	perr := checkTrailingFlags(flag.Args(), os.Args)
+	var prompt string
+	if perr == nil {
+		prompt, perr = resolvePrompt(flag.Args(), promptFile.val, os.Stdin)
+	}
+	if perr == nil && *jsonFlag && prompt == "" {
+		perr = usageErrf("-json reports one task's result: give the task as an argument, or with -prompt-file")
+	}
+	if perr == nil && prompt == "" {
+		switch {
+		case *timeoutFlag != 0:
+			perr = usageErrf("-timeout bounds one run: give the task as an argument, or with -prompt-file")
+		case *summaryFlag != "":
+			perr = usageErrf("-summary is written at the end of one run: give the task as an argument, or with -prompt-file")
+		}
+	}
+	// A -summary path that cannot be written is discovered at the END of the run
+	// otherwise — after the work, after the check and after one more model call
+	// bought to write a file that then goes nowhere. The commonest shape is a
+	// wrapper interpolating an empty variable, so `-summary $WORKTREE/summary.md`
+	// becomes `/summary.md`: MkdirAll("/") succeeds, the write gets EACCES, and the
+	// run reports `passed` / exit 0 with an empty merge request description and
+	// nothing alerting anybody. Probing it here makes it row 2, before the gateway
+	// is touched.
+	if perr == nil && prompt != "" && *summaryFlag != "" {
+		perr = probeWritable(*summaryFlag, "-summary")
+	}
+	if perr != nil {
+		fatalCode(exitUsage, perr)
+	}
 
 	cfg.Unsafe = cfg.Unsafe || *unsafe
 	if *tierFlag != "" {
@@ -76,10 +142,30 @@ func main() {
 		ap.TrustAll()
 		mark(cfgSrc, "approve", SrcFlag, "-y")
 	}
+	// Nobody at the keyboard: every question becomes an immediate, recorded
+	// refusal. -y does not cover this — it deliberately does not grant mcp_write,
+	// and that door would have been the one thing left waiting for an answer that
+	// is never typed. A hang in a cron job is a worktree and a claimed ticket held
+	// until somebody notices.
+	if *jsonFlag {
+		ap.Unattended("-json: this run answers to a program, not to a person")
+	} else if !in.IsTTY() {
+		ap.Unattended("stdin is not a terminal")
+	}
 	orch, err := setupOrchestrator(cfg, ap, os.Getenv("LCA_TRACE"))
 	if err != nil {
-		fatal(err)
+		// Not 1, which every startup failure used to be: a roles.yaml that will not
+		// parse or a config file with an
+		// unknown key is the table's row 2 — alert somebody, do not touch the ticket.
+		fatalCode(exitUsage, err)
 	}
+	// The budgets after the orchestrator, because roles.yaml's defaults: are the
+	// floor the flags override and the file has only just been read.
+	budget, berr := newRunBudget(orch.roles, *timeoutFlag, *maxStepsFlag, *maxTokensFlag)
+	if berr != nil {
+		fatalCode(exitUsage, berr)
+	}
+	orch.budget, orch.summary = budget, *summaryFlag
 	defer orch.rec.Close()
 	defer orch.tracer.Close()
 	// A stdio MCP server is a child process of ours: reap it on the way out, the
@@ -104,7 +190,9 @@ func main() {
 	agentName = firstNonEmpty(agentName, cfg.Agent)
 	sess, err := orch.NewPrimary(agentName, ref, nil)
 	if err != nil {
-		fatal(err)
+		// An unknown role or an unknown model is a name in a file or on the command
+		// line, not a failure of the task: row 2 again.
+		fatalCode(exitUsage, err)
 	}
 	sess.view = newTermView(sess)
 	sess.Loop, sess.ShowThink, sess.Raw = cfg.Loop, cfg.ShowThinking, cfg.Raw
@@ -127,7 +215,7 @@ func main() {
 	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions)
 
 	if prompt != "" {
-		code := oneShot(orch, sess, prompt, *checkFlag, append(notes, orch.warnings...))
+		code := oneShot(orch, sess, prompt, *checkFlag, *jsonFlag, result, append(notes, orch.warnings...))
 		// os.Exit runs no defers, and a one-shot has the same things to close as a
 		// session: the stdio MCP children first, because they are PROCESSES and a leaked
 		// one outlives lca along with its process group, then the trace and the audit
@@ -157,47 +245,16 @@ func main() {
 	r.Loop()
 }
 
-// oneShot runs a single task and returns the exit code. stdout carries only
-// the answer; notes and the verdict go to stderr. With -check the verifier,
-// not the model, decides success.
-func oneShot(orch *Orchestrator, sess *Session, prompt, check string, notes []string) int {
-	for _, n := range notes {
-		// reconcileModel() hands these back pre-coloured for the banner's
-		// contValue() rows, so they are stripped on the way to a stderr that may
-		// well be a file. The theme already makes a piped run plain; this is the
-		// case it cannot see, a terminal stdout with stderr redirected.
-		fmt.Fprintln(os.Stderr, stripANSI(n))
-	}
-	orch.rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
-	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: prompt})
-	if check == "" {
-		err := sess.Run(context.Background())
-		sess.saveTranscript()
-		if err != nil {
-			return 1
-		}
-		return 0
-	}
-	start := time.Now()
-	v := sess.RunVerified(context.Background(), check, orch.verifyAttempts())
-	sess.traceTask(prompt, v, check, 0, 0, false, nil, start, "")
-	sess.saveTranscript()
-	fmt.Fprintf(os.Stderr, "\n%s  %s\n", statusWord(v.Status), faint("%s"+gSep+"%s", check, plural(v.Attempts, "attempt", "attempts")))
-	if v.Status != "passed" {
-		if v.Tail != "" {
-			fmt.Fprintln(os.Stderr, v.Tail)
-		}
-		return 1
-	}
-	return 0
-}
-
-func fatal(err error) {
+// fatalCode prints and exits with the code the pipeline's table gives the
+// reason: 2 for "lca was called wrong, or configured wrong". The message goes to
+// stderr, which is where it goes under -json too, because stdout there carries
+// the result object and nothing else — and a run that dies here has no result.
+func fatalCode(code int, err error) {
 	fmt.Fprintln(os.Stderr, cRed+gDown+cReset+" "+err.Error())
 	if h := errorHint(err); h != "" {
 		fmt.Fprintln(os.Stderr, cFaint+gHint+" "+h+cReset)
 	}
-	os.Exit(1)
+	os.Exit(code)
 }
 
 // setupOrchestrator builds everything a run needs from cfg: jail (with the
@@ -290,11 +347,16 @@ func usage() {
 		"   lca                          interactive session",
 		"   lca \"<task>\"                 run one task and exit",
 		"   lca -check \"<cmd>\" \"<task>\"  run one task; succeed only if <cmd> passes",
+		"   lca -prompt-file t.md        take the task from a file (- = stdin), not from argv",
+		"   lca -json …                  one JSON result object on stdout, everything else on stderr",
 		"   lca init                     create .lca/roles.yaml from the gateway's models",
 		"   lca doctor                   check gateway, roles, tool calls, members, workflows",
+		"   lca doctor -role <name>      also the sandbox and permission rules in force for that role",
+		"   lca doctor -role <name> -y   the same, answered as `lca -y` would: an ask becomes an allow",
 		"   lca run <name>               run a workflow (deterministic steps; -list, -dry-run)",
 		"   lca eval tasks/              run evaluation tasks (see README)",
 		"   lca report                   render the newest trace as one HTML file",
+		"   lca version                  the build's sha and the hash of the roles.yaml in force",
 		"   lca merge <branch>           check a delegation's branch out as a real merge (apply: branch)",
 		"   lca clean [--branches]       remove what dead sessions left behind",
 		"",
@@ -302,6 +364,13 @@ func usage() {
 		"   -role <name>                 role (roles.yaml) or agent to run as",
 		"   -model <name>                model override: gateway name or provider/model",
 		"   -tier <name>                 run every tier-declaring role on that chain (roles.yaml tiers:)",
+		"   -prompt-file <path>          read the task from a file, or from stdin with -",
+		"   -json                        result object on stdout; exit 0 passed, 1 failed, 2 usage,",
+		"                                3 infra, 4 budget, 130 cancelled",
+		"   -timeout <dur>               budget for the whole run; exceeding it is exit 4",
+		"   -max-steps <n>               step ceiling for the run, over every role's own",
+		"   -max-tokens <n>              prompt+completion ceiling for the run, subagents included",
+		"   -summary <path.md>           write a short markdown summary of the run there",
 		"   -y                           approve edits, commands and fetches without asking",
 		"   -resume                      continue the most recent session",
 		"   -unsafe                      lift the sandbox (any path, any command)",

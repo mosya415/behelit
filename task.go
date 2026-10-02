@@ -116,7 +116,10 @@ func runTaskTool(tc *ToolCtx, a Args) string {
 		child.view = newChildView(child, true)
 		child.background = true
 		go func() {
-			res := o.runChild(context.Background(), child)
+			// The RUN's context, not a detached one: a background subagent is the one
+			// child a budget could not reach, so its `cargo build` outlived the run
+			// that started it with nobody left to read the output.
+			res := o.runChild(o.runContext(), child)
 			s.deliver(res)
 		}()
 		return fmt.Sprintf("<task id=%q agent=%q state=\"running\">\nStarted in the background. Its result will be delivered automatically when it finishes — do not wait or poll; continue with other work, or end your reply if nothing else remains.\n</task>", child.ID, name)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -89,15 +90,44 @@ func (r *Recorder) Event(kind string, fields map[string]any) {
 }
 
 // Transcript rewrites the session file with the current message list.
-func (r *Recorder) Transcript(msgs []Message) {
+//
+// It RETURNS the failure now, and writes through a temporary file. The old
+// shape — os.WriteFile with its error discarded — was two problems in one line.
+// O_TRUNC comes first, so on ENOSPC, EDQUOT or a read-only state directory the
+// previous good transcript was destroyed and nothing was written in its place;
+// and nobody was told, so the run reported `status: passed` with the path of a
+// 0-byte file, and the wrapper attached that to the ticket as the record of the
+// run. Writing beside it and renaming makes a failed write leave the last good
+// transcript standing, which is the only outcome where something is still
+// readable afterwards.
+func (r *Recorder) Transcript(msgs []Message) error {
 	if r == nil {
-		return
+		return nil
 	}
 	data, err := json.MarshalIndent(msgs, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	os.WriteFile(r.session, data, 0o600)
+	return writeRecordAtomic(r.session, data, 0o600)
+}
+
+// writeRecordAtomic writes one of the recorder's own files through a temporary
+// file beside it and renames it over the target, so a write that fails halfway
+// cannot destroy what was there. It is deliberately not edit.go's
+// writeFileAtomic: that one is for files in the USER's repository and carries
+// their mode, their owner and their symlinks across. These are lca's own, in
+// lca's own state directory, and the only thing they need is that a failure
+// leaves the last good copy standing.
+func writeRecordAtomic(path string, data []byte, perm fs.FileMode) error {
+	tmp, err := tempBeside(path, data, perm)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // ChildTranscript writes a subagent session's transcript beside the main one
@@ -113,7 +143,7 @@ func (r *Recorder) ChildTranscript(taskID string, msgs []Message) {
 	}
 	p := childTranscriptPath(r.dir, r.id, taskID)
 	os.MkdirAll(filepath.Dir(p), 0o700)
-	os.WriteFile(p, data, 0o600)
+	writeRecordAtomic(p, data, 0o600)
 }
 
 func (r *Recorder) SessionPath() string { return r.session }

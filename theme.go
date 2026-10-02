@@ -618,7 +618,7 @@ func themeFor(pref string, c termCaps) Theme {
 
 // applyTheme resolves the preference against this terminal and installs the
 // result. It is called twice at startup — once before the config is read, so
-// usage() and fatal() are already honest, and once after, so the `theme` key
+// usage() and fatalCode() are already honest, and once after, so the `theme` key
 // takes effect — and again on /theme, which is why it returns what it chose.
 func applyTheme(pref string) Theme {
 	t := themeFor(pref, detectCaps())

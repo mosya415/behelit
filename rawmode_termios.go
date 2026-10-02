@@ -51,6 +51,18 @@ func makeTurnMode(fd int) (func(), error) {
 	return func() { ioctlTermios(fd, termiosSet, &old) }, nil
 }
 
+// isTerminal reports whether fd has a terminal behind it. The cheapest honest
+// test there is: ask for the line discipline and see whether the kernel has one
+// to give. Nothing is changed and nothing is read, so it is safe on a descriptor
+// a prompt is about to use.
+func isTerminal(fd int) bool {
+	if fd < 0 {
+		return false
+	}
+	var t syscall.Termios
+	return ioctlTermios(fd, termiosGet, &t) == nil
+}
+
 func ioctlTermios(fd int, req uint, t *syscall.Termios) error {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(req), uintptr(unsafe.Pointer(t)))
 	if errno != 0 {

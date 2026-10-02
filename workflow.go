@@ -1774,6 +1774,20 @@ func (r *wfRunner) shellStep(ctx context.Context, s *WorkflowStep, cmd string, t
 		return why, -1
 	}
 	jl := r.orch.policyOf(mem)
+	// The permission rules, before either leg. A workflow step used to be checked
+	// by the jail allowlist alone, so every deny in a profile was inert for
+	// `lca run`: `git` is on the pipeline profile's allowlist, and a step reading
+	// `run: git push origin HEAD:refs/heads/x` ran and PUSHED — locally and on a
+	// member. The same line through the model's run_command was correctly refused,
+	// so the boundary held for one caller and not the other, which is the worst
+	// shape for a boundary to have. A step is authored in a file like a check_cmd,
+	// but a profile that says its rules "apply to EVERY role" has to mean it, and
+	// the wrapper owns pushing whoever typed the line.
+	if act := runAction(cmd, mem.Rem != nil || jl.Unsafe || jl.Shell, r.orch.stepRules()...); act == Deny {
+		why := fmt.Sprintf("denied by a permission rule (run: %q)", cmd)
+		r.log.line(why)
+		return why, -1
+	}
 	if rem := mem.Rem; rem != nil {
 		// The gate is inside Remote.run too, but a step's refusal has to reach
 		// run.log: nothing streamed, so this is the only place it can be written.
@@ -2427,13 +2441,18 @@ func runWorkflow(cfg Config, args []string) int {
 	}
 	effective := wf.effectiveVars(cliVars)
 
-	ap := NewApprover(NewInput(os.Stdin))
+	wfIn := NewInput(os.Stdin)
+	ap := NewApprover(wfIn)
 	if !*ask {
 		// Unattended by default: every action in a workflow was authored in a
 		// file, exactly like a check_cmd. The sandbox, the GPU policy and the
 		// deny rules still hold, so a diff touching a denied path still blocks.
 		ap.TrustAll()
 		ap.quiet = true
+		ap.Unattended("lca run is unattended unless -ask is given")
+	} else if !wfIn.IsTTY() {
+		// -ask with no terminal asked for questions nobody can answer.
+		ap.Unattended("-ask was given, but stdin is not a terminal")
 	}
 	orch, err := setupOrchestrator(cfg, ap, os.Getenv("LCA_TRACE"))
 	if err != nil {
@@ -2532,8 +2551,27 @@ func runWorkflow(cfg Config, args []string) int {
 			}
 		}
 	}
+	// roles.yaml's defaults: bound this run too. `lca run` used to leave
+	// orch.budget nil, and every method on it is nil-safe, so a team's
+	// max_steps / max_tokens evaluated to "no ceiling" with nothing said — on the
+	// one caller that is unattended by construction. The clock is deliberately
+	// left to the steps' own timeouts, which are what a workflow author writes.
+	if b, err := newRunBudget(orch.roles, 0, 0, 0); err == nil {
+		// The CLOCK is dropped on purpose, and it is the one ceiling of the three
+		// that would change what a workflow means. A workflow's units of time are
+		// its steps' own `timeout:`, which its author wrote next to a build and a
+		// deploy; a 45-minute defaults: timeout — the pipeline profile's value —
+		// would cancel a legitimate four-step stand run halfway through, which is a
+		// worse outcome than the loop it was protecting against. The step and token
+		// ceilings bound the thing that actually runs away: a model.
+		b.timeout = 0
+		orch.budget = b
+	}
+	wfCtx, wfCancel := orch.budget.start(context.Background())
+	defer wfCancel()
+	orch.setRunContext(wfCtx)
 	orch.rec.Event("workflow_start", map[string]any{"workflow": wf.Name, "run": st.Run, "steps": len(wf.Steps), "resume": *resume})
-	code := runner.Run(context.Background())
+	code := runner.Run(wfCtx)
 	orch.rec.Event("workflow_end", map[string]any{"workflow": wf.Name, "run": st.Run, "status": st.Status, "exit": code})
 	return code
 }

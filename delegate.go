@@ -301,7 +301,7 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 	}
 	for _, c := range checks {
 		if err := checkOn(o.policyOf(target), target, c); err != nil {
-			return marshalDelegate(delegateResult{Status: "error", TestTail: "check_cmd rejected by the sandbox: " + err.Error()})
+			return marshalDelegate(delegateResult{Status: "error", TestTail: "check_cmd refused before it ran: " + err.Error()})
 		}
 	}
 	if msg, ok := tc.Ask("delegate", roleName, "DELEGATE "+roleName, "  "+truncate(task, 300)+"\n  check: "+orNone(check)); !ok {
@@ -381,6 +381,10 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 		return marshalDelegate(delegateResult{Status: "error", TestTail: "cannot create a worktree: " + err.Error()})
 	}
 	wt.mem = target // createOn already knows; create does not, and heads() names it
+	// The RUN's context and not tc.Ctx: the integration legs below run after the
+	// subagent returned, and tc.Ctx is this tool call's. The run's is what carries
+	// the deadline every leg has to answer to.
+	wt.ctx = o.runContext()
 	if !sameTree {
 		// git diff paths are repository-relative, so the subagent's project must
 		// sit at the same place in its repository as the caller's does in the
@@ -557,6 +561,13 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 			}
 		}
 	}
+	if applied {
+		// The run's own account of what it changed, for files_changed and diff_bytes
+		// in the result object. The merge (or the patch) is a git operation, so it
+		// never enters the tool-level change log the caller's /undo reads — and the
+		// wrapper's only question of that field is "is there anything to commit".
+		o.noteApplied(s.jail().Root, wt.changedFiles, len(diff))
+	}
 	callerMember := ""
 	if !sameTree {
 		callerMember = caller.MemberName()
@@ -616,6 +627,23 @@ type worktree struct {
 	base         string   // snapshot commit
 	branch       string   // real branch this worktree is on ("" = detached, today's default)
 	changedFiles []string // relative to the jail root
+	// ctx is the RUN's context, kept because the integration legs below run after
+	// the subagent has returned and the caller's own ctx is out of scope by then.
+	// They used context.Background() with 5- and 10-minute per-call timeouts, which
+	// made the per-call timeout the only bound on them: `-timeout 30s` on a role
+	// with a member exited ten minutes late, asking an ssh that had gone away for a
+	// diff — twenty times the slack the criterion allows. The per-call timeouts are
+	// still there as the inner bound.
+	ctx context.Context
+}
+
+// runCtx is w.ctx, or Background for a worktree built before anything set one
+// (every test harness that constructs one by hand).
+func (w *worktree) runCtx() context.Context {
+	if w == nil || w.ctx == nil {
+		return context.Background()
+	}
+	return w.ctx
 }
 
 // pathspec limits git to the caller's jail: a subagent's changes above its
@@ -653,18 +681,45 @@ func layoutWord(sub string) string {
 	return sub
 }
 
+// gitCmdTimeout is the bound on one local git invocation when the caller has no
+// context to offer. It is generous — a `git add -A` over a large tree, or an
+// apply of a megabyte patch, is slow and legitimate — and it exists because the
+// alternative is unbounded: a `git commit` that meets commit.gpgsign and a
+// pinentry used to wait forever, which in a cron job is a held worktree and a
+// claimed ticket until somebody looks.
+const gitCmdTimeout = 10 * time.Minute
+
 func gitCmd(dir string, env []string, stdin []byte, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	return gitCmdIn(context.Background(), dir, env, stdin, args...)
+}
+
+// gitCmdIn is gitCmd with the caller's context, which is what lets the RUN's
+// deadline reach a git invocation. Every leg that has a context in reach passes
+// it: the worktree's diff, apply, heads and removal, and the per-attempt commit
+// under `apply: branch`. The per-call timeout stays as the inner bound, so a
+// caller with no deadline of its own is still bounded.
+func gitCmdIn(ctx context.Context, dir string, env []string, stdin []byte, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(noPromptEnv(), env...)
 	cmd.Env = append(cmd.Env, "GIT_AUTHOR_NAME=lca", "GIT_AUTHOR_EMAIL=lca@localhost",
-		"GIT_COMMITTER_NAME=lca", "GIT_COMMITTER_EMAIL=lca@localhost", "GIT_TERMINAL_PROMPT=0")
+		"GIT_COMMITTER_NAME=lca", "GIT_COMMITTER_EMAIL=lca@localhost")
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
+	// Its own session, so the whole group is reaped on cancellation and — the
+	// reason this matters here — so no child of it has a controlling terminal to
+	// ask a question on. GIT_TERMINAL_PROMPT and the two askpass variables come
+	// from noPromptEnv above; gpg's pinentry respects neither and opens /dev/tty.
+	inProcessGroup(cmd)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return out.String(), fmt.Errorf("git %s: %v", strings.Join(args, " "), ctx.Err())
+		}
 		return out.String(), fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
 	}
 	return out.String(), nil
@@ -913,10 +968,10 @@ func (w *worktree) diff() (string, int, error) {
 	if w.rem != nil {
 		return w.diffOn()
 	}
-	if _, err := gitCmd(w.dir, nil, nil, "add", "-A"); err != nil {
+	if _, err := gitCmdIn(w.runCtx(), w.dir, nil, nil, "add", "-A"); err != nil {
 		return "", 0, err
 	}
-	names, err := gitCmd(w.dir, nil, nil, append([]string{"diff", "--cached", "--name-only", w.base}, w.pathspec()...)...)
+	names, err := gitCmdIn(w.runCtx(), w.dir, nil, nil, append([]string{"diff", "--cached", "--name-only", w.base}, w.pathspec()...)...)
 	if err != nil {
 		return "", 0, err
 	}
@@ -929,7 +984,7 @@ func (w *worktree) diff() (string, int, error) {
 			w.changedFiles = append(w.changedFiles, n)
 		}
 	}
-	d, err := gitCmd(w.dir, nil, nil, append([]string{"diff", "--cached", "--binary", w.base}, w.pathspec()...)...)
+	d, err := gitCmdIn(w.runCtx(), w.dir, nil, nil, append([]string{"diff", "--cached", "--binary", w.base}, w.pathspec()...)...)
 	return d, len(w.changedFiles), err
 }
 
@@ -943,10 +998,10 @@ func (w *worktree) diff() (string, int, error) {
 // paths is `diff --cached --binary <base>` itself, with its a/… b/… prefixes:
 // paths are repository-relative, which is also why the layout guard exists.
 //
-// There is no ctx here because diff()'s signature is the one the caller already
-// has; plumb's own timeout is the bound.
+// The context is the RUN's, carried on the worktree (diff()'s signature is the
+// one the caller already has), with plumb's own timeout as the inner bound.
 func (w *worktree) diffOn() (string, int, error) {
-	ctx := context.Background()
+	ctx := w.runCtx()
 	git := "git -c core.quotepath=false -c core.autocrlf=false "
 	names, errs, exit := w.rem.plumb(ctx, "git add -A && "+git+"diff --cached --name-only "+shellQuote(w.base)+w.pathspecSh(), nil, 10*time.Minute)
 	if exit != 0 {
@@ -995,17 +1050,17 @@ func (w *worktree) applyTo(jailRoot, diff string) error {
 		rem := w.caller.Rem.withDir(top)
 		git := "git -c core.quotepath=false -c core.autocrlf=false apply"
 		for _, args := range []string{" --check --binary -", " --binary -"} {
-			out, errs, exit := rem.plumb(context.Background(), git+args, []byte(diff), 10*time.Minute)
+			out, errs, exit := rem.plumb(w.runCtx(), git+args, []byte(diff), 10*time.Minute)
 			if exit != 0 {
 				return fmt.Errorf("%s", strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 6, 800)))
 			}
 		}
 		return nil
 	}
-	if _, err := gitCmd(top, nil, []byte(diff), "apply", "--check", "--binary", "-"); err != nil {
+	if _, err := gitCmdIn(w.runCtx(), top, nil, []byte(diff), "apply", "--check", "--binary", "-"); err != nil {
 		return err
 	}
-	_, err := gitCmd(top, nil, []byte(diff), "apply", "--binary", "-")
+	_, err := gitCmdIn(w.runCtx(), top, nil, []byte(diff), "apply", "--binary", "-")
 	return err
 }
 
@@ -1015,10 +1070,10 @@ func (w *worktree) applyTo(jailRoot, diff string) error {
 func (w *worktree) heads(role string) string {
 	short := func(m *Member, dir string) string {
 		if m.IsLocal() {
-			out, _ := gitCmd(dir, nil, nil, "rev-parse", "--short", "HEAD")
+			out, _ := gitCmdIn(w.runCtx(), dir, nil, nil, "rev-parse", "--short", "HEAD")
 			return strings.TrimSpace(out)
 		}
-		out, _, _ := m.Rem.withDir(dir).plumb(context.Background(), "git rev-parse --short HEAD", nil, time.Minute)
+		out, _, _ := m.Rem.withDir(dir).plumb(w.runCtx(), "git rev-parse --short HEAD", nil, time.Minute)
 		return strings.TrimSpace(out)
 	}
 	caller := w.caller
@@ -1040,6 +1095,10 @@ func (w *worktree) removeLocked() {
 		// No `worktree prune` on a member: prune is safe locally because
 		// worktrees.mu serialises it, but across two lca processes it can prune a
 		// worktree another has just added.
+		// Deliberately NOT the run context: this is the cleanup, and it runs most
+		// often precisely because the run was cancelled. Hung off a cancelled
+		// context it would return instantly and leave the worktree — and on a member,
+		// a directory nothing else will ever remove. Its own timeout is the bound.
 		w.mem.Rem.plumb(context.Background(), "git -C "+shellQuote(w.top)+" worktree remove --force "+shellQuote(w.dir)+
 			" >/dev/null 2>&1 || rm -rf "+shellQuote(w.dir), nil, 5*time.Minute)
 		return

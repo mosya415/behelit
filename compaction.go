@@ -78,6 +78,17 @@ func (s *Session) Compact(ctx context.Context, auto bool) error {
 		{Role: "user", Content: prompt},
 	}, Thinking: cs.thinking()}, StreamSink{})
 	cs.traceTurn(0, res, fb, start, nil, err)
+	// Counted, because this is the single most expensive request a long run makes:
+	// the whole conversation goes up as the prompt. Uncounted, a run that
+	// auto-compacted three times against a 120 KB window spent roughly 360k prompt
+	// tokens on the operator's GPUs that -max-tokens never saw and the ticket's
+	// cost line never mentioned — and the compactor may be a different role
+	// ("cheap"), whose own session's stats go nowhere at all, which is why the
+	// budget is the thing that has to hold them.
+	s.orch.budget.spend(res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens)
+	s.stats.PromptTokens += res.Usage.PromptTokens
+	s.stats.CachedTokens += res.Usage.CachedTokens
+	s.stats.OutputTokens += res.Usage.CompletionTokens
 	summary := strings.TrimSpace(reThinkBlock.ReplaceAllString(res.Content, ""))
 	if err != nil {
 		return err

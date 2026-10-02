@@ -104,7 +104,14 @@ defaults:
   context: 128000
   steps: 50
   verify_attempts: 2   # failing check output is fed back this many times in total
-  check_timeout: 900   # seconds
+  check_timeout: 900   # seconds, for ONE check
+  # The whole run's ceilings, for an unattended one-shot: nobody is watching, and
+  # `steps` alone bounds nothing — an agent that re-reads three files ends every
+  # turn inside its step budget. -timeout / -max-steps / -max-tokens override
+  # these; exceeding any of them is status budget_exceeded and exit 4.
+  # timeout: 45m       # wall clock, the check and the closing summary included
+  # max_steps: 200     # over every role's own steps:
+  # max_tokens: 4000000  # prompt+completion across the run, subagents included
   # review: reviewer   # a team-wide second opinion; per-role review: wins
   # member: build-box  # where roles that name no member: work
 

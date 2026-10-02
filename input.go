@@ -44,9 +44,14 @@ type Input struct {
 
 func NewInput(f *os.File) *Input {
 	in := &Input{f: f}
-	if st, err := f.Stat(); err == nil {
-		in.tty = st.Mode()&os.ModeCharDevice != 0 && osTermWidth() > 0
-	}
+	// isTerminal and not Stat()'s ModeCharDevice: /dev/null is a character device
+	// too, so a run started with `</dev/null` in a terminal answered IsTTY true —
+	// and every picker, every wizard question and the setup offer believed there
+	// was somebody there. They read instead of refusing, got an immediate EOF, and
+	// reported it as "cancelled" with nothing written down. The termios ioctl is
+	// the question actually being asked: is there a line discipline behind this
+	// descriptor.
+	in.tty = isTerminal(in.fd()) && osTermWidth() > 0
 	return in
 }
 

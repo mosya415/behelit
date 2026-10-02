@@ -346,11 +346,37 @@ func runCommand(parent context.Context, j *Jail, cmdline string, timeout time.Du
 // sandbox: {shell: true}), so pipes, redirects and && work; otherwise exec
 // directly, with no shell to interpret anything.
 func commandFor(ctx context.Context, j *Jail, cmdline string) *exec.Cmd {
+	var cmd *exec.Cmd
 	if j.Unsafe || j.Shell {
-		return exec.CommandContext(ctx, "sh", "-c", cmdline)
+		cmd = exec.CommandContext(ctx, "sh", "-c", cmdline)
+	} else {
+		argv, _ := tokenize(cmdline) // validated by CheckCommand
+		cmd = exec.CommandContext(ctx, argv[0], argv[1:]...)
 	}
-	argv, _ := tokenize(cmdline) // validated by CheckCommand
-	return exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = noPromptEnv()
+	return cmd
+}
+
+// noPromptEnv is the environment with every "ask the operator" door shut.
+//
+// lca's own git plumbing already knows this hazard and sets GIT_TERMINAL_PROMPT=0
+// (branch.go, delegate.go). The model's `run_command` and the verifier's check
+// did not, and `cmd.Stdin = nil` closes stdin but not /dev/tty: `git` is on the
+// default allowlist and -y grants the run class, so a model trying
+// `git fetch origin` on an https remote with no credential helper, or a check.sh
+// whose `git commit` meets commit.gpgsign and a pinentry, blocked on the
+// terminal. It was bounded — the command timeout or check_timeout eventually
+// kills the group — but the cost is up to a check_timeout per attempt, times
+// verify_attempts, for a run that was never going to produce anything, and the
+// prompt text goes to /dev/tty: onto the operator's screen and into NEITHER
+// captured stream, so nothing in the transcript explains the stall.
+func noPromptEnv() []string {
+	return append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/true", "SSH_ASKPASS=/bin/true",
+		// Without this ssh prefers SSH_ASKPASS only when there is no tty; Setsid
+		// below removes the tty, and "force" keeps a pre-set SSH_ASKPASS_REQUIRE
+		// from putting it back.
+		"SSH_ASKPASS_REQUIRE=force")
 }
 
 // exitInfo renders a failed command's exit for the model: the status number it
@@ -387,10 +413,22 @@ func execCheck(parent context.Context, j *Jail, cmdline string, timeout time.Dur
 		sink = io.MultiWriter(&buf, live[0])
 	}
 	cmd.Stdout, cmd.Stderr = sink, sink // one writer ⇒ os/exec serializes the two streams
+	cstart := time.Now()
 	err := cmd.Run()
+	elapsed := time.Since(cstart)
 	out := buf.String()
 	switch {
 	case ctx.Err() == context.DeadlineExceeded:
+		// Which deadline fired matters. This context is WithTimeout(parent, …), and
+		// when the parent is the run's own clock the CHILD's Err() is
+		// DeadlineExceeded too — so a `-timeout 30s` run reported "(check timed out
+		// after 30m0s)", naming the profile's check_timeout, a limit that was never
+		// approached. That sentence is fed back to the model as the next attempt's
+		// input, reaches the summary and lands in the ticket comment, where an
+		// operator reads it and raises check_timeout, which changes nothing.
+		if parent.Err() != nil {
+			return out + fmt.Sprintf("\n(the run's time budget ended this check after %s)", elapsed.Round(time.Millisecond)), -1
+		}
 		return out + fmt.Sprintf("\n(check timed out after %s)", timeout), -1
 	case err == nil:
 		return out, 0

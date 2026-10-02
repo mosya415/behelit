@@ -653,6 +653,9 @@ func pickOne(in *Input, cs []choice, o pickOpts) (int, error) {
 // prompt that opens right afterwards, one keystroke from being sent to the model
 // as a user message.
 func askSecret(in *Input, prompt string) (string, error) {
+	if !in.IsTTY() {
+		return "", errNoTTY
+	}
 	ed := NewLineEditor(in)
 	ed.bare, ed.noHistory, ed.secret = true, true, true
 	line, err := ed.ReadLine("  "+cFaint+gPrompt+cReset+" "+prompt, "")
@@ -664,7 +667,16 @@ func askSecret(in *Input, prompt string) (string, error) {
 
 // ask reads one line with the real line editor, prefilled with cur, so "Enter
 // keeps it" is literally true. errLineCancel passes straight through.
+//
+// Like pick() and confirm() it refuses without a terminal BEFORE reading a byte.
+// Its callers are all wizard steps, and the wizard is gated already — but a
+// read that blocks forever is the one failure that cannot be recovered from, so
+// every door to the keyboard carries its own lock rather than trusting the
+// corridor it stands in.
 func ask(in *Input, ed *LineEditor, prompt, cur string) (string, error) {
+	if !in.IsTTY() {
+		return "", errNoTTY
+	}
 	if ed == nil {
 		ed = NewLineEditor(in)
 	}

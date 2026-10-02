@@ -1377,7 +1377,7 @@ func TestDelegateCheckCmdCheckedAsAShellLine(t *testing.T) {
 	h, box, calls := memberDelegateHarness(t, fs, "")
 	pwned := filepath.Join(box, "pwned")
 	res := delegateOnMember(t, h, Args{"role": "coder", "task": "t", "check_cmd": "ls . ; /usr/bin/touch " + pwned})
-	if res.Status != "error" || !strings.Contains(res.TestTail, "rejected by the sandbox") {
+	if res.Status != "error" || !strings.Contains(res.TestTail, "refused before it ran") {
 		t.Fatalf("a check_cmd smuggling a second command: %+v", res)
 	}
 	if _, err := os.Stat(pwned); err == nil {

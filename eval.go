@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -454,6 +455,10 @@ func runEvalTask(cfg Config, t *EvalTask, dir string, keep, verbose bool) (res E
 	ap := NewApprover(newStringInput(""))
 	ap.TrustAll() // unattended; sandbox and deny rules still hold
 	ap.quiet = true
+	// An eval task has no keyboard by construction, and the one class -y does not
+	// grant (mcp_write) would otherwise reach a door. A hung task holds its
+	// worktree and never writes its row in results.jsonl.
+	ap.Unattended("lca eval runs unattended")
 	orch, err := setupOrchestrator(tcfg, ap, res.Trace)
 	if err != nil {
 		res.Error = err.Error()
@@ -478,12 +483,33 @@ func runEvalTask(cfg Config, t *EvalTask, dir string, keep, verbose bool) (res E
 	if attempts == 0 {
 		attempts = orch.verifyAttempts()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), t.Timeout)
+	// roles.yaml's defaults: are in force HERE too. Only main.go used to build a
+	// budget, so `defaults: {max_steps: 200, max_tokens: 4000000}` was silently
+	// ignored by the eval — the document's own second caller of lca — and by
+	// `lca run`: every method on a nil budget is nil-safe, so the ceilings
+	// evaluated to "none" without a word, and `doctor -role` printed them anyway.
+	// A task that loops burns whatever the gateway will give it. The task's own
+	// `timeout:` overrides only the clock, which is the one ceiling a task is
+	// allowed an opinion about.
+	if b, err := newRunBudget(orch.roles, t.Timeout, 0, 0); err == nil {
+		orch.budget = b
+	}
+	ctx, cancel := orch.budget.start(context.Background())
+	orch.setRunContext(ctx)
 	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: t.Prompt})
 	vstart := time.Now()
 	v := sess.RunVerified(ctx, t.CheckCmd, attempts)
-	if ctx.Err() == context.DeadlineExceeded {
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
 		v.Status = "timeout"
+	// A task that ran out of steps or tokens did not fail the task: it never
+	// finished it. Rolling that into "failed" makes a pass rate that moved because
+	// a ceiling was lowered look like a model that got worse.
+	case v.Status != "passed" && orch.budget.tripped() != "":
+		v.Status = statusBudget
+		if v.Err == nil {
+			v.Err = errors.New(orch.budget.tripped())
+		}
 	}
 	cancel()
 	sess.traceTask(t.Prompt, v, t.CheckCmd, 0, 0, false, nil, vstart, "")

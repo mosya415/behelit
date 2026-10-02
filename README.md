@@ -20,6 +20,7 @@ trail come from the process (uid/gid) for free.
 
 - [Quick start](#quick-start) — `lca` → `/setup`
 - [Configuration in the session](#configuration-in-the-session--setup-config-set-save) — `/config`, `/set`, `/save`, the `config.json` keys, the API-key rule
+- [Driven by a program](#driven-by-a-program---prompt-file--json-oneshotgo) — `-prompt-file`, `-json`, the result object and the exit-code table, [budgets](#budgets-on-one-run---timeout--max-steps--max-tokens-budgetgo), [`-summary`](#the-short-summary---summary-pathmd-summarygo), [the pipeline sandbox profile](#the-pipeline-sandbox-profile--examplespipelinerolesyaml)
 - [Non-interactive: CI, scripts and containers](#non-interactive-ci-scripts-and-containers) · [Environment variables](#environment-an-override-one-run-at-a-time)
 - [Models & providers](#models--providers--providersgo-modelsgo-chatgo) — presets, per-family profiles, the JSON config
 - [The team — `roles.yaml`](#the-team--rolesyaml-rolesgo-delegatego-verifygo) — roles, [delegation and the verifier](#delegation-and-the-verifier--delegaterole-task-check_cmd), [`apply: branch`](#apply-branch--a-delegation-becomes-a-real-branch--branchgo-cleango), [cross-family review](#cross-family-review), [`fork:`](#fork-true--inherit-the-reads-not-the-transcript), [tiers](#tiers-develop-on-premium-operate-on-cheap), `/role`
@@ -110,6 +111,251 @@ status** is the machine-readable result:
 
 Without `-y`, side effects still need approval; with no terminal attached
 they are refused rather than run unattended.
+
+### Driven by a program — `-prompt-file`, `-json`, `oneshot.go`
+
+A wrapper that takes a ticket, makes a worktree, calls lca once and then does
+the state transitions itself — commit, push, MR, labels, a comment — needs three
+things lca gives it here: the task off the command line, one machine-readable
+result, and the promise that nothing ever waits for a keystroke.
+
+```sh
+./lca -y -role coder -json -prompt-file ticket.md -check ./check.sh   # a ticket from a file
+jira-get OPS-412 | ./lca -y -json -prompt-file - -check ./check.sh    # or from stdin
+```
+
+`-prompt-file <path>` reads the task from a file, and `-` reads stdin. The bytes
+reach the model exactly as they are on disk: a ticket is multi-line markdown with
+quotes, `$VAR` and backticks in it, and in argv it has to be escaped by whoever
+builds the command line, shows up in `ps` for every user on the machine, and runs
+into the command-line length limit. A prompt file **and** a positional task is a
+usage error and never a concatenation. An empty one is refused too, rather than
+opening a session nobody is sitting at — and so are the four other ways a
+wrapper gets this wrong: a second `-prompt-file` (the first one silently lost is
+a ticket nobody read), a flag typed *after* the positional task (`lca "task"
+-json` — Go stops parsing at the first non-flag, so the flag went into the prompt
+and the whole terminal session went to stdout), a path that is not a regular file
+(a fifo blocks in `open(2)` before any signal handler or deadline exists), and
+bytes that are not valid UTF-8 (every consumer is `encoding/json`, which rewrites
+each bad byte as U+FFFD and reports nothing, so the transcript would agree with
+the request precisely because both were corrupted).
+
+`-json` writes **exactly one JSON object to stdout and nothing else** — every
+human line, including the model's own prose, moves to stderr, and so does colour:
+
+```json
+{"status": "passed", "session": "20260102-…", "role": "coder", "models": ["…"],
+ "attempts": 2, "check_cmd": "./check.sh", "check_exit": 0, "check_tail": "…",
+ "files_changed": 3, "diff_bytes": 1840, "turns": 17, "tool_calls": 42,
+ "tool_errors": 1, "invalid_calls": 0, "tokens": {"prompt": 0, "completion": 0, "cached": 0},
+ "duration_ms": 0, "transcript": "/path", "trace": "/path",
+ "lca_version": "sha", "roles_hash": "sha256 of roles.yaml"}
+```
+
+`check_exit` is `null` when no check ran, so `check_exit == 0` can never be read
+as green by accident; `check_cmd` and `check_tail` are always present beside it
+(empty when there was no check), because three fields describing one thing that
+appear and disappear independently are a `KeyError` on the row that matters.
+`tokens` is the **run's** spend — every session in it, subagents, the compactor
+and the closing summary call included — so it cannot contradict the `reason`
+standing next to it. `files_changed` counts what reached the tree, a delegation's
+merged diff included. `lca_version` and `roles_hash` (`lca version` prints both)
+are what make two runs comparable: a pass rate that moved after a prompt edit is
+a different measurement, not a better one.
+
+The **exit code** is the whole of the wrapper's decision, so it is a table:
+
+| exit | status | what it means |
+| --- | --- | --- |
+| 0 | `passed` | the check ran and was green |
+| 1 | `failed`, `unverified` | the model did not manage it — a person should look |
+| 2 | — | lca was called wrong, or configured wrong; nothing was decided, so there is no object |
+| 3 | `infra_error` | the gateway, a member or an MCP server is not reachable — retry later, leave the ticket alone |
+| 4 | `budget_exceeded` | it ran out of time, steps or tokens before anything was settled ([budgets](#budgets-on-one-run---timeout--max-steps--max-tokens-budgetgo)) |
+| 130 | `cancelled` | SIGINT, SIGTERM or SIGHUP: the transcript and the object are still written |
+
+The one that matters is 3. "The infrastructure fell over" and "the model did not
+manage it" are different tickets, and a run that exits 1 for both makes the
+wrapper either wake somebody for a dropped VPN or quietly retry a real failure
+for ever. A connection refused, a 5xx or a 429 from the gateway, an overloaded or
+drained gateway, a member that does not answer ssh and an MCP server that never
+handshook are all 3; a rejected key, a wrong base path and a check the sandbox
+will never run are all 2 — and so is a malformed endpoint (`htp://…`, an
+out-of-range port), which never reached the network and will not fix itself
+overnight. A context overflow that survived the one compaction retry is 4, not 2:
+the conversation outgrew the window, which is a thing that happened during the
+run rather than a way lca was called.
+
+All three signals a wrapper bounds a job with — `timeout`, systemd, `docker
+stop`, `pkill` — share row 130: each one cancels the run, writes the transcript,
+the trace and the object, and reaps the children. A crash in lca itself is
+reported as `infra_error` with the panic as the reason, so even a bug keeps the
+exit code inside the table and leaves something to attach to the ticket.
+
+Nothing in this mode waits for a human. With `-json`, or with stdin not a
+terminal, **every** question is an immediate refusal, written to the audit log
+and to the transcript with the permission class named — including `mcp_write`,
+which `-y` deliberately does not grant (see [Approval modes](#approval-modes--approvalgo)).
+`lca eval` and `lca run` are unattended the same way.
+
+#### Budgets on one run — `-timeout`, `-max-steps`, `-max-tokens`, `budget.go`
+
+A role's `steps` and a check's `check_timeout` together bound nothing. An agent
+that re-reads the same three files ends every turn inside its step budget, the
+verifier hands it the same red check, and the run keeps buying gateway tokens
+until somebody looks at the GPU queue in the morning — which a cron job cannot
+do. So a run carries three ceilings:
+
+```sh
+./lca -y -json -timeout 30m -max-steps 200 -max-tokens 4000000 \
+      -prompt-file ticket.md -check ./check.sh
+```
+
+| flag | what it bounds |
+| --- | --- |
+| `-timeout <dur>` | wall clock for the whole run, the check and the summary included |
+| `-max-steps <n>` | model requests across the **whole run** — every role, every subagent, every verifier attempt — and a per-session ceiling over each role's own `steps`; a role that asked for less keeps its own |
+| `-max-tokens <n>` | prompt + completion across the run, every session in it: subagents, the compactor's request and the closing summary call |
+
+The defaults live in `roles.yaml` under `defaults:` (`timeout:`, `max_steps:`,
+`max_tokens:`) and each flag overrides its own independently — stretching the
+timeout for one awkward ticket must not silently drop the team's token ceiling.
+A bare number for `timeout:` is seconds, like `check_timeout` beside it; a value
+that is not a duration is an error, because reading `30 minutes` as "no limit" is
+a mistake whose only symptom is the bill.
+
+Exceeding any of them ends the run **gracefully**: the transcript is saved, the
+status is `budget_exceeded`, the exit code is 4, and every child the run started
+is killed rather than orphaned — the check command's whole process group, a
+stdio MCP server, a background subagent and whatever it launched. That last part
+is a property of the shape and not of a list: everything a run starts hangs off
+one context, so cancelling that context once reaps all of it, and the one-shot
+cancels it on every exit path there is.
+
+The clock and the tokens stop different things, on purpose. The clock cancels
+everything, because with no time left there is nothing to run a check in. A spent
+token budget stops the **model** and lets the verifier finish: a run whose last
+reply said "done" and went one token over must still have its check run, or a
+finished ticket is reported as "did not fit" and goes to a person for nothing. A
+green check outranks a spent budget for the same reason. "Lets the verifier
+finish" means exactly one more check: the loop stops there rather than spending
+the remaining `verify_attempts` re-running an identical check against a tree the
+model can no longer touch, which with a `check_timeout` of half an hour is an
+hour of stand builds bought after the run had decided to stop.
+
+All three ceilings are properties of a **run**, armed by the one-shot, by an
+`lca eval` task and by `lca run` — and deliberately not by the REPL, so a
+`defaults: max_tokens` cannot wedge an interactive session that crossed it over
+a long day.
+
+One bound is not lca's: `LCA_GW_MAX_WAIT` (900 seconds by default) is how long a
+single model call waits on a gateway answering 503, and a run with no `-timeout`
+is bounded only by that, per call. An unattended run should set it low — the
+wrapper wants to hear "infra_error" in seconds, not a quarter of an hour per
+call — and should carry its own wall-clock kill (`timeout 3600 lca …`) as well,
+which lca now handles as a clean row 130 rather than dying where it stands.
+
+#### The short summary — `-summary <path.md>`, `summary.go`
+
+There is a full transcript and an HTML report already, and neither is what a
+reviewer opens. `-summary` writes the five hundred words the wrapper pastes into
+the merge request and the ticket comment:
+
+```sh
+./lca -y -json -summary /tmp/OPS-412.md -prompt-file ticket.md -check ./check.sh
+```
+
+Markdown, at most 3 KB, with what changed (one line per file), how it was
+verified (the command, its exit, the attempts), what did not work, what it cost
+and where the transcript and the trace are. The JSON result carries the path as
+`summary`.
+
+The model writes it, in **one** short call after the verdict, on its own system
+prompt and with no tools offered — a separate request, so the session's cached
+prefix on the gateway does not move. Everything that must be exact is lca's: the
+file list, the exit code, the attempt count, the cost and the paths are appended
+after the model's prose and counted against the 3 KB first, so a long-winded
+summary cannot push the links out. A model asked to recall a token count invents
+one.
+
+It is written for a **failed** run too — that is the run that gets read — and for
+a cancelled one and a budget_exceeded one. If the gateway goes away between the
+verdict and the summary, lca writes the facts itself rather than leaving an empty
+file. The only run with no summary is an `infra_error` before the first model
+**reply**: there is nothing to summarise and nobody to write it.
+
+Because this file is the one artefact written to be pasted somewhere a wider
+audience reads, everything in it is sanitised on the way out: the values of
+environment variables whose names match `*TOKEN*`, `*KEY*`, `*SECRET*` or
+`*PASSWORD*` become `[redacted]`, and terminal escapes and control bytes are
+stripped. The model is handed its own tool results and told to be specific about
+what did not work, so a `logs` command that printed an `Authorization` header is
+the ordinary path from a live token to a merge request description. The result
+object's `check_tail` and `reason` go through the same filter. The 3 KB clamp cuts
+at a line boundary and never inside a rune, so the file is always valid UTF-8 —
+`open(..., encoding="utf-8")` on it cannot be the thing that fails a run whose
+work is already done. A `-summary` path that cannot be written is refused at
+startup, with exit 2, before the gateway is touched.
+
+#### The pipeline sandbox profile — `examples/pipeline.roles.yaml`
+
+In the pipeline lca changes files in its own worktree and runs checks. It does
+not commit, push, open a merge request or comment on a ticket: those are state
+transitions and the wrapper owns them. And on the operator's own machines
+production berserk runs under the same unix user as the agent, so `ssh`,
+`scancel` and `berserk-ctl.sh` are not dangerous in the abstract — they are the
+live gateway.
+
+The profile in `examples/` is that posture, in two files because lca keeps the
+two halves of a sandbox in two places, included in one line. Its `permission.run`
+block is **fail-closed** — `"*": "deny"` first, then the shapes the work needs —
+because `-y`, which is on its own documented command line, turns every `ask` into
+an allow before "there is nobody here to ask" is consulted: based on `ask`, the
+deny list caught only the spellings it named literally. A command line is also
+canonicalised before matching, so `git  push` with two spaces, a tab, or a quoted
+subcommand is denied too. `lca doctor -role <name> -y` prints the posture that
+flag actually produces. What a pattern list provably cannot catch — a script the
+model just wrote, `cargo run` with an edited `main.rs`, a `.git/config` alias — is
+written out in the profile itself, next to the enforcement that does hold: a push
+token restricted server-side.
+
+```sh
+LCA_ROLES=examples/pipeline.roles.yaml LCA_CONFIG=examples/pipeline.config.json \
+  ./lca -y -role coder -json -prompt-file ticket.md -check ./check.sh
+```
+
+`pipeline.roles.yaml` carries `sandbox.allow` — the hard boundary, which no flag
+widens — and the run's budgets. It declares **no roles**, so it collides with
+nothing in the team's own file, and `$LCA_ROLES` is read last so its allowlist
+wins. `pipeline.config.json` carries the per-command `permission.run` rules,
+which apply to every role and need none of them to exist. Allowed: `cargo`, `go`,
+`python3`, `bash`, `rg`/`grep`, `git status|diff|log|show` and
+`stage/stage.sh check|logs|status`.
+Denied: `git commit`, `git push`, `git reset --hard`, `git checkout -- .`,
+`git remote`, `git config`, `ssh` except those stage scripts, `curl`/`wget`,
+`scancel`, `berserk-ctl.sh` — and `webfetch` is off outright, so the tool is not
+in the request prefix at all.
+
+`-y` cannot override any of it: a `deny` returns before trust is consulted, and
+the model is told *"denied by a permission rule"* and not to retry — a refusal it
+can read and work around, not a dead session. The deny holds on a **member** too,
+which it did not before: a remote command is sent as one argument to a login
+shell over there, and `*` in a pattern matches `&&`, so `git status && git push`
+matched the allow rule whole. Every segment of a line a shell will split is now
+evaluated and the most restrictive answer wins.
+
+Read back what including it granted, instead of running an agent to find out:
+
+```sh
+LCA_ROLES=examples/pipeline.roles.yaml LCA_CONFIG=examples/pipeline.config.json \
+  ./lca doctor -role coder
+```
+
+`doctor -role <name>` prints the member, the allowlist, the run's budgets, which
+tools are disabled outright, the standing action per permission key, and then
+every rule in precedence order with the layer it came from — computed by the same
+functions the runtime uses, so a row that says `deny` is the decision a tool call
+will get.
 
 ### Configuration in the session — `/setup`, `/config`, `/set`, `/save`
 
@@ -1874,6 +2120,18 @@ The audit log records `auto: true` on every action granted by a trusted class,
 so an interactive `y` and an auto-approval are always distinguishable after the
 fact. `-y` on the command line trusts all classes for a one-shot run.
 
+When there is nobody at the keyboard — stdin is not a terminal, or `-json` was
+asked for, or this is `lca eval` / `lca run` — the gate asks nothing at all.
+Every question becomes an immediate refusal, with `permission_denied` and the
+reason in the audit log and the permission class named in the tool result the
+model reads ("`mcp_write` is not granted in an unattended run"). That is not the
+same thing as trust: `-y` decides what needs no answer, this decides what happens
+to the questions that remain — and `mcp_write`, which `-y` withholds on purpose,
+is exactly the door that would otherwise have been left waiting for an answer
+nobody is there to type. Every other way into the keyboard refuses before
+reading as well: the pickers, the wizard's yes/no and its text fields all answer
+"no terminal" without touching stdin.
+
 ## Audit & transcript — `recorder.go`
 
 Both artifacts live under `$LCA_DIR` (default `~/.lca`), created `0600` under the
@@ -1970,7 +2228,12 @@ field.
 ## Layout
 
 ```
-main.go       entry point: subcommands (init, doctor, eval, report, run), flags, one-shot, usage
+main.go       entry point: subcommands (init, doctor, eval, report, run, version), flags, usage
+oneshot.go    the one-shot run: -prompt-file, the -json result object, the exit-code table
+budget.go     what one run may spend: wall clock, steps and tokens, and the context they share
+summary.go    -summary: the short markdown a person reads, written by the model in one call
+redact.go     secrets, escapes and control bytes out of the two artefacts that leave the machine
+version.go    lca version: the build's sha, the roles.yaml hash
 repl.go       interactive session: command registry (help, menu, dispatch), banner card, all /commands
 repl_cmds.go  custom markdown commands
 setup_cmds.go lca init (roles.yaml from the gateway + stack) and lca doctor (end-to-end checks)

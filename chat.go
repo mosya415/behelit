@@ -488,8 +488,12 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, sink StreamSink) (Ch
 	// (proxy timeout, dropped connection): don't treat a partial reply or a
 	// half-streamed tool call as complete.
 	if !gotDone && res.Finish == "" {
+		// Wrapped in a sentinel, because this is the one transport failure with no
+		// net.Error left to inspect — a [DONE] that never came looks like a clean end
+		// of file — and an unattended caller has to be able to tell it from a model
+		// that failed a task. See errCutStream.
 		return c.finish(res, &content, &reasoning, nil, start, firstTok, deltas),
-			fmt.Errorf("stream from %s ended unexpectedly (connection closed before the reply finished)", c.baseURL)
+			fmt.Errorf("stream from %s ended unexpectedly: %w", c.baseURL, errCutStream)
 	}
 	// Flatten accumulated tool calls in index order.
 	var idx []int

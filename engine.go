@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,6 +93,33 @@ type Orchestrator struct {
 	legMem *Member // the synthesised "remote" member, keyed on o.remote
 
 	gatewayModels int // models the gateway lists: -1 not checked, 0 unreachable
+
+	// budget is what this RUN may spend (budget.go): wall clock, steps and tokens
+	// across every session in it. nil means no ceilings — a session in a terminal,
+	// and every Orchestrator a test builds by hand — and every method on it is
+	// nil-safe for exactly that reason.
+	budget *runBudget
+	// summary is where -summary wants the short markdown written, "" when the
+	// caller asked for none. It rides on the orchestrator rather than on oneShot's
+	// parameter list because it is a property of the run, like the budget, and not
+	// of the task.
+	summary string
+
+	// runCtx is the context the whole run hangs off, so cancelling the run reaps
+	// what it started. Guarded because a background subagent reads it from its own
+	// goroutine.
+	runMu  sync.Mutex
+	runCtx context.Context
+
+	// What delegations brought home. files_changed has to answer "did lca change
+	// the tree", and a merge is a git operation: it never reaches the tool-level
+	// change log that /undo and sessionChangeStats read, so for every delegating
+	// role — which is the default entry role — the field said zero for a run that
+	// had rewritten files. Paths and not a count, so the union with the caller's
+	// own edits can be taken (oneshot.go runChangeStats).
+	appliedMu    sync.Mutex
+	appliedFiles map[string]bool
+	appliedBytes int
 
 	histMu  sync.Mutex
 	history []*taskEntry // every subagent run, for /tasks
@@ -768,11 +796,76 @@ func (s *Session) runCheck(ctx context.Context, cmd string, timeout time.Duratio
 // the semantics of the machine that will run it: a member's leg crosses a shell
 // over there, and one-argv semantics would let a second command past the
 // allowlist. The verifier asks the same question before it spends an attempt.
+//
+// The operator's deny rules are asked too, and that took measuring to get
+// right: `git` is on the pipeline profile's allowlist (status, diff, log), so
+// the allowlist alone passed `-check 'git push origin HEAD'` and git really
+// pushed, while the same line through the model's run_command was refused by
+// the profile's `"git push *": "deny"`. A boundary that holds for one caller
+// and waves the other through is the worst shape a boundary can have, so a
+// check is now checked like a workflow step: the profile that says its rules
+// apply to every role has to mean it.
+//
+// Only an explicit DENY stops a check. `ask` cannot mean a question here — the
+// command came from the operator's own -check or their role's check_cmd, and in
+// an unattended run there is nobody to ask — so the rules that are merely a
+// door for the model are a no-op for a line the operator typed themselves.
 func (s *Session) checkCmd(cmd string) error {
-	if s.remote() != nil {
-		return s.jail().CheckRemote(cmd)
+	rem := s.remote() != nil
+	if rem {
+		if err := s.jail().CheckRemote(cmd); err != nil {
+			return err
+		}
+	} else if err := s.jail().CheckCommand(cmd); err != nil {
+		return err
 	}
-	return s.jail().CheckCommand(cmd)
+	// After the sandbox, so every refusal the sandbox already words keeps its
+	// wording. shellSplits matches the executor: a member's line is split by the
+	// far side's shell, and sandbox: {shell: true} is split by ours, so each
+	// segment has to face the rules on its own.
+	jl := s.jail()
+	if act := runAction(cmd, rem || jl.Unsafe || jl.Shell, s.orch.stepRules()...); act == Deny {
+		return fmt.Errorf("denied by a permission rule (run: %q)", cmd)
+	}
+	return nil
+}
+
+// rewroteCheck answers whether this run has itself written a file the check
+// command names. A verifier the run rewrote is not a verifier: the sandbox and
+// the deny rules see a command line, never the inside of a script, so with
+// `-check "$WORKTREE/check.sh"` — where the wrapper puts the script in the very
+// tree the model edits — a single edit to that file turns the verifier into a
+// way to run anything, under the operator's own hand rather than the model's.
+//
+// It is deliberately narrow: only a token that resolves to a path this run
+// APPLIED counts, so `go test ./...`, `make test` and `cargo check` are
+// untouched even when the run changed the Makefile, because the command line
+// does not name it. The answer is the file's path, for a message that can say
+// what to do about it.
+func (s *Session) rewroteCheck(cmd string) string {
+	if s.orch == nil || s.remote() != nil {
+		return "" // a member's tree is not the tree this run's edits landed in
+	}
+	argv, err := tokenize(cmd)
+	if err != nil {
+		return "" // unparsable: the sandbox has already refused it
+	}
+	root := s.jail().Root
+	s.orch.appliedMu.Lock()
+	defer s.orch.appliedMu.Unlock()
+	for _, tok := range argv {
+		if tok == "" || strings.HasPrefix(tok, "-") {
+			continue
+		}
+		p := tok
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, p)
+		}
+		if s.orch.appliedFiles[filepath.Clean(p)] {
+			return tok
+		}
+	}
+	return ""
 }
 
 // SetAgent switches the primary agent. The system prompt is rebuilt (a
@@ -925,12 +1018,17 @@ func (s *Session) event(kind string, fields map[string]any) {
 	s.orch.rec.Event(kind, fields)
 }
 
-func (s *Session) saveTranscript() {
+// saveTranscript rewrites this session's transcript, and reports whether it
+// landed. Every caller but oneShot's last one ignores the error on purpose: a
+// mid-run save is a checkpoint and the next step will try again a second later,
+// while the LAST one is the file the wrapper names in its result and attaches to
+// the ticket, so that one is reported.
+func (s *Session) saveTranscript() error {
 	if s.parent == nil {
-		s.orch.rec.Transcript(s.Msgs)
-	} else {
-		s.orch.rec.ChildTranscript(s.ID, s.Msgs)
+		return s.orch.rec.Transcript(s.Msgs)
 	}
+	s.orch.rec.ChildTranscript(s.ID, s.Msgs)
+	return nil
 }
 
 func (s *Session) setTodos(t []Todo) {
@@ -976,8 +1074,19 @@ func (s *Session) drainInbox() bool {
 // the server's parser, not the model.
 type SessionStats struct {
 	Turns, ToolCalls, InvalidCalls, ToolErrors int
-	PromptTokens, CachedTokens, OutputTokens   int
-	Fallbacks, Compactions, VerifyRuns         int
+	// Replies counts the requests that came BACK. Turns counts the ones that were
+	// sent, whether or not anything answered, so it is never 0 once a request has
+	// been attempted — which made "did the model ever reply" unanswerable, and the
+	// guard that skips the closing summary for a gateway that was never there
+	// unreachable from the one-shot path.
+	Replies                                  int
+	PromptTokens, CachedTokens, OutputTokens int
+	Fallbacks, Compactions, VerifyRuns       int
+	// StepCaps counts the turns the step cap ended. It is the only budget a run
+	// has today, and the pipeline's result has to tell "the check went red" from
+	// "the agent never got to the end" — the first is a ticket for a person, the
+	// second is a ticket for a person with "did not fit" written on it.
+	StepCaps int
 }
 
 // pendingInbox reports delivered background results not yet handed to the model.
@@ -994,6 +1103,16 @@ func (s *Session) BackgroundRunning() int {
 }
 
 func (s *Session) maxSteps() int {
+	// The run's own ceiling first, and it is a CEILING and not a default: -max-steps
+	// (or roles.yaml's defaults.max_steps) is the operator saying "whatever the
+	// roles say, not more than this on this run", so a role's own 80 must not
+	// outrank it — including a subagent's, which is where the tokens actually go.
+	if n := s.orch.budget.steps(); n > 0 {
+		if s.agent.Steps > 0 && s.agent.Steps < n {
+			return s.agent.Steps
+		}
+		return n
+	}
 	if s.agent.Steps > 0 {
 		return s.agent.Steps
 	}
@@ -1051,6 +1170,16 @@ func (s *Session) Run(ctx context.Context) error {
 	for step := 0; step < maxSteps && !stop.Load(); step++ {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Before the request, not only after the reply: by here another session in
+		// this run — a subagent, or an earlier verifier attempt — may already have
+		// spent the last of the budget, and the next request would be bought with
+		// money the run does not have.
+		if why := s.orch.budget.over(); why != "" {
+			s.view.Warn("STOPPED — " + why)
+			s.event("budget_exceeded", map[string]any{"why": why, "steps": step, "run_tokens": s.orch.budget.tokens()})
+			s.saveTranscript()
+			return nil
 		}
 		last := step == maxSteps-1
 		if last {
@@ -1111,6 +1240,16 @@ func (s *Session) Run(ctx context.Context) error {
 		s.stats.CachedTokens += res.Usage.CachedTokens
 		s.stats.OutputTokens += res.Usage.CompletionTokens
 		s.stats.Fallbacks += len(fallbacks)
+		if err == nil {
+			s.stats.Replies++
+		}
+		// The run's token ceiling is counted HERE and not from s.stats, because
+		// s.stats is one session's and the ceiling is the run's: a lead and the four
+		// coders it delegated to spend one ticket's tokens between them. The same is
+		// true of the step ceiling, and for the same reason plus one more: this
+		// loop's own `step` restarts at 0 on every verifier attempt.
+		s.orch.budget.spend(res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens)
+		s.orch.budget.spendStep()
 		if res.Usage.PromptTokens > 0 {
 			s.event("usage", map[string]any{"model": s.client.Ref(), "prompt": res.Usage.PromptTokens, "cached": res.Usage.CachedTokens,
 				"completion": res.Usage.CompletionTokens, "tok_s": res.Usage.TokPerSec()})
@@ -1188,6 +1327,20 @@ func (s *Session) Run(ctx context.Context) error {
 			return err
 		}
 
+		// The run's budget, checked where the step cap is checked and ended the same
+		// way: tools are not executed, the turn is traced and saved, and the loop
+		// returns nil. nil, not an error, because nothing FAILED — the run was
+		// stopped on purpose, and statusOf turns the recorded reason into
+		// budget_exceeded. Returning an error here would have had the wrapper read a
+		// deliberate stop as a broken gateway.
+		if why := s.orch.budget.over(); why != "" {
+			s.Msgs[len(s.Msgs)-1].ToolCalls = nil // never run what the run will not pay for
+			s.traceTurn(step, res, fallbacks, turnStart, nil, nil)
+			s.view.Warn("STOPPED — " + why)
+			s.event("budget_exceeded", map[string]any{"why": why, "steps": step + 1, "run_tokens": s.orch.budget.tokens()})
+			s.saveTranscript()
+			return nil
+		}
 		full := s.Msgs[len(s.Msgs)-1].Content
 		calls := s.extractCalls(s.Msgs[len(s.Msgs)-1])
 		if last {
@@ -1198,6 +1351,7 @@ func (s *Session) Run(ctx context.Context) error {
 			}
 			s.traceTurn(step, res, fallbacks, turnStart, nil, nil)
 			s.view.Warn(fmt.Sprintf("STOPPED — hit %d-step cap", maxSteps))
+			s.stats.StepCaps++
 			s.event("step_cap", map[string]any{"steps": maxSteps})
 			s.saveTranscript()
 			return nil
@@ -1535,8 +1689,30 @@ func (s *Session) execCalls(ctx context.Context, calls []pendingCall, stop *atom
 	return results
 }
 
-func (s *Session) timedCall(ctx context.Context, c *pendingCall, stop *atomic.Bool) string {
+func (s *Session) timedCall(ctx context.Context, c *pendingCall, stop *atomic.Bool) (out string) {
 	start := time.Now()
+	// A panic here is an ordinary tool error for the model, and never the end of
+	// the process. execCalls runs every parallel-safe tool in its own goroutine,
+	// and a panic in a goroutine runs NO deferred function anywhere: not
+	// CloseMCP, so the stdio servers (each in its own session, so a group kill
+	// does not reach them) outlive lca; not the tracer or the recorder; and never
+	// oneShot's encoder, so the wrapper gets Go's exit 2 — "lca was called wrong,
+	// alert, do not touch the ticket" — with an empty stdout and a few thousand
+	// lines of goroutine dump in the log it was collecting. One tool call failing
+	// is a thing the model handles every day.
+	//
+	// The stack goes to the TRACE, which is where a crash is diagnosed, and not to
+	// stderr, which the wrapper is reading as a log.
+	defer func() {
+		p := recover()
+		if p == nil {
+			return
+		}
+		out = fmt.Sprintf("error: the %s tool crashed (%v) — this is a bug in lca, not in your call; do something else", c.name, p)
+		c.failed, c.errText = true, out
+		c.ms = time.Since(start).Milliseconds()
+		s.event("tool_panic", map[string]any{"tool": c.name, "err": fmt.Sprint(p), "stack": string(debug.Stack())})
+	}()
 	res := s.execCall(ctx, c, stop)
 	c.ms = time.Since(start).Milliseconds()
 	c.resultBytes = len(res)
@@ -1647,8 +1823,18 @@ func (tc *ToolCtx) Ask(permission, pattern, header, preview string) (string, boo
 		pattern = permPath(s.jail(), pattern)
 	}
 	act := Evaluate(permission, pattern, s.rules()...)
+	if permission == "run" {
+		// A command line is asked about the way the machine that will run it reads
+		// that line: where a shell splits it, every segment is evaluated and the most
+		// restrictive answer wins (permission.go). Without this a deny held only on
+		// the one machine where the command was not sent through a shell.
+		act = runAction(pattern, s.shellSplits(), s.rules()...)
+	}
 	// With a shell (unsafe mode) an allow rule like "git status *" would also
-	// match "git status; rm -rf ~" — a chained command always asks.
+	// match "git status; rm -rf ~" — a chained command always asks. Still here, and
+	// not subsumed by the segment check above: this is stricter, because it asks
+	// even when every segment is separately allowed, and -unsafe is the one posture
+	// where "all the parts are fine" is not an argument.
 	if act == Allow && permission == "run" && s.jail().Unsafe && reShellChain.MatchString(pattern) {
 		act = Ask
 	}
@@ -1683,9 +1869,33 @@ func (tc *ToolCtx) Ask(permission, pattern, header, preview string) (string, boo
 			s.interruptedAtDoor.Store(true)
 			return "error: [interrupted by the user at the approval prompt — nothing ran]", false
 		}
+		// Nobody was asked, because there is nobody to ask. The audit says so with
+		// the reason, the model is told not to retry — a retry loop against a door
+		// that cannot open burns the whole step budget — and the words name the
+		// permission class, so "mcp_write is not granted in an unattended run" is
+		// what the operator reads in the transcript rather than "denied".
+		if why := s.orch.ap.unattendedWhy(); why != "" {
+			s.event("permission_denied", map[string]any{"permission": permission, "pattern": pattern, "unattended": why})
+			return fmt.Sprintf("error: %s is not granted in an unattended run (%s) — %s. Nobody can approve it: do NOT retry this call, do what you can without it, and say in your final answer what was refused",
+				permission, header, why), false
+		}
 		return "user denied this action (" + header + ")", false
 	}
 	return "", true
+}
+
+// shellSplits reports whether a SHELL, and not this process, will split the
+// command line this session runs. Three ways that happens: the sandbox is lifted
+// (-unsafe), the team asked for it (sandbox: {shell: true}), or the command
+// crosses to another machine, where the transport sends `cd <dir> && <line>` as
+// one ssh argument and the login shell over there does the splitting whatever
+// this team's sandbox.shell says.
+func (s *Session) shellSplits() bool {
+	if s.remote() != nil {
+		return true
+	}
+	j := s.jail()
+	return j != nil && (j.Unsafe || j.Shell)
 }
 
 // permPath normalizes a path for permission matching, so "./a/b", "a//b" and

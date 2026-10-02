@@ -535,9 +535,16 @@ func TestLeasesTakenInSortedOrder(t *testing.T) {
 	root := t.TempDir()
 	o := leaseOrch(t, root)
 	a, b := filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")
-	done := make(chan struct{})
+	// BOTH writers are waited for, not just the first. The second one used to be
+	// launched and forgotten, which made this test fail in two ways that had
+	// nothing to do with lease ordering: a t.Error from a goroutine still running
+	// after the test returned panics the whole binary ("Fail in goroutine after
+	// TestLeasesTakenInSortedOrder has completed"), and a lock file written after
+	// the test returned made t.TempDir's cleanup fail with "directory not empty".
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		defer close(done)
+		defer wg.Done()
 		for i := 0; i < 50; i++ {
 			for _, set := range []map[string]string{{a: "a.txt", b: "b.txt"}, {b: "b.txt", a: "a.txt"}} {
 				rel, err := o.leaseFiles(set)
@@ -550,6 +557,7 @@ func TestLeasesTakenInSortedOrder(t *testing.T) {
 		}
 	}()
 	go func() {
+		defer wg.Done()
 		for i := 0; i < 50; i++ {
 			rel, err := o.leaseFiles(map[string]string{b: "b.txt", a: "a.txt"})
 			if err != nil {
@@ -559,6 +567,8 @@ func TestLeasesTakenInSortedOrder(t *testing.T) {
 			rel()
 		}
 	}()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):

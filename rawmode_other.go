@@ -13,3 +13,7 @@ func makeRaw(fd int) (func(), error) {
 func makeTurnMode(fd int) (func(), error) {
 	return nil, errors.New("terminal modes unsupported on this platform")
 }
+
+// isTerminal has no termios to ask here. False is the safe answer: every caller
+// reads it as "nobody to ask" and refuses instead of reading.
+func isTerminal(fd int) bool { return false }

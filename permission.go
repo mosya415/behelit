@@ -85,6 +85,83 @@ func Disabled(permission string, sets ...Ruleset) bool {
 	return false
 }
 
+// rank orders the actions by how much they refuse, so several answers about one
+// command line can be reduced to the one a cautious reader would give.
+func (a Action) rank() int {
+	switch a {
+	case Allow:
+		return 0
+	case Deny:
+		return 2
+	}
+	return 1 // Ask, and anything unrecognised
+}
+
+// runAction is Evaluate for a command line, asked the way the machine that will
+// run it reads that line.
+//
+// A rule is matched against a PATTERN, and `*` in a pattern matches anything —
+// including `&&`. So wherever a shell, and not this process, splits the line,
+// "git status *" matched `git status && git push origin main` and allowed the
+// push, and "git push *" did not match it and so did not deny it. Both halves of
+// that are wrong in the same direction, and the one place it matters most is the
+// member leg: a remote command is always sent as one argument to a login shell
+// over there (see Jail.CheckRemote), so a team whose profile denies `git push`
+// had no such profile on any machine but their own.
+//
+// The fix is the jail's own: check every segment, and take the most restrictive
+// answer. The whole line is still evaluated too, so a rule an operator wrote
+// about a pipeline as a whole keeps working. shellSplits=false — a local command
+// run as one argv, where `&&` is just an argument git will reject — asks exactly
+// the question it used to.
+// The second half is the same idea applied to WHITESPACE and quoting. tokenize()
+// collapses runs of spaces and tabs and strips quotes, so `git  push origin HEAD`
+// (two spaces), `git\tpush …` and `git 'push' …` are all exec'd byte-identically
+// to the line a profile denies — and none of them matches the pattern
+// "git push *", because that match is done on the raw string. A deny list is a
+// guardrail against an honest mistake, and a guardrail that a second space walks
+// through is not one. So the CANONICAL line is asked about too, and the most
+// restrictive of the answers wins.
+func runAction(pattern string, shellSplits bool, sets ...Ruleset) Action {
+	act := Evaluate("run", pattern, sets...)
+	worst := func(line string) {
+		if line == "" {
+			return
+		}
+		if a := Evaluate("run", line, sets...); a.rank() > act.rank() {
+			act = a
+		}
+	}
+	worst(canonicalCommand(pattern))
+	if !shellSplits {
+		return act
+	}
+	for _, seg := range splitShellSegments(pattern) {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		worst(seg)
+		worst(canonicalCommand(seg))
+	}
+	return act
+}
+
+// canonicalCommand is the command line as the kernel will see it: argv joined
+// with single spaces. "" when it does not tokenize (an unbalanced quote), where
+// there is nothing to canonicalise and the raw answer is the only one there is.
+func canonicalCommand(line string) string {
+	argv, err := tokenize(line)
+	if err != nil || len(argv) == 0 {
+		return ""
+	}
+	canon := strings.Join(argv, " ")
+	if canon == line {
+		return ""
+	}
+	return canon
+}
+
 var (
 	wildMu    sync.Mutex
 	wildCache = map[string]*regexp.Regexp{}

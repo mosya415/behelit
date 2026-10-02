@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // roles.yaml — the team definition for orchestration through the LLM gateway.
@@ -40,7 +41,10 @@ import (
 //	  context: 128000
 //	  steps: 50
 //	  verify_attempts: 2        # verifier failures fed back before giving up
-//	  check_timeout: 600        # seconds
+//	  check_timeout: 600        # seconds, for ONE check
+//	  timeout: 30m              # the WHOLE run (-timeout overrides)
+//	  max_steps: 120            # the whole run, over every role's own
+//	  max_tokens: 2000000       # prompt+completion, subagents included
 //	  review: reviewer          # team-wide reviewer for passed delegations
 //	sandbox:
 //	  allow: [go, git, make, pytest, python3, ls, cat, grep, bsk]
@@ -84,13 +88,21 @@ type RolesConfig struct {
 	ModelOpts      map[string]*ModelOpts // per-model settings from the model card
 	VerifyAttempts int
 	CheckTimeout   int
-	Review         string              // defaults.review: the reviewer for roles that name none
-	Tiers          map[string][]string // tiers: — named model chains, validated like a role's
-	TierOrder      []string            // declaration order, for messages and YAML()
-	Tier           string              // the active tier (cfg.Tier): -tier / LCA_TIER
-	Roles          []*Agent
-	Sources        []string
-	Warnings       []string
+	// The run-wide budgets from defaults: (budget.go). They are deliberately NOT
+	// the same keys as `steps` and `check_timeout` beside them: `steps` is the
+	// default for a role that declares none and `check_timeout` bounds one check,
+	// while these three bound the WHOLE run — every role, every subagent, every
+	// retry — and are what `-timeout`, `-max-steps` and `-max-tokens` override.
+	RunTimeout   time.Duration       // defaults: timeout:
+	RunMaxSteps  int                 // defaults: max_steps:
+	RunMaxTokens int                 // defaults: max_tokens:
+	Review       string              // defaults.review: the reviewer for roles that name none
+	Tiers        map[string][]string // tiers: — named model chains, validated like a role's
+	TierOrder    []string            // declaration order, for messages and YAML()
+	Tier         string              // the active tier (cfg.Tier): -tier / LCA_TIER
+	Roles        []*Agent
+	Sources      []string
+	Warnings     []string
 }
 
 // ModelOpts is what roles.yaml says about one model: its transport and the
@@ -152,6 +164,41 @@ func (rc *RolesConfig) transportOf(model string) string {
 	return rc.Transport
 }
 
+// rolesSearchPaths is where a team's file is looked for, in MERGE order: the
+// user's, the project's, then $LCA_ROLES — which is last because that is how a
+// profile is included on top of whatever team is already there.
+//
+// It is a function so that the one other thing that needs these paths — the
+// roles hash, which is over the paths and their bytes and needs no parsing at
+// all — cannot drift from the order the loader actually uses.
+func rolesSearchPaths(cfg Config) []string {
+	paths := []string{filepath.Join(cfg.Dir, "roles.yaml"), filepath.Join(cfg.Root, ".lca", "roles.yaml")}
+	if p := os.Getenv("LCA_ROLES"); p != "" {
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// rolesFilePaths is rolesSearchPaths narrowed to the files that are THERE, made
+// absolute and de-duplicated exactly as loadRoles does it, so hashing them gives
+// the same answer the run's own roles_hash does.
+func rolesFilePaths(cfg Config) []string {
+	var out []string
+	for _, p := range rolesSearchPaths(cfg) {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if contains(out, p) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 func loadRoles(cfg Config) (*RolesConfig, error) {
 	rc := &RolesConfig{Apply: "verified", VerifyAttempts: 2, CheckTimeout: 600, ModelOpts: map[string]*ModelOpts{},
 		Members: map[string]*Member{localMemberName: {Name: localMemberName}}}
@@ -160,10 +207,7 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 	// and members: may sit in a different merged file than remote:.
 	remoteBlock, envRemote := false, strings.TrimSpace(os.Getenv("LCA_REMOTE")) != ""
 	lastPath := ""
-	paths := []string{filepath.Join(cfg.Dir, "roles.yaml"), filepath.Join(cfg.Root, ".lca", "roles.yaml")}
-	if p := os.Getenv("LCA_ROLES"); p != "" {
-		paths = append(paths, p)
-	}
+	paths := rolesSearchPaths(cfg)
 	byName := map[string]*Agent{}
 	var order []string
 	for _, p := range paths {
@@ -203,6 +247,30 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		}
 		if n, err := strconv.Atoi(defs.str("check_timeout")); err == nil && n > 0 {
 			rc.CheckTimeout = n
+		}
+		// The run budgets. A value that does not parse is an ERROR and not a silent
+		// zero: a team that wrote `timeout: 30 minutes` and got "no limit" would
+		// discover it from a GPU bill, which is the one way nobody wants to learn it.
+		if v := defs.str("timeout"); v != "" {
+			d, err := parseRunDuration("timeout", v)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", p, err)
+			}
+			rc.RunTimeout = d
+		}
+		if v := defs.str("max_steps"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("%s: defaults: max_steps: %q is not a step count", p, v)
+			}
+			rc.RunMaxSteps = n
+		}
+		if v := defs.str("max_tokens"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("%s: defaults: max_tokens: %q is not a token count", p, v)
+			}
+			rc.RunMaxTokens = n
 		}
 		if v := defs.str("review"); v != "" {
 			rc.Review = v
@@ -896,6 +964,18 @@ func (rc *RolesConfig) YAML() string {
 		b.WriteString("\nmembers:\n" + mem.String())
 	}
 	fmt.Fprintf(&b, "\ndefaults:\n  verify_attempts: %d\n  check_timeout: %d\n", rc.VerifyAttempts, rc.CheckTimeout)
+	// Written back only when set: a round trip through /role save must not invent
+	// a ceiling the operator never asked for, and "no limit" is the honest default
+	// for a session somebody is sitting at.
+	if rc.RunTimeout > 0 {
+		fmt.Fprintf(&b, "  timeout: %s\n", rc.RunTimeout)
+	}
+	if rc.RunMaxSteps > 0 {
+		fmt.Fprintf(&b, "  max_steps: %d\n", rc.RunMaxSteps)
+	}
+	if rc.RunMaxTokens > 0 {
+		fmt.Fprintf(&b, "  max_tokens: %d\n", rc.RunMaxTokens)
+	}
 	if rc.Review != "" {
 		fmt.Fprintf(&b, "  review: %s\n", rc.Review)
 	}

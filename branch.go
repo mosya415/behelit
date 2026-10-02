@@ -290,7 +290,10 @@ func (s *Session) commitWork(ctx context.Context, w *worktree, attempt int) erro
 	if w.rem != nil {
 		return w.commitOn(ctx, msg)
 	}
-	st, err := gitCmd(w.dir, nil, nil, append([]string{"status", "--porcelain"}, w.pathspec()...)...)
+	// ctx, not Background: the commit is the one local git call that happens once
+	// per verifier attempt, and the run's deadline has to be able to end it. The
+	// signature already accepted a ctx and forwarded it only on the remote path.
+	st, err := gitCmdIn(ctx, w.dir, nil, nil, append([]string{"status", "--porcelain"}, w.pathspec()...)...)
 	if err != nil {
 		return err
 	}
@@ -309,10 +312,10 @@ func (s *Session) commitWork(ctx context.Context, w *worktree, attempt int) erro
 		return fmt.Errorf("the merge in %s is not resolved — %s still hold conflict markers, and committing that text would put it on %s",
 			w.dir, strings.Join(bad, ", "), w.branch)
 	}
-	if _, err := gitCmd(w.dir, nil, nil, append([]string{"add", "-A"}, w.pathspec()...)...); err != nil {
+	if _, err := gitCmdIn(ctx, w.dir, nil, nil, append([]string{"add", "-A"}, w.pathspec()...)...); err != nil {
 		return err
 	}
-	_, err = gitCmd(w.dir, nil, nil, "-c", "core.hooksPath="+os.DevNull, "-c", "commit.gpgsign=false", "commit", "-m", msg)
+	_, err = gitCmdIn(ctx, w.dir, nil, nil, "-c", "core.hooksPath="+os.DevNull, "-c", "commit.gpgsign=false", "commit", "-m", msg)
 	return err
 }
 

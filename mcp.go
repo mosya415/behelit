@@ -1096,6 +1096,46 @@ func editDistance(a, b string) int {
 
 func (m *MCPSet) configured() bool { return m != nil && len(m.order) > 0 }
 
+// unreachable names the servers that were tried and did not answer — in
+// declaration order, each with the reason connect() recorded.
+//
+// The pipeline's result needs it: a model that worked without the tool it was
+// given produced a change nobody can judge, so a red check after an MCP server
+// was down is infrastructure and not a verdict on the change. A GREEN check
+// still wins — it got there anyway — which is why this reports and does not
+// decide (see statusOf).
+func (m *MCPSet) unreachable() []string {
+	if m == nil {
+		return nil
+	}
+	var out []string
+	for _, n := range m.order {
+		sv := m.servers[n]
+		if sv == nil {
+			continue
+		}
+		// A server that was never DIALLED is not a machine that is away. build()
+		// records a mistake in the mcp block of config.json — a missing transport, a
+		// literal `Authorization: Bearer …` where an env reference belongs — as
+		// loadErr and sets the same failed state, with no packet sent. Reported here
+		// it made one typo in a file turn every non-passing run in that project into
+		// infra_error / exit 3: the wrapper put the ticket back in todo and re-ran it
+		// on every tick forever, because a file does not fix itself — and while the
+		// entry stayed broken no genuinely red check could reach a human either,
+		// since exit 3 outranks exit 1. This is exactly the failure classifyRunErr's
+		// own comment warns about. Startup already warned about these, /mcp lists
+		// them and doctor prints them; if they should end a run, the row for that is
+		// 2 (alert somebody), never 3.
+		if sv.loadErr != "" {
+			continue
+		}
+		if _, state, reason := sv.snapshot(); state == mcpStateFailed {
+			out = append(out, "mcp server "+n+" ("+firstLine(reason)+")")
+		}
+	}
+	return out
+}
+
 // expandRoleWildcard turns "jira__*" into that server's READ-ONLY exposed tools.
 //
 // A wildcard is a convenience the operator will reach for, and the danger is

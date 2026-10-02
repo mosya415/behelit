@@ -1,0 +1,127 @@
+# The pipeline profile: what an agent may run when nobody is watching.
+#
+# Two files, because lca keeps the two halves of a sandbox in two places, and a
+# profile that only brought one of them would be half a profile:
+#
+#   examples/pipeline.roles.yaml    this file — the sandbox allowlist (the HARD
+#                                   boundary) and the run's budgets
+#   examples/pipeline.config.json   the per-command permission rules, which apply
+#                                   to EVERY role and need none of them to exist
+#
+# Include both in one line. lca reads $LCA_ROLES last, so this file's sandbox
+# wins over the team's own, and it declares no roles at all — nothing here can
+# collide with the team's models, members or prompts:
+#
+#   LCA_ROLES=examples/pipeline.roles.yaml LCA_CONFIG=examples/pipeline.config.json \
+#     lca -y -role coder -json -prompt-file ticket.md -check ./check.sh
+#
+# Read back what that actually granted before trusting it. doctor prints the
+# rules in force for one role, in precedence order, with the layer each came
+# from, next to the allowlist and the run's ceilings:
+#
+#   LCA_ROLES=examples/pipeline.roles.yaml LCA_CONFIG=examples/pipeline.config.json \
+#     lca doctor -role coder
+#
+# ── why this file exists ─────────────────────────────────────────────────────
+#
+# In the pipeline lca changes files in its own worktree and runs checks. It does
+# NOT commit, push, open a merge request, label a ticket or comment on one: those
+# are state transitions, and the wrapper — deterministic code, not a model — owns
+# them. An agent that pushes has taken a decision nobody reviewed.
+#
+# The second reason is sharper. Production berserk runs under the same unix user
+# as this agent. `ssh`, `scancel` and `berserk-ctl.sh` are therefore not
+# "dangerous commands" in the abstract: they are the live gateway, and a model
+# that reaches for one while debugging a failing check is one tool call away from
+# taking the fleet down.
+#
+# ── the two layers, and why both are needed ──────────────────────────────────
+#
+#   sandbox.allow (here)       argv[0] must be on this list, on this machine and
+#                              on every member, for a model's command and for a
+#                              verifier's check_cmd alike. A command missing from
+#                              it cannot run at all — no flag grants it back.
+#                              This is also why the list lives in roles.yaml: a
+#                              team's own sandbox.allow outranks config.json's,
+#                              and $LCA_ROLES outranks the team's.
+#   permission.run (the json)  the per-command rules. Last match wins, so the
+#                              order in that file IS the policy: it OPENS with
+#                              `"*": "deny"`, then allows the shapes the work
+#                              needs, then denies the ones the wrapper owns, then
+#                              re-allows the single exception. These produce a
+#                              REFUSAL THE MODEL CAN READ ("denied by a permission
+#                              rule") instead of a dead session, and -y cannot
+#                              override them: a deny returns before trust is ever
+#                              consulted. A role's own permission: block still
+#                              outranks them, which is the documented precedence
+#                              of the whole system — so don't write one for a role
+#                              you run unattended.
+#
+# The base rule is `deny` and not `ask`, and that is the difference between a
+# guardrail and a decoration. -y — which is on this file's own command line above
+# — turns every `ask` into an allow: Approver.Confirm consults trust BEFORE it
+# consults "there is nobody here to ask", so under `ask` the deny list caught
+# only the spellings it names literally and everything else ran. Based on `deny`,
+# a spelling nobody anticipated is refused with a reason the model can read.
+# `lca doctor -role coder -y` prints what the posture actually is under that flag.
+#
+# A deny holds on a member too, where the command crosses a login shell: every
+# segment of the line is evaluated there, so `git status && git push` is denied
+# on the `git push` in it. The line is also canonicalised before matching, so
+# `git  push` (two spaces), `git<TAB>push` and `git 'push'` — all of which exec
+# byte-identically to the denied line — are denied as well.
+#
+# ── what a command-pattern list cannot catch ─────────────────────────────────
+#
+# Say it plainly, because the list above reads like a boundary and is not one. A
+# model that means to push can still get there, and no pattern list can stop it:
+#
+#   * a script it just WROTE. `bash ./push.sh` is `bash *`, which the work needs.
+#   * `cargo run` / `go run .` with an edited main.rs — the compiler is the shell.
+#   * a `.git/config` alias (`git p = push`) written with the edit tool: edit is
+#     `ask`, which -y allows, and nothing guards `.git/`.
+#   * a symlink or a shadowing PATH entry named `cargo`.
+#   * `bash -c '…'`, `sh -c '…'` and `python3 -c '…'` are denied here, which
+#     closes the easiest spelling and not the class: in non-shell mode the inner
+#     command of an interpreter is never allowlist-checked, so any interpreter
+#     invocation is an unchecked shell.
+#
+# The enforcement that DOES hold is outside lca, and the pipeline should have it:
+# a push token restricted server-side to no branches (or to protected-branch
+# rules that refuse the agent), and a worktree whose remote credentials cannot
+# push at all. Treat these rules as the thing that stops an honest mistake and
+# tells the model why, and the token as the thing that stops a determined one.
+
+defaults:
+  verify_attempts: 3
+  check_timeout: 1800    # ONE check: a stand run is a build + a deploy + check.sh
+
+  # The run's own ceilings. An unattended run has no operator to notice a loop,
+  # and `steps` alone bounds nothing: an agent that re-reads three files ends
+  # every turn inside its step budget and the verifier hands it the same red
+  # check for as long as the GPU is willing. -timeout / -max-steps / -max-tokens
+  # override these per run; exceeding any of them is exit 4, which the wrapper
+  # reads as "needs a human, and tell them it did not fit".
+  timeout: 45m
+  max_steps: 200
+  max_tokens: 4000000
+
+sandbox:
+  # Everything the work needs and nothing that reaches production. `curl`, `wget`,
+  # `scancel` and `berserk-ctl.sh` are deliberately absent.
+  #
+  # `ssh` IS here, and that is a trade-off worth stating. The requirement allows
+  # one ssh shape — invoking the stand's own stage/*.sh — and a shape cannot be
+  # allowed by a rule if the hard boundary refuses the binary. So the jail permits
+  # ssh and the rules in pipeline.config.json narrow it to those three scripts; a
+  # model that types anything else gets a refusal it can read. What the jail alone
+  # still permits is a check_cmd an OPERATOR wrote with ssh in it, because a check
+  # meets no permission rules — that one is on whoever wrote roles.yaml.
+  #
+  # Reaching a member is not affected either way: that transport builds its own
+  # ssh, and the allowlist is applied to what the command does over there.
+  allow: [cargo, go, gofmt, python3, bash, sh, rg, grep, git, ssh, stage.sh, ls, cat, head, tail, wc, find, sort, uniq, cut, sed, awk, echo, true]
+
+  # shell: false — and left at false on purpose. With a shell every command in a
+  # pipeline is still allowlisted, but the model gains redirects, and `> file` is
+  # a write no edit guard ever saw.
