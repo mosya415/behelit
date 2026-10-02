@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -1443,6 +1444,22 @@ func lastCols(s string, n int) string {
 // row below it, so the reader could no longer tell which column a value was in.
 // In statusLine it defeated the no-wrap invariant the editor's walk-back counts
 // on, which erased the input line on every keystroke.
+// clockOf is a wall-clock time for a reader at this terminal: the time alone
+// while it is still today, and the date in front of it once it is not — a run
+// that spans midnight, or a session reopened the next morning, otherwise reports
+// 02:14 for something that happened yesterday.
+func clockOf(t time.Time) string {
+	if t.IsZero() {
+		return gEllipsis
+	}
+	t = t.Local()
+	ny, nm, nd := time.Now().Local().Date()
+	if y, m, d := t.Date(); y == ny && m == nm && d == nd {
+		return t.Format("15:04:05")
+	}
+	return t.Format("Jan 2 15:04")
+}
+
 func ellipsize(s string, n int) string {
 	if visibleWidth(s) <= n || n < 2 {
 		return s

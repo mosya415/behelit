@@ -835,6 +835,11 @@ func (r *Repl) cmdTasks(arg string) bool {
 				section(h.ID, h.Agent)
 				row("task", h.Title)
 				row("status", statusWord(h.Status))
+				if h.Duration > 0 {
+					row("done", clockOf(h.Start.Add(h.Duration))+faint("%safter %s", gSep, fmtDurShort(h.Duration)))
+				} else if !h.Start.IsZero() {
+					row("started", clockOf(h.Start))
+				}
 				if h.Detail != "" {
 					fmt.Println()
 					for _, l := range strings.Split(h.Detail, "\n") {
@@ -853,14 +858,19 @@ func (r *Repl) cmdTasks(arg string) bool {
 	}
 	var rows [][]string
 	for _, h := range hist {
-		dur := gEllipsis
+		dur, done := gEllipsis, gEllipsis
 		if h.Duration > 0 {
 			dur = fmtDurShort(h.Duration)
+			// WHEN it finished, beside how long it took. A long run is read after the
+			// fact — the deploy broke at 02:14, which of these had finished by then —
+			// and a duration cannot answer that. Local time, like the lease messages,
+			// because the operator reading it is at this terminal.
+			done = clockOf(h.Start.Add(h.Duration))
 		}
-		rows = append(rows, []string{faint("%s", h.ID), h.Kind, h.Agent, statusWord(h.Status), faint("%s", dur), firstLine(h.Title)})
+		rows = append(rows, []string{faint("%s", h.ID), h.Kind, h.Agent, statusWord(h.Status), faint("%s", dur), faint("%s", done), firstLine(h.Title)})
 	}
 	// the task is the operator's own sentence and its two ends both say what it was
-	sectionTable("subagent runs", "", []string{"id", "kind", "agent", "status", "time", "task"}, rows, 5)
+	sectionTable("subagent runs", "", []string{"id", "kind", "agent", "status", "took", "done", "task"}, rows, 6)
 	hint("/tasks <id> shows a run's result")
 	return false
 }
@@ -1040,10 +1050,20 @@ func (r *Repl) cmdContext(string) bool {
 	// fill — and those are the ones worth reading, because in a team the children
 	// are where the context fills while the primary stays nearly empty.
 	type kidRow struct {
-		id, role, model, state string
-		tok, of                int
+		id, role, model, state, done string
+		tok, of                      int
 	}
 	var kids []kidRow
+	// The history first, by id: a child can be BOTH still in the registry (it is
+	// resumable) and already finished, and only the history knows when it
+	// finished. Looked up rather than recomputed, so the two sections of this
+	// panel and /tasks all print the one recorded time.
+	when := map[string]string{}
+	for _, e := range r.orch.History() {
+		if e.Duration > 0 {
+			when[e.ID] = clockOf(e.Start.Add(e.Duration))
+		}
+	}
 	live := map[string]bool{}
 	for _, k := range r.orch.Tasks() {
 		live[k.ID] = true
@@ -1055,13 +1075,21 @@ func (r *Repl) cmdContext(string) bool {
 		if k.budgetKnown() {
 			of = k.budget()
 		}
-		kids = append(kids, kidRow{k.ID, k.agent.Name, k.client.Model(), state, estimateTokens(k.Msgs), of})
+		done := when[k.ID]
+		if done == "" || k.running.Load() {
+			done = gEllipsis // still going: there is no finish time to print yet
+		}
+		kids = append(kids, kidRow{k.ID, k.agent.Name, k.client.Model(), state, done, estimateTokens(k.Msgs), of})
 	}
 	for _, e := range r.orch.History() {
 		if live[e.ID] || e.Ctx == 0 {
 			continue // still listed above, or never measured
 		}
-		kids = append(kids, kidRow{e.ID, e.Agent, e.Model, faint("%s", e.Status), e.Ctx, e.CtxOf})
+		done := when[e.ID]
+		if done == "" {
+			done = gEllipsis
+		}
+		kids = append(kids, kidRow{e.ID, e.Agent, e.Model, faint("%s", e.Status), done, e.Ctx, e.CtxOf})
 	}
 	if len(kids) > 0 {
 		pnl.Div("subagents")
@@ -1073,7 +1101,7 @@ func (r *Repl) cmdContext(string) bool {
 			} else if k.tok > 0 {
 				fill = fmt.Sprintf("~%s", kfmt(k.tok)) + faint("%sno window reported", gSep)
 			}
-			rows = append(rows, []string{faint("%s", k.id), k.role, k.model, k.state, fill})
+			rows = append(rows, []string{faint("%s", k.id), k.role, k.model, k.state, faint("%s", k.done), fill})
 		}
 		pnl.Table(nil, rows, pnl.room())
 	}

@@ -244,3 +244,24 @@ func TestThePruneSparesTheSessionBeingContinued(t *testing.T) {
 		t.Fatalf("want the spared one plus 2 kept, got %d", left)
 	}
 }
+
+// How long a task took does not say WHEN it finished, and a long run is read
+// after the fact — often beside somebody else's incident: "the stand went down
+// at 02:14, which of these had finished by then" is only answerable against a
+// recorded clock time.
+func TestAClockTimeSaysWhichDayItWas(t *testing.T) {
+	now := time.Now()
+	if got := clockOf(now); !strings.Contains(got, now.Local().Format("15:04")) {
+		t.Fatalf("today is the time alone, got %q", got)
+	}
+	// Once it is not today any more, the date goes in front: "02:14" for
+	// something that happened yesterday is worse than no answer.
+	y := now.AddDate(0, 0, -1)
+	got := clockOf(y)
+	if !strings.Contains(got, y.Local().Format("Jan")) || !strings.Contains(got, y.Local().Format("15:04")) {
+		t.Fatalf("yesterday needs its date, got %q", got)
+	}
+	if clockOf(time.Time{}) != gEllipsis {
+		t.Fatalf("a time nobody recorded says so, got %q", clockOf(time.Time{}))
+	}
+}

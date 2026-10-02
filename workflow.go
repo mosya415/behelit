@@ -1567,6 +1567,10 @@ func (r *wfRunner) report(s *WorkflowStep, o stepOutcome, d time.Duration) {
 		bits = append(bits, "unverified")
 	}
 	bits = append(bits, fmtDurShort(d))
+	// And the clock. A pipeline is read after the fact, often beside somebody
+	// else's incident: "the stand went down at 02:14" is only answerable against
+	// a step that says when it finished, and a duration alone cannot say it.
+	bits = append(bits, "done "+clockOf(time.Now()))
 	if o.Attempts > 1 {
 		bits = append(bits, plural(o.Attempts, "attempt", "attempts"))
 	}
@@ -1690,12 +1694,19 @@ func (r *wfRunner) summary() {
 		default:
 			failed++
 		}
+		// state.json has recorded `finished` since this file was written; it had
+		// never been shown, so a resumed run's table could not say which steps
+		// belonged to which night.
+		done := gEllipsis
+		if t, err := time.Parse(time.RFC3339, ss.Finished); err == nil {
+			done = clockOf(t)
+		}
 		rows = append(rows, []string{ss.Name, ss.Kind, orDash(ss.Role), stepStatusWord(ss.Status),
-			fmtDurShort(time.Duration(ss.DurationMs) * time.Millisecond), strconv.Itoa(ss.Attempts), firstLine(ss.Detail)})
+			fmtDurShort(time.Duration(ss.DurationMs) * time.Millisecond), done, strconv.Itoa(ss.Attempts), firstLine(ss.Detail)})
 	}
 	// The detail goes in whole, for the same reason the plan's check does — and the
 	// step name and the detail are the two identifiers on the row.
-	pnl.Table([]string{"step", "kind", "role", "status", "time", "tries", "detail"}, rows, pnl.room(), 0, 6)
+	pnl.Table([]string{"step", "kind", "role", "status", "took", "done", "tries", "detail"}, rows, pnl.room(), 0, 7)
 	fmt.Println()
 	pnl.Print()
 	tally := fmt.Sprintf("%d/%d ok", ok, len(r.wf.Steps))
