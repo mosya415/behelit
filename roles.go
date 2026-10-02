@@ -41,7 +41,8 @@ import (
 //	  context: 128000
 //	  steps: 50
 //	  verify_attempts: 2        # verifier failures fed back before giving up
-//	  check_timeout: 600        # seconds, for ONE check
+//	  check_timeout: 600        # seconds (or 10m), for ONE check; a role may
+//	                            # raise its own up to an hour
 //	  timeout: 30m              # the WHOLE run (-timeout overrides)
 //	  max_steps: 120            # the whole run, over every role's own
 //	  max_tokens: 2000000       # prompt+completion, subagents included
@@ -67,6 +68,7 @@ import (
 //	    effort: medium
 //	    tools: [read_file, grep, glob, list_dir, edit, write, run_command]
 //	    check_cmd: go test ./...
+//	    check_timeout: 1800    # or 30m — this role's check is a stand; max 1h
 //	    prompt_file: prompts/coder.md
 //	  cheap:                    # used for compaction
 //	    models: [qwen3-30b-a3b]
@@ -252,8 +254,12 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		if n, err := strconv.Atoi(defs.str("verify_attempts")); err == nil && n > 0 {
 			rc.VerifyAttempts = n
 		}
-		if n, err := strconv.Atoi(defs.str("check_timeout")); err == nil && n > 0 {
-			rc.CheckTimeout = n
+		if v := defs.str("check_timeout"); v != "" {
+			secs, err := parseCheckTimeout("defaults: check_timeout", v)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", p, err)
+			}
+			rc.CheckTimeout = secs
 		}
 		// The run budgets. A value that does not parse is an ERROR and not a silent
 		// zero: a team that wrote `timeout: 30 minutes` and got "no limit" would
@@ -842,6 +848,18 @@ func applyRole(a *Agent, n *yNode, baseDir string) error {
 	if v := n.str("check_cmd"); v != "" {
 		a.CheckCmd = v
 	}
+	// A role's own ceiling on ONE check. Parsed with its field right here, and
+	// never silently dropped: a stand check behind a ten-minute default is killed
+	// at ten minutes and reported to the model as a failing check, which is the
+	// one failure mode this key exists to remove — so a value that does not parse
+	// has to say so rather than leave the default in place and look obeyed.
+	if v := n.str("check_timeout"); v != "" {
+		secs, err := parseCheckTimeout("check_timeout", v)
+		if err != nil {
+			return err
+		}
+		a.CheckTimeout = secs
+	}
 	if v := n.str("mode"); v != "" {
 		a.Mode = v
 	}
@@ -1085,6 +1103,9 @@ func (rc *RolesConfig) YAML() string {
 		}
 		if a.CheckCmd != "" {
 			fmt.Fprintf(&b, "    check_cmd: %s\n", a.CheckCmd)
+		}
+		if a.CheckTimeout > 0 {
+			fmt.Fprintf(&b, "    check_timeout: %d\n", a.CheckTimeout)
 		}
 		if a.Review != "" {
 			fmt.Fprintf(&b, "    review: %s\n", a.Review)

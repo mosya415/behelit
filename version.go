@@ -88,6 +88,116 @@ func rolesHash(rc *RolesConfig) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// promptHash fingerprints the SYSTEM PROMPT a session actually ran with — the
+// assembled text, not the role's `prompt:` key: prompt.go composes it from the
+// role's prose, the tool transport's instructions, the subagent list, the
+// project's own instructions and the environment block, and any of those moving
+// changes what the model was asked to do.
+//
+// It is the third of the three fields an eval row needs, and the one the other
+// two cannot stand in for. lca_version moves when the binary is rebuilt and
+// roles_hash moves when roles.yaml is edited, but an AGENTS.md edit, a tool
+// added to the registry or a role switched from native to text tool calling
+// moves neither — and each of them rewrites the prompt. Two runs whose pass rate
+// differs and whose three hashes match are the same measurement twice; two whose
+// prompt_hash differs are two measurements, which is the thing worth knowing
+// before anybody claims the prompt edit helped.
+//
+// "" for no prompt at all, for the same reason rolesHash reports "" for no
+// roles.yaml: a hash of nothing says more than the hash of an empty string.
+func promptHash(prompt string) string {
+	if prompt == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(h[:])
+}
+
+// systemPromptOf is the system prompt a built session is carrying. It reads
+// Msgs[0] rather than calling systemPrompt() again, because that is the text the
+// gateway was sent: compaction and the project-instruction reload both rewrite
+// Msgs[0] in place (engine.go), and re-assembling it here would fingerprint a
+// prompt no request ever used.
+func systemPromptOf(s *Session) string {
+	if s == nil || len(s.Msgs) == 0 || s.Msgs[0].Role != "system" {
+		return ""
+	}
+	return s.Msgs[0].Content
+}
+
+// promptFingerprint is promptHash over the prompt with the two facts about THIS
+// run taken out of it. Without that it is a hash of the working directory and
+// the calendar, and useless for the one job it has.
+//
+// The assembled prompt names the jail root and today's date (prompt.go's
+// Environment block). An eval gives every task a fresh workspace under
+// <out>/<timestamp>/, so a raw hash differs between every two tasks of the same
+// run and between every two runs of the same task — which is to say it never
+// matches and never tells anybody anything. Two runs a week apart on the same
+// prompt have to produce the same hash, or there is nothing to compare.
+//
+// Nothing else is normalised. The allowlist, the tool documentation, the
+// platform, the project instructions and the role's own prose all stay in: each
+// of them is a real change to what the model was asked to do, and noticing
+// those is the point.
+// It reads both facts out of the PROMPT rather than out of the session — the
+// root off the line that names it, the date off the line that names it — and so
+// touches nothing else on a Session. That matters because one of its callers is
+// the panic handler in oneshot.go, where everything may be half-built: a
+// fingerprint is not worth a second panic inside the handler that exists to
+// report the first.
+const promptCwdLine = "- Working directory (jail): "
+
+func promptFingerprint(s *Session) string {
+	// Whatever the session was built with, if it was built: NewPrimary takes this
+	// once, before the first turn, and both callers read that one answer. Reading
+	// Msgs[0] again at the end of a run reported the POST-compaction, post-reload
+	// prompt, so a one-shot row and an eval row of the same configuration could
+	// disagree about the configuration.
+	if s != nil && s.promptFP != "" {
+		return s.promptFP
+	}
+	return fingerprintOf(systemPromptOf(s))
+}
+
+// fingerprintOf is the normalisation, over the prompt text itself. Separate from
+// the session so the rules above can be asserted on a prompt a test wrote, and
+// so promptFingerprint's memo is the only thing that decides WHEN the prompt is
+// read.
+func fingerprintOf(p string) string {
+	if p == "" {
+		return ""
+	}
+	// By prefix and not by today's literal date or the jail's current root: a run
+	// that started before midnight and is fingerprinted after it, or one whose
+	// root moved mid-session, would otherwise keep a per-run fact in the hash and
+	// never match anything again.
+	lines := strings.Split(p, "\n")
+	root := ""
+	for _, l := range lines {
+		if strings.HasPrefix(l, promptCwdLine) {
+			root = strings.TrimSpace(strings.TrimPrefix(l, promptCwdLine))
+			break
+		}
+	}
+	for i, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "- Today's date: "):
+			lines[i] = "- Today's date: <today>"
+		case strings.HasPrefix(l, promptCwdLine):
+			lines[i] = promptCwdLine + "<root>"
+		}
+	}
+	p = strings.Join(lines, "\n")
+	// The root again, everywhere else it appears — a skills index, the name of a
+	// project-instructions file. Only when it is a real path: replacing "/"
+	// throughout a prompt would hash something nobody wrote.
+	if len(root) > 1 {
+		p = strings.ReplaceAll(p, root, "<root>")
+	}
+	return promptHash(p)
+}
+
 // runVersion is `lca version`: the build, and the team it would run with here.
 // It talks to nothing — no gateway, no ssh — so it answers in a broken
 // environment, which is when somebody usually asks.

@@ -1004,9 +1004,40 @@ func loadRunState(dir string) (*WorkflowState, error) {
 // saveRunState writes through a temp file in the same directory and renames it:
 // a crash mid-write must not leave a half-parsed state, which is the whole
 // point of writing state after every step.
+// redactedRunState is st with the fields that carry text from OUTSIDE this
+// program scrubbed: a step's recorded output, the check output under it, and a
+// reviewer's verdict text. A `run:` step's script echoes `curl -H
+// "Authorization: Bearer $BSK_TOKEN"` before it dies, and state.json is a file a
+// reader opens to find out why a stage stopped.
+//
+// Field by field, and deliberately NOT over the marshalled bytes the way the
+// transcript and the trace are done. This document is read BACK: a resume
+// substitutes `vars` into the next step's command line and compares them with
+// the -var the operator passed, and `sum` is the sha256 that decides whether the
+// workflow file was edited under the run. A [redacted] in any of those would
+// make a resumed run refuse to start, or start and execute a command that is not
+// the one it is resuming. So the three fields that hold foreign prose are named,
+// and the ones a program reads are left byte for byte.
+//
+// On a copy, because the live state is what the rest of this run expands
+// ${steps.x.out} from.
+func redactedRunState(st *WorkflowState) *WorkflowState {
+	if st == nil || len(envSecrets()) == 0 {
+		return st
+	}
+	c := *st
+	c.Steps = append([]StepState(nil), st.Steps...)
+	for i := range c.Steps {
+		c.Steps[i].Out = redactSecrets(c.Steps[i].Out)
+		c.Steps[i].Detail = redactSecrets(c.Steps[i].Detail)
+		c.Steps[i].Review = redactSecrets(c.Steps[i].Review)
+	}
+	return &c
+}
+
 func saveRunState(dir string, st *WorkflowState) error {
 	st.Updated = nowTS()
-	b, err := json.MarshalIndent(st, "", "  ")
+	b, err := json.MarshalIndent(redactedRunState(st), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -1189,7 +1220,16 @@ func (l *runLog) Write(b []byte) (int, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.f.WriteString(stripANSI(string(b)))
+	// Scrubbed HERE, at the byte boundary, and not by whoever hands us the bytes.
+	// This writer is a step's live tee: execCheck streams the child's stdout and
+	// stderr through it as they are produced, so the credential a `run:` step's
+	// script echoed — `curl -H "Authorization: Bearer $BSK_TOKEN"` before it dies —
+	// is on this disk long before the caller's buffered copy is scrubbed. And
+	// run.log is the file the run itself points the operator at when a step fails,
+	// which makes it the first thing pasted into a ticket. Same discipline as
+	// recorder.go and trace.go: the bytes go through the filter on the way to the
+	// file, so no new caller can forget.
+	l.f.WriteString(string(redactBytes([]byte(stripANSI(string(b))))))
 	return len(b), nil
 }
 

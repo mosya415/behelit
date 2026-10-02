@@ -209,7 +209,19 @@ func (o *Orchestrator) writeSummary(s *Session, f summaryFacts) string {
 	// description. ANSI and C0 controls go the same way: a build tool emits colour
 	// whether or not anybody is watching, and a NUL in the middle of a comment
 	// body is an API call the wrapper cannot make.
+	//
+	// All THREE fields that carry text from outside this program, and not just the
+	// one the model quotes back. `check` is the operator's own command line and
+	// `reason` quotes it — `sh -c 'curl -H "Authorization: Bearer $T"'`, with the
+	// shell having expanded $T before lca ever saw it — and both of them reach this
+	// file twice over: through the prompt below, and through skeleton() on the
+	// fallback path, which runs AFTER the model's prose has been scrubbed and so
+	// was never covered by scrubbing only the prose. Doing it on the facts instead
+	// of on the output covers every path out of them by construction, including the
+	// one request this file sends to the gateway.
 	f.tail = forPublication(f.tail)
+	f.check = forPublication(f.check)
+	f.reason = forPublication(f.reason)
 	body := forPublication(o.askForSummary(s, f))
 	if strings.TrimSpace(body) == "" {
 		// The model did not answer — the gateway went away mid-run, or the clock ran

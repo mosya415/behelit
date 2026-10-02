@@ -207,7 +207,18 @@ func continueSession(o *Orchestrator, s *Session, m sessionMeta) (int, error) {
 	s.Msgs = append(s.Msgs[:1:1], body...)
 	same := saved == "" || saved == s.Msgs[0].Content
 	if !same {
-		warnLine("-session %s: this round's system prompt is not the one that session ran with — the role, its tools or the project instructions changed, so the gateway has no cached prefix for it and the round costs what a fresh session costs", m.id)
+		// WHICH difference, because the three this used to name are the operator's
+		// fault and the fourth is nobody's: the prompt carries today's date and the
+		// jail root (prompt.go's Environment block), so a round two after midnight,
+		// or one run from a worktree at another path, misses the cache having
+		// changed nothing anybody wrote. Telling them to go and look at the role
+		// sends them after a difference that is not there. promptFingerprint's
+		// normalisation is exactly those two facts, so it is the right question.
+		why := "the role, its tools or the project instructions changed"
+		if fingerprintOf(saved) == fingerprintOf(s.Msgs[0].Content) {
+			why = "the dated Environment block is the only difference — this round crossed midnight, or the tree is at another path"
+		}
+		warnLine("-session %s: this round's system prompt is not the one that session ran with — %s, so the gateway has no cached prefix for it and the round costs what a fresh session costs", m.id, why)
 	}
 	o.rec.Event("session_continue", map[string]any{"from": m.path, "messages": len(body), "same_prefix": same})
 	return len(body), nil

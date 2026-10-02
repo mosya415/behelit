@@ -29,6 +29,14 @@ type Recorder struct {
 	uid     string
 	user    string
 	pid     int
+
+	// checkRound is the suffix this process's check logs carry, decided once on
+	// the first one written (checktail.go's checkRoundOf): "" for a session's
+	// first round and ".r2" for the round a `-session <uid>` continues, so a
+	// second round cannot overwrite the file the first round's result object
+	// named. checkRoundSet separates "no suffix" from "not asked yet".
+	checkRound    string
+	checkRoundSet bool
 }
 
 func NewRecorder(cfg Config) (*Recorder, error) { return NewRecorderOn(cfg, "") }
@@ -103,6 +111,12 @@ func (r *Recorder) Event(kind string, fields map[string]any) {
 	if err != nil {
 		return
 	}
+	// The audit records the command lines and the tool results of a run, so a
+	// `curl -H "Authorization: Bearer $TOK"` the model ran is in here verbatim.
+	// It is not an artefact anybody attaches to a ticket, but it is one more file
+	// under $LCA_DIR that somebody will eventually copy somewhere, and one line
+	// of JSON costs nothing to scrub.
+	line = redactBytes(line)
 	r.mu.Lock()
 	r.audit.Write(append(line, '\n'))
 	r.mu.Unlock()
@@ -127,7 +141,11 @@ func (r *Recorder) Transcript(msgs []Message) error {
 	if err != nil {
 		return err
 	}
-	return writeRecordAtomic(r.session, data, 0o600)
+	// This file goes to Jira as an attachment (requirement P2-2), which is the
+	// reason the scrub is here and not at the two publication sinks it started
+	// at: the transcript holds every tool result the model saw, and a check that
+	// echoed its environment on failure put a live token in one of them.
+	return writeRecordAtomic(r.session, redactBytes(data), 0o600)
 }
 
 // writeRecordAtomic writes one of the recorder's own files through a temporary
@@ -142,6 +160,21 @@ func writeRecordAtomic(path string, data []byte, perm fs.FileMode) error {
 	if err != nil {
 		return err
 	}
+	return renameRecord(tmp, path)
+}
+
+// writeRecordAtomicString is writeRecordAtomic for a record that is already a
+// string, which is the check log: a stand's output is megabytes and []byte(s)
+// copies all of them for nothing.
+func writeRecordAtomicString(path, data string, perm fs.FileMode) error {
+	tmp, err := tempBesideString(path, data, perm)
+	if err != nil {
+		return err
+	}
+	return renameRecord(tmp, path)
+}
+
+func renameRecord(tmp, path string) error {
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
@@ -162,7 +195,7 @@ func (r *Recorder) ChildTranscript(taskID string, msgs []Message) {
 	}
 	p := childTranscriptPath(r.dir, r.id, taskID)
 	os.MkdirAll(filepath.Dir(p), 0o700)
-	writeRecordAtomic(p, data, 0o600)
+	writeRecordAtomic(p, redactBytes(data), 0o600)
 }
 
 func (r *Recorder) SessionPath() string { return r.session }

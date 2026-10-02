@@ -94,7 +94,10 @@
 
 defaults:
   verify_attempts: 3
-  check_timeout: 1800    # ONE check: a stand run is a build + a deploy + check.sh
+  check_timeout: 1800    # ONE check: a stand run is a build + a deploy + check.sh.
+                         # A single role can raise its own (`check_timeout:` on
+                         # the role, up to an hour) without giving every cheap
+                         # `go test` role the same rope.
 
   # The run's own ceilings. An unattended run has no operator to notice a loop,
   # and `steps` alone bounds nothing: an agent that re-reads three files ends

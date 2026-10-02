@@ -62,10 +62,16 @@ type Agent struct {
 	ToolsSet bool
 	Context  int    // context limit in tokens
 	CheckCmd string // default verifier command for tasks given to this role
-	Review   string // roles.yaml `review:` — the role that reviews this role's diffs
-	Fork     bool   // roles.yaml `fork:` — delegations to this role start from the caller's reads
-	Tier     string // roles.yaml `tier:` — the chain this role names instead of models:
-	Member   string // roles.yaml `member:` — the machine this role's sessions work on
+	// CheckTimeout is roles.yaml `check_timeout:` on the ROLE — seconds, 0 = the
+	// team's defaults:. It exists because one role's check is a stand (build,
+	// deploy, check.sh: five to fifteen minutes) while the rest run `go test` in
+	// seconds, and raising the team default to cover the first gives the others an
+	// hour each to hang in. Capped at an hour by the loader.
+	CheckTimeout int
+	Review       string // roles.yaml `review:` — the role that reviews this role's diffs
+	Fork         bool   // roles.yaml `fork:` — delegations to this role start from the caller's reads
+	Tier         string // roles.yaml `tier:` — the chain this role names instead of models:
+	Member       string // roles.yaml `member:` — the machine this role's sessions work on
 }
 
 func (a *Agent) isPrimary() bool  { return a.Mode == "primary" || a.Mode == "all" || a.Mode == "" }

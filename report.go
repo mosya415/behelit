@@ -1143,9 +1143,20 @@ func writeReport(dst string, r *report) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	w := bufio.NewWriterSize(tmp, 64<<10)
+	// The scrub sits UNDER the buffer, between it and the file, and not over the
+	// report struct: the page is rendered straight out through a 64 KiB buffer and
+	// never exists as one string, and a `lca report` run days later may be built
+	// from a trace an older binary wrote with nothing scrubbed out of it. It holds
+	// back the tail of each write so a token cannot slip through split across two
+	// of them — hence the second Flush, which releases it.
+	rw := newRedactWriter(tmp)
+	w := bufio.NewWriterSize(rw, 64<<10)
 	r.render(w)
 	if err := w.Flush(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := rw.Flush(); err != nil {
 		tmp.Close()
 		return err
 	}

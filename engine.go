@@ -357,6 +357,11 @@ type Session struct {
 	interruptedAtDoor atomic.Bool // Ctrl-C answered an approval question
 	background        bool        // runs detached from the terminal: can't prompt for approval
 	lastUsage         Usage
+
+	// promptFP is promptFingerprint of the system prompt this session was BUILT
+	// with — the run's prompt_hash, decided before the first turn and never
+	// recomputed. See NewPrimary.
+	promptFP string
 }
 
 // NewPrimary creates the REPL / one-shot session.
@@ -373,6 +378,15 @@ func (o *Orchestrator) NewPrimary(agentName, modelRef string, view View) (*Sessi
 		return nil, err
 	}
 	s.Msgs = []Message{{Role: "system", Content: s.systemPrompt()}}
+	// The run's identity, taken HERE and once. prompt_hash has to name what the
+	// run STARTED from, and Msgs[0] does not stay still: compaction and the
+	// project-instruction reload both rewrite it in place (RefreshSystem),
+	// so a caller that read it at the end of the run reported a different prompt
+	// from a caller that read it at the beginning — for the same roles.yaml, the
+	// same binary and the same task. The field exists so two runs with matching
+	// hashes can be called the same measurement twice; two callers of one run
+	// disagreeing defeats it.
+	s.promptFP = promptFingerprint(s)
 	return s, nil
 }
 

@@ -544,8 +544,9 @@ func cleanUsage() {
 		"usage: lca clean [--branches] [--dry-run] [<branch>…]",
 		"",
 		"  with no flags   remove the worktrees of processes that are gone, sweep",
-		"                  stale write leases, temporary indexes and finished",
-		"                  integration journals. No branch is touched, and a merge",
+		"                  stale write leases, temporary indexes, old check output",
+		"                  and finished integration journals. No branch is touched,",
+		"                  and a merge",
 		"                  worktree you were handed is left alone until it is a day",
 		"                  old, clean and not mid-merge.",
 		"  --branches      also delete the lca/* branches that are integrated and",
@@ -796,6 +797,25 @@ func cleanRepo(top string, cfg Config, branches, dry bool, named []string) int {
 		say("sweep the half-written file %s", p)
 		if !dry {
 			os.Remove(p)
+		}
+	}
+	// The check logs, which are the biggest thing lca writes: a stand prints
+	// megabytes per attempt and every attempt of every run keeps one. They are
+	// bounded on every start (pruneCheckLogs), but this is the command an operator
+	// runs when the disk is full, and it did not know the directory existed — so
+	// the one sweep somebody reaches for missed the one directory worth sweeping.
+	// Said with its size, because "a few old logs" and "forty gigabytes" are
+	// different decisions.
+	if dir := filepath.Join(stateDir, "checks"); true {
+		stale, bytes := checkLogsToCollect(dir, cfg.KeepSessions, "")
+		if len(stale) > 0 {
+			say("sweep %s of check output past the limits (%s) from %s",
+				fmtBytes(bytes), plural(len(stale), "file", "files"), shortDir(dir))
+			if !dry {
+				for _, p := range stale {
+					os.Remove(p)
+				}
+			}
 		}
 	}
 	// A journal whose branch is gone, or whose branch is now in the tree, has

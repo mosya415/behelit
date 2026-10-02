@@ -258,6 +258,15 @@ func main() {
 	})
 	defer orch.rec.Event("session_end", nil)
 	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions, resumed.id)
+	// The check logs sit beside the transcripts and are bounded the same way, by
+	// SESSION — and in bytes as well, because they are the biggest thing lca
+	// writes: a stand prints megabytes per attempt, an unattended pipeline runs
+	// every few minutes, and this is the one artefact that would otherwise fill
+	// the disk on its own.
+	//
+	// resumed.id for the same reason the line above takes it: a round two must not
+	// start by deleting the paths round one's result object handed the wrapper.
+	pruneCheckLogs(filepath.Join(cfg.stateDir(), "checks"), cfg.KeepSessions, resumed.id)
 
 	// After the prune, so a round two is never the thing that gets collected, and
 	// before the one-shot appends its message: the history has to be under it.
@@ -375,6 +384,16 @@ func buildOrchestrator(cfg Config, ap *Approver, rec *Recorder, tracer *Tracer) 
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	mset, mcpWarns := loadMCP(cfg, fc)
+	// The process-wide tool table has one owner. `lca eval -j N` sets this before
+	// its workers start, because a second registration rebinds every MCP tool's
+	// server under the sessions already running against the first one — see the
+	// refusal in eval.go. Failing the task that brought MCP with it (through its
+	// own LCA_ROOT) is a row with a reason in it; racing is a row that says Jira
+	// was down, or a crash that writes no rows at all.
+	if len(mset.order) > 0 && mcpRefuseSecondRegistration.Load() {
+		mset.cancel()
+		return nil, fmt.Errorf("mcp: this task configures MCP servers (%s) and the run is parallel — the MCP tool table is shared by the whole process; run with -j 1", strings.Join(mset.order, ", "))
+	}
 	mcpWarns = append(mcpWarns, registerMCPTools(mset)...)
 
 	roles, err := loadRoles(cfg)

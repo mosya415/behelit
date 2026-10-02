@@ -146,25 +146,41 @@ human line, including the model's own prose, moves to stderr, and so does colour
 ```json
 {"status": "passed", "session": "20260102-…", "role": "coder", "models": ["…"],
  "attempts": 2, "check_cmd": "./check.sh", "check_exit": 0, "check_tail": "…",
+ "check_logs": ["/path/<session>-1.1.log", "/path/<session>-2.1.log"],
  "files_changed": 3, "diff_bytes": 1840, "turns": 17, "tool_calls": 42,
  "tool_errors": 1, "invalid_calls": 0, "tokens": {"prompt": 0, "completion": 0, "cached": 0},
  "duration_ms": 0, "transcript": "/path", "trace": "/path",
- "lca_version": "sha", "roles_hash": "sha256 of roles.yaml"}
+ "lca_version": "sha", "roles_hash": "sha256 of roles.yaml",
+ "prompt_hash": "sha256 of the role's system prompt"}
 ```
 
 `check_exit` is `null` when no check ran, so `check_exit == 0` can never be read
 as green by accident; `check_cmd` and `check_tail` are always present beside it
 (empty when there was no check), because three fields describing one thing that
 appear and disappear independently are a `KeyError` on the row that matters.
+`check_logs` is the full output of every check of every attempt, one file each,
+beside the transcript — `check_tail` is a *selection* out of those bytes (see
+[the check that takes minutes](#the-check-that-takes-minutes--checktailgo)), and
+these are what a human is given when the selection is not enough. It is `[]` and
+never `null`, for the same reason its neighbours have no `omitempty`.
 `tokens` is the **run's** spend — every session in it, subagents, the compactor
 and the closing summary call included — so it cannot contradict the `reason`
 standing next to it. `files_changed` counts what reached the tree, a delegation's
-merged diff included. `lca_version` and `roles_hash` (`lca version` prints both)
-are what make two runs comparable: a pass rate that moved after a prompt edit is
-a different measurement, not a better one. `summary` is there when
+merged diff included. `lca_version`, `roles_hash` (`lca version` prints both) and
+`prompt_hash` are what make two runs comparable: a pass rate that moved after
+a prompt edit is a different measurement, not a better one, and `prompt_hash` is
+the one the other two cannot stand in for — an `AGENTS.md` edit or a tool added
+to a role's `tools:` moves neither the binary nor `roles.yaml` and rewrites the
+prompt. It is taken over the prompt with the working directory and today's date
+normalised out, so two runs of one role in two worktrees agree.
+
+`summary` is there when
 `-summary` wrote one, and `review` only on a [`-diff-base`](#the-reviewers-per-line-verdict---diff-base-reviewgo)
 run — where its ABSENCE is itself the answer, because a review that could not be
-read is `status: failed` and never a silent approve.
+read is `status: failed` and never a silent approve. It can be PRESENT beside a
+status of `budget_exceeded`: the reviewer answered and the run then ran out of
+clock or tokens, so the verdict is real and the run is not finished — read
+`review.verdict` and the status together, which is what the exit table is for.
 
 The **exit code** is the whole of the wrapper's decision, so it is a table:
 
@@ -295,7 +311,9 @@ environment variables whose names match `*TOKEN*`, `*KEY*`, `*SECRET*` or
 stripped. The model is handed its own tool results and told to be specific about
 what did not work, so a `logs` command that printed an `Authorization` header is
 the ordinary path from a live token to a merge request description. The result
-object's `check_tail` and `reason` go through the same filter. The 3 KB clamp cuts
+object's `check_tail` and `reason` go through the same filter, and so does
+[every other artefact a run writes](#secrets-out-of-every-artefact--redactgo).
+The 3 KB clamp cuts
 at a line boundary and never inside a rune, so the file is always valid UTF-8 —
 `open(..., encoding="utf-8")` on it cannot be the thing that fails a run whose
 work is already done. A `-summary` path that cannot be written is refused at
@@ -455,7 +473,9 @@ Comment bodies and the summary go through the same filter as `-summary` and
 `check_tail`: the values of `*TOKEN*`, `*KEY*`, `*SECRET*` and `*PASSWORD*`
 variables become `[redacted]`, and escapes and control bytes are stripped. These
 strings are pasted into a public merge request by a program that will not read
-them first.
+them first. The same values are scrubbed out of
+[every other artefact the run writes](#secrets-out-of-every-artefact--redactgo),
+the transcript included — it goes to Jira as an attachment.
 
 #### The next round on the same session — `-session <uid>`
 
@@ -821,6 +841,7 @@ roles:
     effort: medium
     tools: [list_dir, glob, grep, read_file, edit, write, run_command]
     check_cmd: go test ./...
+    check_timeout: 1800                 # or 30m — this role's check is a stand
     prompt_file: prompts/coder.md
   cheap:
     models: [qwen3-30b-a3b-instruct]
@@ -831,6 +852,19 @@ roles:
 When the file is silent, `apply:` is `verified`, `defaults.verify_attempts` is 2
 and `defaults.check_timeout` is 600 seconds; the numbers above are only an
 example.
+
+`check_timeout` bounds **one** check and is settable on a role as well as under
+`defaults:`, as a number of seconds or a duration (`30m`), **up to an hour**.
+Both spellings are needed because one role's check is a stand — build, deploy,
+`check.sh`, five to fifteen minutes before anything is known — while the rest run
+`go test` in seconds, and raising the team default to cover the first gives every
+other role an hour to hang in. An hour is a real ceiling and not advice: this
+timeout is the only thing that ends a check that stopped answering, and an
+unattended run with no bound on it holds its worktree and its ticket until
+somebody notices. A value over it, or one that does not parse, is a config error
+with exit 2 rather than a silently ignored line that leaves the default in place
+and looks obeyed — give the whole *run* longer with `-timeout`, which is where
+that belongs.
 
 A role is an agent bound to an **ordered model chain**, a reasoning effort, a
 prompt, an **exact tool set** and a **context limit** (the budget for trimming
@@ -865,6 +899,54 @@ without prompts; `bsk` still asks.
 `-check` gives a one-shot run the same contract:
 `lca -role coder -check "go test ./..." "fix the flaky parser test"` exits 0
 only if the check passes.
+
+#### The check that takes minutes — `checktail.go`
+
+A stand check is a build, a deploy and then `check.sh`: five to fifteen minutes,
+and twenty thousand lines of output with the one line that decides the ticket
+somewhere in the middle of it. The last sixty lines — which is what the verifier
+used to send back — are the harness's own epilogue, and on a stand that epilogue
+is "3 of 412 failed, see above". The model was being told that something was
+wrong and shown the one part of the output that does not say what.
+
+So the output is cut three ways instead of one:
+
+- the **full** output of every check of every attempt goes to a file beside the
+  transcript (`$LCA_DIR/checks/<session>-<attempt>.<n>.log`, 0600, bounded both by
+  `keep_sessions` and by a byte ceiling, oldest session first, because one attempt
+  of a stand check was measured at 500 MB), so nothing is lost. The paths are in
+  the result object's `check_logs`. A second round on the same session
+  (`-session <uid>`) writes `…<session>.r2-<attempt>.<n>.log`, so it cannot
+  overwrite the file the first round's result object named.
+- what the **model** is sent is *selected* rather than truncated: every line
+  matching `error` / `FAIL` / `panicked` / `✗` (case-insensitively) with five
+  lines of context around it, plus the last forty. The order is a **priority**
+  order and not the order they are listed in: the matching lines first, then the
+  end of the log, then the context around each match with the radius shrinking
+  while the budget runs out. The line that matched is the one the whole file
+  exists to deliver — forty long lines of a JSON deploy record in the epilogue
+  must not be able to crowd out the `FAIL` twenty rows above them — and the
+  matches are taken from the first forwards, because in a build log the first
+  error is the cause and the rest are its consequences. A single line of
+  megabytes (a check whose progress output uses only `\r`) is clipped *around*
+  its match rather than through the middle.
+- what is **omitted is marked**, with the line numbers it stood at — `[… lines
+  41-8213 omitted of 20001 …]` — and those numbers are an index into the full log
+  file, because the two are cut from the same bytes. A tail that silently skipped
+  eight thousand lines would read as a complete log.
+
+Output short enough to arrive whole still does, byte for byte and with no
+markers: `go test ./...` on a red package prints forty load-bearing lines, and an
+operator reading `check_tail` should see what the command printed. The selection
+has a byte ceiling of its own, because this text is appended to a conversation
+that goes round the attempt loop again, and the ceiling is real: every omission
+marker is charged against it as it is claimed, which is what keeps a log where
+every twelfth line matches from spending 3.7x the stated budget on markers. When
+it is reached the count of lines left behind is stated rather than dropped — and
+it is stated without telling the model to go and read the full log, which under
+the default `LCA_DIR` sits outside the sandbox and cannot be read. When the log
+*is* inside the jail, the message that goes back names the path and the `grep`
+that would find what was cut.
 
 ### `apply: branch` — a delegation becomes a real branch — `branch.go`, `clean.go`
 
@@ -1264,8 +1346,51 @@ the model.
 Built on the trace:
 
 ```sh
-lca eval [-out dir] [-role r] [-run regexp] [-transport native,text] [-tier cheap,premium] [-keep] [-v] tasks/
+lca eval [-out dir] [-role r] [-run regexp] [-transport native,text] [-tier cheap,premium]
+         [-repeat N] [-j N] [-keep] [-v] tasks/
+lca eval -compare before/results.jsonl after/results.jsonl
 ```
+
+`-repeat N` runs every task N times, because model variance is large enough that
+one run proves nothing: the row that matters is "3 of 5 passed", and five rows
+reading passed, failed, passed, passed, failed are not that row. Each repetition
+is its own tree and its own line in `results.jsonl` (`repeat` says which run it
+was), and a **spread** table at the end counts the passes and the first-attempt
+passes per task with the median tokens and time beside them.
+
+`-j N` runs N of them at once. **What that does to the gateway:** each job is a
+separate `lca` session with its own `x-session-id`, and each one is sequential in
+itself, so `-j N` means exactly N requests in flight and N prefix-cache slots in
+use — no more. Nothing is batched and no request is reordered, so the gateway
+sees what it would see from N operators working at once; past its own capacity it
+queues, and the only thing that changes here is wall clock. It is **1 by
+default**, because the right number is a property of your fleet and not of this
+program, and it is clamped to the number of jobs. The two git legs that take a
+lock on the enclosing repository — making each task's worktree and removing it —
+are serialised, so `-j` is safe for tasks without a `repo:` fixture too. `-j > 1`
+is **refused** when an `mcp:` block is configured: the MCP tool table is
+process-wide, so N orchestrators in one process would send every task's calls
+over one task's connection and lose every MCP tool when the first of them
+finishes. Such a matrix runs with `-j 1`.
+
+`lca eval -compare a.jsonl b.jsonl` reads finished runs and prints them side by
+side, per task and in total: pass rate, passed **on the first attempt** (a task
+that needs the verifier to push back twice is a different result from one that
+gets it right, and both are `passed`), median tokens and median time. Medians,
+because a single run that hit its step ceiling moves a mean by hundreds of
+thousands of tokens and tells the reader nothing they can act on — and the cost
+medians are taken over the rows that **ran**: a task that died at `workspace:`
+reports 0 tokens and 80 ms, and a file holding three of those would otherwise
+read as the cheap, fast run. A cell where nothing ran prints `—`, and the number
+of rows left out of the medians is stated under the table. A file that is not a
+`results.jsonl` — a `trace.jsonl` from the same directory, whose task records
+carry `task`, `status`, `attempts` and `duration_ms` too — is refused rather than
+scored. Above the table
+it prints each run's identity — `lca_version`, `roles_hash`, `prompt_hash` — so a
+reader can see whether the difference they are about to explain is between two
+different measurements or two runs of the same one. It talks to nothing: no
+gateway, no `roles.yaml`, no workspace, because a comparison of two runs from
+last month must not need this month's config to load.
 
 `-transport native,text` runs every task once per transport (forced for all
 roles) and prints them side by side — pass rate, invalid-call rate, turns,
@@ -1283,6 +1408,18 @@ fresh git repo; omitted = a worktree of the current repo's HEAD), `setup`,
 its own workspace; the verifier's result is the score, and turns, tokens,
 cache ratio, tool calls/errors, fallbacks and delegations are aggregated from
 the task's trace into `results.jsonl`. Exit status is 0 only if every task passed.
+
+Every line of `results.jsonl` also carries `lca_version`, `roles_hash` and
+`prompt_hash` — the build, the team as it was *loaded*, and a sha256 of the
+system prompt that task's role actually ran with. Without the three, two runs
+before and after a prompt edit are not comparable, which is the only reason to
+run an eval twice. `prompt_hash` is the one the other two cannot stand in for: an
+`AGENTS.md` edit, a tool added to a role's `tools:`, or a role switched from
+native to text tool calling moves neither the binary nor `roles.yaml`, and each
+of them rewrites the prompt. It is taken over the assembled prompt with the two
+facts about *this* run removed from it — the working directory and today's date,
+which `prompt.go` names in its Environment block — because an eval gives every
+task a fresh workspace and a hash of the calendar matches nothing, ever.
 
 ### Report — `lca report`
 
@@ -1318,6 +1455,79 @@ model, a path or a command line is escaped once on the way in, because a tool
 argument is attacker-chosen text in an HTML page. And corrupt or oversized lines
 are counted on the page rather than dropped, as are the caps on a long detail
 list, so a page missing rows says which and why.
+
+### Secrets, out of every artefact — `redact.go`
+
+The values of environment variables whose **name** matches `*TOKEN*`, `*KEY*`,
+`*SECRET*` or `*PASSWORD*` are `[redacted]` in **everything a run writes**: the
+transcript, the subagent transcripts, the audit log, the trace, the full check
+logs, the HTML report, the summary, a workflow's `run.log` and `state.json`, and
+the result object. The transcript is the
+reason the scrub is this wide — it goes to Jira as an attachment, and it holds
+every tool result the model saw.
+
+MCP responses were already scrubbed against the tokens the MCP layer itself
+resolved. What that cannot see is a token this process never handled: a
+`check.sh` that echoes its environment when it fails, a test that prints the
+failing request with its `Authorization` header, a deploy script that logs
+`curl -H "Authorization: Bearer $BSK_TOKEN"` before dying. The check's output is
+not ours and we cannot ask it to behave, so the **environment** is the source of
+truth.
+
+Three decisions worth knowing:
+
+- It sits at the **write boundary** of each artefact, on the bytes, not on the
+  structs. Scrubbing the records before they are marshalled would mean naming
+  every field of every one of them, and the field somebody forgets is the one
+  that leaks. It is deliberately *not* at the source: redacting a tool result
+  would change what the model is shown, and a run that legitimately prints a
+  token to a log it then greps would silently stop working. What a model sees is
+  this program's business; what lands in a file somebody attaches to a ticket is
+  everybody's.
+- It knows every **spelling** of each value. A transcript and a trace record are
+  JSON and the report is HTML, and both escape some bytes on the way out: a token
+  containing a quote is written `\"` in one and `&#34;` in the other. The raw, the
+  JSON-escaped and the HTML-escaped spellings are all searched for, deduplicated —
+  which for a token of letters, digits, dashes and underscores is one spelling, so
+  a scan costs what it always did. The report is written through a streaming
+  variant that holds back the tail of each write, because a token can straddle
+  two of them.
+- The **value** is asked as well as the name, because the four name patterns are
+  substring matches on four very common English words. A value shorter than 6
+  bytes is left alone (a `*_KEY=on` would redact every "on" in a build log), and
+  so is one that is a filesystem path (`TOKENIZER_PATH`, `GITLAB_TOKEN_FILE`),
+  the name of another variable (`BSK_API_KEY_ENV=BSK_GW_TOKEN`), a word of up to
+  24 letters (`API_KEY_HEADER=Authorization`, `TOKEN_PREFIX=Bearer`,
+  `JIRA_PASSWORD_POLICY=strong`) or a short identifier of up to 12 letters and
+  digits (`SSH_KEY_ALGO=ed25519`). Anything with punctuation, a separator or real
+  length in it still goes. Without this gate the check's own failure line reached
+  the model as `request rejected: missing [redacted] header`, which it cannot act
+  on, and it then spent every attempt guessing.
+- **stderr is not an artefact.** The live output of a check and of a tool is
+  streamed to the terminal as the child produces it, before any buffered copy
+  exists to scrub, so lca's own stderr is the one place a credential still appears
+  verbatim. It is the operator's live view, deliberately: do not tee it into a
+  ticket comment or a CI log. Everything that is a *file* — including a
+  workflow's `run.log` and `state.json` — goes through the filter.
+
+**The cost**, since this runs on every write of a file that is rewritten after
+every turn, measured rather than assumed:
+
+- With **no credential** in the environment — every development machine, and the
+  whole test suite bar three tests — it is one nil check. `redactBytes` returns
+  the same slice, so not a byte is copied and the streaming writer is a plain
+  pass-through.
+- With credentials set, on a 2.1 MB transcript (2 000 messages) and four
+  spellings to look for: **3–4 ms per write, 500–700 MB/s** on an M-series
+  laptop. For scale, `json.MarshalIndent` on the same transcript is ≈2.8 ms, so
+  the scrub roughly **doubles** the cost of writing a transcript — a cost that
+  was already linear in the transcript and already paid once per turn, and
+  single-digit milliseconds against a turn that takes seconds of gateway time.
+  It is one pass per spelling, not one per message or one per secret-by-message,
+  which is what keeps it in that range as the session grows.
+
+The measurement is a test (`TestRedactionCostOnALongTranscript`) and prints the
+figure, so the numbers here are ones anybody can reproduce.
 
 ## The sandbox — `jail.go`, `tools.go`
 
@@ -2436,8 +2646,9 @@ oneshot.go    the one-shot run: -prompt-file, the -json result object, the exit-
 budget.go     what one run may spend: wall clock, steps and tokens, and the context they share
 summary.go    -summary: the short markdown a person reads, written by the model in one call
 review.go     -diff-base: the reviewer's per-line verdict, every file:line checked against the diff
-redact.go     secrets, escapes and control bytes out of the two artefacts that leave the machine
-version.go    lca version: the build's sha, the roles.yaml hash
+redact.go     secrets, escapes and control bytes out of every artefact a run writes
+checktail.go  the check that takes minutes: the selected tail, the full log of every attempt
+version.go    lca version: the build's sha, the roles.yaml hash, the role prompt's hash
 repl.go       interactive session: command registry (help, menu, dispatch), banner card, all /commands
 repl_cmds.go  custom markdown commands
 setup_cmds.go lca init (roles.yaml from the gateway + stack) and lca doctor (end-to-end checks)
@@ -2496,7 +2707,7 @@ mcp.go        internal MCP servers: config + validation, the pinned lock, regist
 mcpclient.go  JSON-RPC 2.0 over HTTP (SSE reply shape) and over a child's pipes; the egress chokepoint
 mcpcmd.go     /mcp, /mcp probe, /mcp refresh, and doctor's mcp section
 trace.go      JSONL trace: turns, task outcomes and workflow steps
-eval.go       lca eval: tasks/ runner scored by the verifier, metrics from the trace
+eval.go       lca eval: tasks/ runner scored by the verifier, -repeat/-j/-compare, metrics from the trace
 report.go     lca report: the trace as one self-contained HTML file (no JS, no network)
 roles_test.go gateway policy, headers, delegate/verifier, compaction, trace, sandbox, eval tests
 workflow_test.go lca run: parsing, placeholders and quoting, when/on_fail, state, resume, locks

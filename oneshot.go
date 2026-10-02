@@ -141,6 +141,17 @@ type runResult struct {
 	CheckCmd  string `json:"check_cmd"`
 	CheckExit *int   `json:"check_exit"`
 	CheckTail string `json:"check_tail"`
+	// CheckLogs are the files holding the FULL output of every check of every
+	// attempt, in the order they ran. check_tail above is a selection — on a stand
+	// it has to be, because the output is twenty thousand lines — and these are
+	// the bytes it was selected from, so the omission markers in the tail ("lines
+	// 41-8213 omitted") are line numbers into these files. The wrapper attaches
+	// them to the ticket when a human has to look.
+	//
+	// Always present and never null, for the reason its three neighbours have no
+	// omitempty: a wrapper written against the documented object indexes the key,
+	// and `[]` is an answer while a KeyError on the row that calls a human is not.
+	CheckLogs []string `json:"check_logs"`
 
 	FilesChanged int `json:"files_changed"`
 	DiffBytes    int `json:"diff_bytes"`
@@ -168,11 +179,16 @@ type runResult struct {
 	// merge request and the ticket, so it needs the path rather than the text.
 	Summary string `json:"summary,omitempty"`
 
-	// Without these two an eval run before a prompt edit cannot be compared with
-	// one after it: the numbers would be from two different programs and two
-	// different teams, with nothing on the record to say so.
+	// Without these three a run before a prompt edit cannot be compared with one
+	// after it: the numbers would be from two different programs, two different
+	// teams and two different instructions, with nothing on the record to say so.
+	// PromptHash is the role's assembled SYSTEM PROMPT — the text this session was
+	// actually sent — and it is the one the other two cannot stand in for: an
+	// AGENTS.md edit or a tool added to the role's tools: moves neither the binary
+	// nor roles.yaml, and each of them rewrites the prompt (see promptFingerprint).
 	LCAVersion string `json:"lca_version"`
 	RolesHash  string `json:"roles_hash"`
+	PromptHash string `json:"prompt_hash"`
 }
 
 // exitCode is the table above. machine says the caller passed -json, which is
@@ -616,10 +632,11 @@ func oneShotPanic(orch *Orchestrator, sess *Session, p any, stack []byte, machin
 	if !machine {
 		return exitInfra
 	}
-	r := runResult{Status: statusInfra, Reason: reason, LCAVersion: lcaVersion()}
+	r := runResult{Status: statusInfra, Reason: reason, LCAVersion: lcaVersion(), CheckLogs: []string{}}
 	if sess != nil {
 		r.Session, r.Role, r.Models = sess.UID, sess.agent.Name, sess.modelChain()
 		r.Turns, r.ToolCalls = sess.stats.Turns, sess.stats.ToolCalls
+		r.PromptHash = promptFingerprint(sess)
 	}
 	if orch != nil {
 		r.Transcript, r.Trace = orch.rec.SessionPath(), orch.tracer.Path
@@ -707,14 +724,23 @@ func (o *Orchestrator) resultOf(s *Session, v Verdict, check string, files, diff
 	prompt, completion, cached := o.budget.spentTokens()
 	r := runResult{
 		Session: s.UID, Role: s.agent.Name, Models: s.modelChain(), Tier: o.activeTier(),
-		Attempts: v.Attempts, CheckCmd: check,
+		// The command line goes through the same filter as everything else in this
+		// object. It is the operator's own text and not the check's, but the shell
+		// expands $BSK_TOKEN before lca is started, so `-check "curl -H \"Authorization:
+		// Bearer $BSK_TOKEN\" …"` arrives here as a live credential — and `reason`, on
+		// the line below, quotes this same string and has been scrubbed since the day
+		// it was written.
+		Attempts: v.Attempts, CheckCmd: forPublication(check),
 		FilesChanged: files, DiffBytes: diffBytes,
 		Turns: s.stats.Turns, ToolCalls: s.stats.ToolCalls, ToolErrors: s.stats.ToolErrors,
 		InvalidCalls: s.stats.InvalidCalls,
 		Tokens:       resultTokens{Prompt: prompt, Completion: completion, Cached: cached},
 		DurationMs:   time.Since(start).Milliseconds(),
 		Transcript:   o.rec.SessionPath(), Trace: o.tracer.Path,
-		LCAVersion: lcaVersion(), RolesHash: rolesHash(o.roles),
+		LCAVersion: lcaVersion(), RolesHash: rolesHash(o.roles), PromptHash: promptFingerprint(s),
+		// Never nil: see the field. A run with no check and a run whose check
+		// printed nothing both report [], which is the truth in both cases.
+		CheckLogs: append([]string{}, v.CheckLogs...),
 	}
 	if v.Checked {
 		exit := v.Exit

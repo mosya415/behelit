@@ -38,6 +38,12 @@ func (t *Tracer) write(v any) {
 	if err != nil {
 		return
 	}
+	// A turn record carries the arguments of every tool call and the text of
+	// every tool error, so a command line with a token in it lands here the same
+	// way it lands in the transcript — and the HTML report is built from this
+	// file. Scrubbed on the bytes, after marshalling, so no new field can be
+	// added to a record and miss it.
+	b = redactBytes(b)
 	t.mu.Lock()
 	t.f.Write(append(b, '\n'))
 	t.mu.Unlock()

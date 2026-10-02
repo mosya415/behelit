@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -854,6 +855,14 @@ func (m *MCPSet) readWrite(sv *MCPServer, tool string, lt *MCPLockTool) (write b
 // exists; the mutex exists for the live-reload path, which calls
 // buildOrchestrator again in a running process.
 var mcpRegMu sync.Mutex
+
+// mcpRefuseSecondRegistration makes buildOrchestrator refuse to build an
+// orchestrator with MCP servers in it. `lca eval -j N` sets it before its
+// workers start, because N orchestrators in one process share this one tool
+// table and the sessions that read it do so without a lock — see the refusal in
+// eval.go for the whole of why. It is written once, before the first goroutine,
+// and only read after that.
+var mcpRefuseSecondRegistration atomic.Bool
 
 // registerMCPTools puts lock ∩ expose into toolRegistry as ordinary *ToolDefs,
 // appends their names to toolOrder and extends protocol.go's tag grammar. It

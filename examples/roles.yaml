@@ -104,7 +104,8 @@ defaults:
   context: 128000
   steps: 50
   verify_attempts: 2   # failing check output is fed back this many times in total
-  check_timeout: 900   # seconds, for ONE check
+  check_timeout: 900   # seconds (or 10m), for ONE check; a role may raise its
+                       # own up to an hour — see coder's check_timeout below
   # The whole run's ceilings, for an unattended one-shot: nobody is watching, and
   # `steps` alone bounds nothing — an agent that re-reads three files ends every
   # turn inside its step budget. -timeout / -max-steps / -max-tokens override
@@ -148,6 +149,11 @@ roles:
     context: 128000
     tools: [list_dir, glob, grep, read_file, edit, write, run_command]
     check_cmd: go test ./...
+    # check_timeout: 30m # ONE check, for a role whose check is a stand (build +
+                         # deploy + check.sh). Seconds or a duration, up to an
+                         # hour; it overrides defaults: check_timeout for this
+                         # role alone, so raising it here does not give every
+                         # cheap role an hour to hang in.
     prompt: |
       You implement exactly one change in an isolated worktree. Read the
       relevant code first, make the smallest correct change, and run the check

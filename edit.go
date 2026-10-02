@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -239,6 +240,25 @@ func createFileAtomic(path string, data []byte) error {
 // measured at 8.2 ms a write against 130 µs without, on an APFS SSD — once per
 // `edit` or `write` tool call and nowhere else in the program.
 func tempBeside(path string, data []byte, mode fs.FileMode) (string, error) {
+	return tempBesideWritten(path, mode, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// tempBesideString is tempBeside for data that is already a string. It exists
+// for one caller: the check log, which on a stand is the whole of a five-minute
+// deploy's output. []byte(s) there copies every byte of it — measured at 500 MB
+// of garbage per attempt, on a peak that already held the same output three
+// times over — and io.WriteString hands the string straight to the file.
+func tempBesideString(path, data string, mode fs.FileMode) (string, error) {
+	return tempBesideWritten(path, mode, func(w io.Writer) error {
+		_, err := io.WriteString(w, data)
+		return err
+	})
+}
+
+func tempBesideWritten(path string, mode fs.FileMode, write func(io.Writer) error) (string, error) {
 	f, err := os.CreateTemp(filepath.Dir(path), ".lca-tmp-")
 	if err != nil {
 		return "", err
@@ -249,7 +269,7 @@ func tempBeside(path string, data []byte, mode fs.FileMode) (string, error) {
 		os.Remove(name)
 		return "", err
 	}
-	if _, err := f.Write(data); err != nil {
+	if err := write(f); err != nil {
 		return fail(err)
 	}
 	// CreateTemp makes the file 0600; the mode has to be set before the rename,
