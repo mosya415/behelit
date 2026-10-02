@@ -577,6 +577,7 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 	if applied {
 		detail = fmt.Sprintf("applied %s: %s\n\n%s", plural(files, "file", "files"), strings.Join(wt.changedFiles, ", "), v.Tail)
 	}
+	o.noteCtx(entry, child)
 	o.trackEnd(entry, v.Status, detail)
 	child.saveTranscript()
 

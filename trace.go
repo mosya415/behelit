@@ -113,7 +113,7 @@ type TaskRecord struct {
 	DurationMs    int64  `json:"duration_ms"`
 	Reviewer      string `json:"reviewer,omitempty"`
 	ReviewModel   string `json:"review_model,omitempty"`
-	ReviewVerdict string `json:"review_verdict,omitempty"` // approve | reject | unreviewed
+	ReviewVerdict string `json:"review_verdict,omitempty"` // approve | reject | request_changes | unreviewed
 	Member        string `json:"member"`                   // where the worktree and the check ran
 	CallerMember  string `json:"caller_member,omitempty"`  // only when a diff crossed machines
 }

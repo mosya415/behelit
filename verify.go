@@ -21,6 +21,15 @@ type Verdict struct {
 	Tail     string // last lines of the check output
 	Attempts int
 	Err      error
+
+	// Review is the structured verdict a -diff-base run asked the reviewer for,
+	// and ReviewErr is why there is none (review.go). They live on the verdict
+	// because statusOf decides from them: a review that could not be read is a
+	// failed run, and a review that could is the thing a reviewer run was for.
+	// Both are zero for every run that did not ask for one, which is every run
+	// that existed before.
+	Review    *reviewReport
+	ReviewErr string
 }
 
 const (

@@ -64,6 +64,84 @@ func listSessions(dir, exclude string) []sessionMeta {
 	return out
 }
 
+// transcriptPath is where one session's transcript lives. One expression, so
+// that "the session the wrapper named" and "the file the recorder writes" can
+// never drift apart.
+func transcriptPath(cfg Config, id string) string {
+	return filepath.Join(cfg.stateDir(), "transcripts", id+".json")
+}
+
+// resumableSession finds the session `-session <uid>` names, for the next round
+// of a pipeline: the reviewer's comments and a fresh check log go back to the
+// SAME session, with its history and its own x-session-id, because the gateway's
+// prefix cache makes that cheaper than starting over — and because the model
+// already knows what it tried.
+//
+// The uid is validated before anything is opened, and strictly, because it
+// becomes a path: `-session ../../../etc/passwd` is a wrapper interpolating the
+// wrong variable, and the answer to it is an error and not a read. Only the
+// characters the recorder's own ids are made of are accepted.
+func resumableSession(cfg Config, uid string) (sessionMeta, error) {
+	if uid == "" {
+		return sessionMeta{}, usageErrf("-session needs a session id; `lca report` and the `session` field of a previous -json result both name one")
+	}
+	for _, r := range uid {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+		default:
+			return sessionMeta{}, usageErrf("-session %q: a session id is letters, digits, dots, dashes and underscores — that is not one", uid)
+		}
+	}
+	if strings.Contains(uid, "..") {
+		return sessionMeta{}, usageErrf("-session %q: that is not a session id", uid)
+	}
+	p := transcriptPath(cfg, uid)
+	msgs, err := loadSession(p)
+	if err != nil {
+		// Named rather than described: the state directory moves with LCA_DIR, and
+		// a wrapper that ran round one with a different LCA_DIR is the likeliest way
+		// to be here with a uid that is otherwise perfectly real.
+		return sessionMeta{}, usageErrf("-session %s: no transcript at %s — nothing here can continue that session", uid, p)
+	}
+	if len(msgs) == 0 {
+		return sessionMeta{}, usageErrf("-session %s: %s is empty", uid, p)
+	}
+	return sessionMeta{path: p, id: uid}, nil
+}
+
+// continueSession puts a saved conversation under the session that is about to
+// run, and returns how many messages came back.
+//
+// The CURRENT system prompt is kept and the saved one dropped, as /resume does:
+// the saved one advertises the tools and the project instructions of the round
+// that wrote it, and a model told it can call a tool this build no longer has is
+// being lied to. But the two being different is the whole cost argument of this
+// flag — the gateway keys its cache on the prefix — so when they differ the
+// operator is told, in the one place where "the second round was cheap" is
+// either true or false.
+func continueSession(o *Orchestrator, s *Session, m sessionMeta) (int, error) {
+	loaded, err := loadSession(m.path)
+	if err != nil {
+		return 0, usageErrf("-session %s: %v", m.id, err)
+	}
+	saved, body := "", loaded
+	if len(body) > 0 && body[0].Role == "system" {
+		saved, body = body[0].Content, body[1:]
+	}
+	if len(body) == 0 {
+		return 0, usageErrf("-session %s: that transcript holds nothing but a system prompt — there is no round to continue", m.id)
+	}
+	// A new backing array (cap forced to 1), so appending here can never write
+	// into whatever else happens to share the session's slice.
+	s.Msgs = append(s.Msgs[:1:1], body...)
+	same := saved == "" || saved == s.Msgs[0].Content
+	if !same {
+		warnLine("-session %s: this round's system prompt is not the one that session ran with — the role, its tools or the project instructions changed, so the gateway has no cached prefix for it and the round costs what a fresh session costs", m.id)
+	}
+	o.rec.Event("session_continue", map[string]any{"from": m.path, "messages": len(body), "same_prefix": same})
+	return len(body), nil
+}
+
 // pruneTranscripts keeps only the `keep` most recent transcript files, deleting
 // older ones so transcripts/ doesn't grow without bound. keep<=0 disables it.
 func pruneTranscripts(dir string, keep int) {

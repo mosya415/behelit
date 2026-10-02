@@ -374,6 +374,7 @@ func (o *Orchestrator) runChild(ctx context.Context, child *Session) string {
 		text = "(the subagent finished without a final message)"
 	}
 	child.view.Finish(state, time.Since(start))
+	o.noteCtx(entry, child)
 	o.trackEnd(entry, state, text)
 	child.event("task_done", map[string]any{"state": state, "ms": time.Since(start).Milliseconds(), "bytes": len(text)})
 	return formatTask(child, state, text)

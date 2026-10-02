@@ -73,6 +73,13 @@ func main() {
 	// ignored by an interactive session is the kind of flag a wrapper keeps passing
 	// for a year while nothing enforces it. The two ceilings are meaningful in a
 	// session too — they bound each turn and its subagents — so they are not.
+	// The second stage's two flags. -diff-base turns a one-shot into a review of
+	// a finished tree and makes the result object carry `review` (review.go);
+	// -session continues a previous one-shot with a new message, keeping its
+	// history and its x-session-id (sessions.go). Both describe one RUN and are
+	// refused below when there is no task, for the reason -timeout is.
+	diffBaseFlag := flag.String("diff-base", "", "")
+	sessionFlag := flag.String("session", "", "")
 	timeoutFlag := flag.Duration("timeout", 0, "")
 	maxStepsFlag := flag.String("max-steps", "", "")
 	maxTokensFlag := flag.Int("max-tokens", 0, "")
@@ -108,7 +115,18 @@ func main() {
 			perr = usageErrf("-timeout bounds one run: give the task as an argument, or with -prompt-file")
 		case *summaryFlag != "":
 			perr = usageErrf("-summary is written at the end of one run: give the task as an argument, or with -prompt-file")
+		case *diffBaseFlag != "":
+			perr = usageErrf("-diff-base %s reviews one finished tree: give the review prompt as an argument, or with -prompt-file", *diffBaseFlag)
+		case *sessionFlag != "":
+			perr = usageErrf("-session %s continues that session with a new message: give it as an argument, or with -prompt-file", *sessionFlag)
 		}
+	}
+	// -resume and -session are the two halves of the same word and neither is the
+	// other: -resume opens the most recent session for a PERSON to carry on
+	// typing in, -session continues a named one with one more message and exits.
+	// Passed together, a wrapper means the second and would have got the first.
+	if perr == nil && *sessionFlag != "" && *resume {
+		perr = usageErrf("-resume opens the most recent session for a person to type in; -session %s continues that one with a new message — pass one, not both", *sessionFlag)
 	}
 	// A -summary path that cannot be written is discovered at the END of the run
 	// otherwise — after the work, after the check and after one more model call
@@ -123,6 +141,26 @@ func main() {
 	}
 	if perr != nil {
 		fatalCode(exitUsage, perr)
+	}
+	// Both of these are resolved BEFORE the gateway is touched, for the reason
+	// -summary's path is probed there: a session id that names no transcript and a
+	// base ref that is not in the repository are mistakes in the CALL, and
+	// finding either out after a model has read a tree costs a run for nothing.
+	var resumed sessionMeta
+	if *sessionFlag != "" {
+		m, err := resumableSession(cfg, *sessionFlag)
+		if err != nil {
+			fatalCode(exitUsage, err)
+		}
+		resumed = m
+	}
+	var review *reviewRun
+	if *diffBaseFlag != "" {
+		rr, err := prepareReview(cfg, *diffBaseFlag)
+		if err != nil {
+			fatalCode(exitUsage, err)
+		}
+		review = rr
 	}
 
 	cfg.Unsafe = cfg.Unsafe || *unsafe
@@ -152,7 +190,10 @@ func main() {
 	} else if !in.IsTTY() {
 		ap.Unattended("stdin is not a terminal")
 	}
-	orch, err := setupOrchestrator(cfg, ap, os.Getenv("LCA_TRACE"))
+	// resumed.id, not "": the recorder's id IS the session's identity — its
+	// x-session-id, its transcript and its trace — so a continued round adopts the
+	// one it is continuing (see NewRecorderOn).
+	orch, err := setupOrchestratorOn(cfg, ap, os.Getenv("LCA_TRACE"), resumed.id)
 	if err != nil {
 		// Not 1, which every startup failure used to be: a roles.yaml that will not
 		// parse or a config file with an
@@ -169,7 +210,7 @@ func main() {
 	if berr != nil {
 		fatalCode(exitUsage, berr)
 	}
-	orch.budget, orch.summary = budget, *summaryFlag
+	orch.budget, orch.summary, orch.review = budget, *summaryFlag, review
 	defer orch.rec.Close()
 	defer orch.tracer.Close()
 	// A stdio MCP server is a child process of ours: reap it on the way out, the
@@ -217,6 +258,16 @@ func main() {
 	})
 	defer orch.rec.Event("session_end", nil)
 	pruneTranscripts(filepath.Join(cfg.stateDir(), "transcripts"), cfg.KeepSessions)
+
+	// After the prune, so a round two is never the thing that gets collected, and
+	// before the one-shot appends its message: the history has to be under it.
+	if resumed.id != "" {
+		n, err := continueSession(orch, sess, resumed)
+		if err != nil {
+			fatalCode(exitUsage, err)
+		}
+		fmt.Fprintln(os.Stderr, stripANSI(faint("continuing %s%s%s", resumed.id, gSep, plural(n, "message", "messages"))))
+	}
 
 	if prompt != "" {
 		code := oneShot(orch, sess, prompt, *checkFlag, *jsonFlag, result, append(notes, orch.warnings...))
@@ -267,7 +318,17 @@ func fatalCode(code int, err error) {
 // $LCA_DIR/traces/<session>.jsonl. It keeps its signature and its callers; the
 // half a live reload can repeat is buildOrchestrator below.
 func setupOrchestrator(cfg Config, ap *Approver, tracePath string) (*Orchestrator, error) {
-	rec, err := NewRecorder(cfg)
+	return setupOrchestratorOn(cfg, ap, tracePath, "")
+}
+
+// setupOrchestratorOn is setupOrchestrator continuing an existing session:
+// sessionID "" mints a new one (every caller but `-session`), and a non-empty
+// one is adopted, which also points the default trace path at that session's
+// own file. The trace is opened O_APPEND, so round two's turns land under round
+// one's in one file — which is where "the rounds share an x-root-session-id" is
+// read back.
+func setupOrchestratorOn(cfg Config, ap *Approver, tracePath, sessionID string) (*Orchestrator, error) {
+	rec, err := NewRecorderOn(cfg, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("recorder init failed: %w", err)
 	}
@@ -353,6 +414,8 @@ func usage() {
 		"   lca -check \"<cmd>\" \"<task>\"  run one task; succeed only if <cmd> passes",
 		"   lca -prompt-file t.md        take the task from a file (- = stdin), not from argv",
 		"   lca -json …                  one JSON result object on stdout, everything else on stderr",
+		"   lca -role reviewer -diff-base origin/main -prompt-file review.md",
+		"                                review the tree: verdict + per-line comments in the JSON",
 		"   lca init                     create .lca/roles.yaml from the gateway's models",
 		"   lca doctor                   check gateway, roles, tool calls, members, workflows",
 		"   lca doctor -role <name>      also the sandbox and permission rules in force for that role",
@@ -371,6 +434,9 @@ func usage() {
 		"   -prompt-file <path>          read the task from a file, or from stdin with -",
 		"   -json                        result object on stdout; exit 0 passed, 1 failed, 2 usage,",
 		"                                3 infra, 4 budget, 130 cancelled",
+		"   -diff-base <ref>             review this tree against <ref>: the result object grows `review`",
+		"                                (verdict + per-line comments, each checked against the diff)",
+		"   -session <uid>               continue that session with a new message (its history, its cache)",
 		"   -timeout <dur>               budget for the whole run; exceeding it is exit 4",
 		"   -max-steps <n>|unlimited     step ceiling for the run, over every role's own",
 		"   -max-tokens <n>              prompt+completion ceiling for the run, subagents included",

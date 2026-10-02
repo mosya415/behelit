@@ -2053,3 +2053,34 @@ func TestPipedBytesDoNotDependOnTheWindow(t *testing.T) {
 		}
 	}
 }
+
+// The context fill is the only field on the status line that MOVES, and it was
+// the first one given up: measured at 80 columns with a team's own model id
+// (`qwen3-coder-480b-a35b-instruct` as the role's model), the gauge vanished
+// while 25 columns of a path the operator already knows stayed — which is how
+// "multi-agent mode does not show how full the context is" happens. The ladder
+// gives up the bar, then the path's comfort, then the path entirely, and the
+// percentage last.
+func TestTheContextFillSurvivesANarrowStatusLine(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	fs.models = allModels()
+	r, h := replFor(t, fs, testRoles)
+	h.sess.client.SetCtxLen(262144)                        // a window the server reported, so the gauge draws
+	h.sess.client.model = "qwen3-coder-480b-a35b-instruct" // a real served id, 30 columns of it
+	h.sess.jail().Root = "/Users/u/work/some/deep/project/root"
+
+	for _, cols := range []int{80, 90, 100, 140} {
+		t.Run(strconv.Itoa(cols), func(t *testing.T) {
+			screenTheme(t, themeDungeon, true, cols)
+			line := stripANSI(r.statusLine())
+			if !strings.Contains(line, "CTX") || !strings.Contains(line, "%") {
+				t.Fatalf("the fill must survive at %d columns: %q", cols, line)
+			}
+			// And the no-wrap invariant the editor's cursor arithmetic depends on
+			// still holds, which is what made the gauge droppable in the first place.
+			if w := visibleWidth(r.statusLine()) + 2; w > max(cols, houseWidth()+1) {
+				t.Fatalf("the status line is %d columns at a terminal of %d: %q", w, cols, line)
+			}
+		})
+	}
+}

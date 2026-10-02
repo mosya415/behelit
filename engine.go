@@ -104,6 +104,12 @@ type Orchestrator struct {
 	// parameter list because it is a property of the run, like the budget, and not
 	// of the task.
 	summary string
+	// review is what -diff-base resolved to: the diff this run is judging and the
+	// line map its comments are checked against (review.go). Non-nil is the one
+	// thing that makes a run a REVIEW — the diff is appended to the task message
+	// and the final reply is read as the review object — and it rides here for the
+	// same reason summary does: it is a property of the run.
+	review *reviewRun
 
 	// runCtx is the context the whole run hangs off, so cancelling the run reaps
 	// what it started. Guarded because a background subagent reads it from its own
@@ -130,6 +136,14 @@ type taskEntry struct {
 	ID, Kind, Agent, Title, Status, Detail string
 	Start                                  time.Time
 	Duration                               time.Duration
+	// How full the child's own context got, measured when it finished. A
+	// subagent's session is dropped from o.children the moment it is no longer
+	// resumable, so this is the only place its context fill survives — and in a
+	// team the children are where the context actually fills, which is what the
+	// operator could not see anywhere. Zero means "not measured", the honest
+	// answer for a child that never got a window.
+	Ctx, CtxOf int
+	Model      string
 }
 
 func (o *Orchestrator) trackStart(id, kind, agent, title string) *taskEntry {
@@ -138,6 +152,21 @@ func (o *Orchestrator) trackStart(id, kind, agent, title string) *taskEntry {
 	o.history = append(o.history, e)
 	o.histMu.Unlock()
 	return e
+}
+
+// noteCtx records a finished child's own context fill on its history entry,
+// before the session itself goes away.
+func (o *Orchestrator) noteCtx(e *taskEntry, s *Session) {
+	if o == nil || e == nil || s == nil {
+		return
+	}
+	tok, budget := estimateTokens(s.Msgs), 0
+	if s.budgetKnown() {
+		budget = s.budget()
+	}
+	o.histMu.Lock()
+	e.Ctx, e.CtxOf, e.Model = tok, budget, s.client.Model()
+	o.histMu.Unlock()
 }
 
 func (o *Orchestrator) trackEnd(e *taskEntry, status, detail string) {

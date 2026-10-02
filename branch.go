@@ -1213,6 +1213,7 @@ human and your work is left here for them to read.`,
 	v := child.RunVerifiedAll(ctx, checks, 1)
 	child.view.Finish(v.Status, time.Since(start))
 	child.saveTranscript()
+	o.noteCtx(entry, child)
 	o.trackEnd(entry, v.Status, v.Tail)
 
 	stop := func(why string) string {

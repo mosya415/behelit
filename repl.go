@@ -314,14 +314,28 @@ func (r *Repl) statusLine() string {
 		// resets has to hand the faint back before the next field
 		// The bar is empty in the plain theme (no block art), and "CTX  0%" with the
 		// hole where it was reads like something failed to draw.
-		ctx = "CTX " + bar + cFaint + fmt.Sprintf(" %d%%", pct)
+		full := "CTX " + bar + cFaint + fmt.Sprintf(" %d%%", pct)
+		short := cFaint + fmt.Sprintf("CTX %d%%", pct)
 		if bar == "" {
-			ctx = cFaint + fmt.Sprintf("CTX %d%%", pct)
+			full = short
 		}
-		if n := visibleWidth(stripANSI(ctx)) + 3; room-n >= 12 {
-			room -= n
-		} else {
-			ctx = ""
+		// The BAR is given up before the number, and both before the path, which is
+		// a change of order: the gauge used to be the first thing dropped, so a
+		// team's own model id took the only field on this line that MOVES. Measured
+		// at 80 columns with `qwen3-coder-480b-a35b-instruct` as the role's model —
+		// the fill vanished while 25 columns of a path the operator already knows
+		// stayed. "CTX 42%" is seven columns and the fill is the reason the line is
+		// read at all, so the path gives way to it instead — and at the last rung it
+		// gives way entirely: a path is in the shell's own title and does not move,
+		// while 90% is the one thing on this line that is about to matter.
+		for _, cand := range []struct {
+			text  string
+			floor int // columns the path may keep while this form is chosen
+		}{{full, 12}, {short, 12}, {short, 8}, {short, 0}} {
+			if n := visibleWidth(stripANSI(cand.text)) + 3; room-n >= cand.floor {
+				ctx, room = cand.text, room-n
+				break
+			}
 		}
 	}
 	// The result is VERIFIED and not assumed from the helper. ellipsizeMiddle used
@@ -335,7 +349,7 @@ func (r *Repl) statusLine() string {
 	switch {
 	case room >= visibleWidth(where):
 		parts = append(parts, where)
-	case room >= 12:
+	case room >= 8:
 		if w := ellipsizeMiddle(where, room); visibleWidth(w) <= room {
 			parts = append(parts, w)
 		}
@@ -989,6 +1003,56 @@ func (r *Repl) cmdContext(string) bool {
 				break
 			}
 			rows = append(rows, []string{faint("%s", byteCount(it.bytes)), it.label})
+		}
+		pnl.Table(nil, rows, pnl.room())
+	}
+	// Every subagent has a context of its OWN, and in a team that is where the
+	// work happens: the operator reported not being able to see how full the
+	// context was in multi-agent mode, and this panel answered for the primary
+	// only — whose session, in a run that delegates everything, is the emptiest
+	// one on the machine. Shown for a child that is running and for one that
+	// finished and is still resumable, because a delegation's cost is worth
+	// reading after it lands too.
+	// Live children from the registry, finished ones from the history: a
+	// subagent's session is dropped the moment it stops being resumable, so a
+	// delegation that has already landed would otherwise leave no trace of its own
+	// fill — and those are the ones worth reading, because in a team the children
+	// are where the context fills while the primary stays nearly empty.
+	type kidRow struct {
+		id, role, model, state string
+		tok, of                int
+	}
+	var kids []kidRow
+	live := map[string]bool{}
+	for _, k := range r.orch.Tasks() {
+		live[k.ID] = true
+		state := faint("%s", "idle")
+		if k.running.Load() {
+			state = statusText(cYellow, gPartial, "running")
+		}
+		of := 0
+		if k.budgetKnown() {
+			of = k.budget()
+		}
+		kids = append(kids, kidRow{k.ID, k.agent.Name, k.client.Model(), state, estimateTokens(k.Msgs), of})
+	}
+	for _, e := range r.orch.History() {
+		if live[e.ID] || e.Ctx == 0 {
+			continue // still listed above, or never measured
+		}
+		kids = append(kids, kidRow{e.ID, e.Agent, e.Model, faint("%s", e.Status), e.Ctx, e.CtxOf})
+	}
+	if len(kids) > 0 {
+		pnl.Div("subagents")
+		var rows [][]string
+		for _, k := range kids {
+			fill := faint("%s", "no window reported")
+			if k.of > 0 {
+				fill = fmt.Sprintf("~%s of ~%s", kfmt(k.tok), kfmt(k.of)) + faint("  %d%%", min(k.tok*100/k.of, 100))
+			} else if k.tok > 0 {
+				fill = fmt.Sprintf("~%s", kfmt(k.tok)) + faint("%sno window reported", gSep)
+			}
+			rows = append(rows, []string{faint("%s", k.id), k.role, k.model, k.state, fill})
 		}
 		pnl.Table(nil, rows, pnl.room())
 	}

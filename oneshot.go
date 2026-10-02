@@ -155,6 +155,13 @@ type runResult struct {
 
 	Transcript string `json:"transcript"`
 	Trace      string `json:"trace"`
+	// Review is the reviewer's structured verdict, present only on a -diff-base
+	// run and absent when one was asked for and could not be read. Absent and not
+	// an empty object, on purpose: the wrapper's test is `"review" in result`, and
+	// a review that could not be read must not be able to look like one that
+	// approved. The reason field says what went wrong, and the status is failed.
+	Review *reviewReport `json:"review,omitempty"`
+
 	// Summary is where -summary wrote the short markdown, absent when none was
 	// asked for — or when there was nothing to summarise (an infra_error before
 	// the first model reply). The wrapper pastes the file's contents into the
@@ -429,7 +436,18 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, machine bo
 		fmt.Fprintln(os.Stderr, stripANSI(n))
 	}
 	orch.rec.Event("user", map[string]any{"text": prompt, "mode": "one-shot"})
-	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: prompt})
+	// A -diff-base run's task is the operator's prompt WITH the diff and the
+	// reply contract under it, all of it in the user message so that the request
+	// prefix — the system prompt and the tool schemas, which is what the gateway
+	// keys its KV cache on — is byte-identical to every other run of this role.
+	// Without -diff-base this is the prompt, unchanged to the byte.
+	task := prompt
+	if orch.review != nil {
+		task = orch.review.taskMessage(prompt)
+		orch.rec.Event("review_diff", map[string]any{"base": orch.review.base,
+			"from": orch.review.from, "diff_bytes": len(orch.review.diff), "files": orch.review.lines.order})
+	}
+	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: task})
 
 	// A signal has to end the RUN and not the process: 130 means "put the ticket
 	// back", and a wrapper can only be told that if the transcript, the trace and
@@ -480,8 +498,16 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, machine bo
 	// agent once and reports "unverified", which is the same loop with the same
 	// error handling instead of a second copy of it that classified nothing.
 	v := sess.RunVerified(ctx, check, orch.verifyAttempts())
+	// The review is read BEFORE the summary and before the result object, because
+	// its one retry is another model call: the tokens it costs belong inside the
+	// total the wrapper is handed, exactly as the summary's own call does. It is
+	// skipped when the run never got to a reply — a dead gateway has no opinion
+	// about a diff — so that an infra_error stays an infra_error.
+	if orch.review != nil && v.Status != "error" && v.Status != statusCancelled {
+		orch.finishReview(ctx, sess, &v)
+	}
 	files, diffBytes := orch.runChangeStats()
-	sess.traceTask(prompt, v, check, diffBytes, files, false, nil, start, "")
+	sess.traceTask(prompt, v, check, diffBytes, files, false, orch.reviewOutcomeOf(sess, v), start, "")
 
 	// The summary is written BEFORE the result object is assembled, so the tokens
 	// its own closing call cost are inside the total the wrapper is handed. It is
@@ -507,6 +533,15 @@ func oneShot(orch *Orchestrator, sess *Session, prompt, check string, machine bo
 	// has just printed.
 	if v.Checked && v.Status != statusPassed && v.Tail != "" {
 		fmt.Fprintln(os.Stderr, v.Tail)
+	}
+	// The verdict in a line a person can read. Without -json there is nowhere
+	// else it appears: the object went past as the model's last reply, which is
+	// not a thing anybody reads, and with -json it belongs in the object and the
+	// object only.
+	if orch.review != nil && !machine {
+		for _, l := range reviewLines(v.Review, v.ReviewErr) {
+			fmt.Fprintln(os.Stderr, l)
+		}
 	}
 	// Nothing about the task was decided AND nothing happened: there is no result
 	// to report, the table gives this row no status word, and inventing one would
@@ -690,6 +725,12 @@ func (o *Orchestrator) resultOf(s *Session, v Verdict, check string, files, diff
 		// pastes into a public merge request and a ticket comment.
 		r.CheckTail = forPublication(v.Tail)
 	}
+	// The object a -diff-base run exists to produce. Nil unless one was asked for
+	// AND could be read, which is what keeps "the reviewer's output was garbage"
+	// from reaching the wrapper as a verdict (see statusOf). Its bodies and its
+	// summary went through forPublication in review.go, where every path into them
+	// passes: this field is pasted straight into merge-request comments.
+	r.Review = v.Review
 	r.Status, r.Reason = o.statusOf(s, v, check)
 	r.Reason = forPublication(r.Reason)
 	// A transcript the disk refused to hold must not be ASSERTED. os.WriteFile
@@ -721,6 +762,27 @@ func (o *Orchestrator) statusOf(s *Session, v Verdict, check string) (status, re
 	// clock ran out, it was done.
 	if why := o.budget.tripped(); why != "" && v.Status != statusPassed {
 		return statusBudget, why
+	}
+	// A review that was ASKED FOR decides this run, because producing it is what
+	// the run was for.
+	//
+	// Unreadable is `failed`, and it outranks a green check: a reviewer whose
+	// output could not be read has not approved anything, and reporting exit 0 on
+	// a run with no `review` field in its object is the one failure mode that
+	// lets a bad change through unseen. Readable is `passed` — the review IS the
+	// verification, and a reviewer run normally has no -check, which would
+	// otherwise have made every successful review `unverified` and exit 1. A red
+	// -check beside it still wins: that is a fact about the tree.
+	//
+	// A run that never reached a reply is left to the ordinary classification
+	// below: a dead gateway is infra_error, not a failed review.
+	if o.review != nil && v.Status != "error" && v.Status != statusCancelled {
+		switch {
+		case v.Review == nil:
+			return statusFailed, "the reviewer's verdict could not be read, so nothing reviewed this change: " + v.ReviewErr
+		case v.Status != statusFailed:
+			return statusPassed, ""
+		}
 	}
 	switch v.Status {
 	case statusPassed:

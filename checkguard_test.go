@@ -66,3 +66,44 @@ func TestACheckTheRunRewroteIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// In a team the children are where the context fills while the primary stays
+// nearly empty — and a subagent's session is dropped from the registry the
+// moment it stops being resumable, so its fill had to be recorded on the
+// history entry before it goes. Without this, /context answered for the one
+// session that had nothing in it, which is how "multi-agent mode does not show
+// how full the context is" reads from the inside.
+func TestAFinishedSubagentsContextFillIsRemembered(t *testing.T) {
+	fs := newFakeServer(t, func(fakeRequest, int) fakeReply { return fakeReply{content: "ok"} })
+	h := newHarness(t, fs.URL, "native", false)
+
+	entry := h.orch.trackStart("t1", "task", "coder", "count the lines")
+	child := h.sess // any session with messages and a known window will do
+	child.client.SetCtxLen(262144)
+	child.Msgs = append(child.Msgs, Message{Role: "user", Content: strings.Repeat("a measured amount of context ", 200)})
+
+	h.orch.noteCtx(entry, child)
+	h.orch.trackEnd(entry, "passed", "done")
+
+	hist := h.orch.History()
+	if len(hist) != 1 {
+		t.Fatalf("one entry, got %d", len(hist))
+	}
+	e := hist[0]
+	if e.Ctx <= 0 {
+		t.Fatal("the child's own fill was not recorded, so /context cannot show it")
+	}
+	// The denominator is the TRANSCRIPT budget and not the raw window — the same
+	// number the gauge divides by — so the panel and the status line can never
+	// disagree about what "80% full" means.
+	if e.CtxOf != child.budget() {
+		t.Fatalf("the budget it was measured against must be recorded too: %d, want %d", e.CtxOf, child.budget())
+	}
+	if e.Model == "" {
+		t.Fatal("which model spent that context is half the answer")
+	}
+	// A child with no window of its own is handled by the panel, which prints the
+	// token count with no denominator rather than dividing by a placeholder —
+	// asserted there rather than here, because budget() has four sources and
+	// zeroing them one by one in a test says nothing about the panel.
+}

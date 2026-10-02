@@ -20,7 +20,7 @@ trail come from the process (uid/gid) for free.
 
 - [Quick start](#quick-start) — `lca` → `/setup`
 - [Configuration in the session](#configuration-in-the-session--setup-config-set-save) — `/config`, `/set`, `/save`, the `config.json` keys, the API-key rule
-- [Driven by a program](#driven-by-a-program---prompt-file--json-oneshotgo) — `-prompt-file`, `-json`, the result object and the exit-code table, [budgets](#budgets-on-one-run---timeout--max-steps--max-tokens-budgetgo), [`-summary`](#the-short-summary---summary-pathmd-summarygo), [the pipeline sandbox profile](#the-pipeline-sandbox-profile--examplespipelinerolesyaml)
+- [Driven by a program](#driven-by-a-program---prompt-file--json-oneshotgo) — `-prompt-file`, `-json`, the result object and the exit-code table, [budgets](#budgets-on-one-run---timeout--max-steps--max-tokens-budgetgo), [`-summary`](#the-short-summary---summary-pathmd-summarygo), [the pipeline sandbox profile](#the-pipeline-sandbox-profile--examplespipelinerolesyaml), [the reviewer's per-line verdict](#the-reviewers-per-line-verdict---diff-base-reviewgo), [the next round](#the-next-round-on-the-same-session---session-uid)
 - [Non-interactive: CI, scripts and containers](#non-interactive-ci-scripts-and-containers) · [Environment variables](#environment-an-override-one-run-at-a-time)
 - [Models & providers](#models--providers--providersgo-modelsgo-chatgo) — presets, per-family profiles, the JSON config
 - [The team — `roles.yaml`](#the-team--rolesyaml-rolesgo-delegatego-verifygo) — roles, [delegation and the verifier](#delegation-and-the-verifier--delegaterole-task-check_cmd), [`apply: branch`](#apply-branch--a-delegation-becomes-a-real-branch--branchgo-cleango), [cross-family review](#cross-family-review), [`fork:`](#fork-true--inherit-the-reads-not-the-transcript), [tiers](#tiers-develop-on-premium-operate-on-cheap), `/role`
@@ -161,7 +161,10 @@ and the closing summary call included — so it cannot contradict the `reason`
 standing next to it. `files_changed` counts what reached the tree, a delegation's
 merged diff included. `lca_version` and `roles_hash` (`lca version` prints both)
 are what make two runs comparable: a pass rate that moved after a prompt edit is
-a different measurement, not a better one.
+a different measurement, not a better one. `summary` is there when
+`-summary` wrote one, and `review` only on a [`-diff-base`](#the-reviewers-per-line-verdict---diff-base-reviewgo)
+run — where its ABSENCE is itself the answer, because a review that could not be
+read is `status: failed` and never a silent approve.
 
 The **exit code** is the whole of the wrapper's decision, so it is a table:
 
@@ -357,6 +360,141 @@ tools are disabled outright, the standing action per permission key, and then
 every rule in precedence order with the layer it came from — computed by the same
 functions the runtime uses, so a row that says `deny` is the decision a tool call
 will get.
+
+#### The reviewer's per-line verdict — `-diff-base`, `review.go`
+
+Inside a delegation a reviewer ends its reply with `VERDICT: approve|reject` and
+that is enough: the only consumer is the apply, and the only question is whether
+the diff may land. GitLab is a different consumer — it wants a comment on a file
+and a line — so the reviewer is also runnable by itself, against a tree the coder
+has already finished:
+
+```sh
+./lca -y -role reviewer -json -prompt-file review.md -diff-base origin/main
+```
+
+The result object then grows one field:
+
+```json
+{"review": {"verdict": "request_changes",
+            "comments": [{"file": "src/bin/gw.rs", "line": 4891, "severity": "blocker",
+                          "body": "this drops the lock before the write"}],
+            "summary": "…"}}
+```
+
+`verdict` is `approve` or `request_changes`; `severity` is one of `blocker`,
+`major`, `minor`, `nit`; `comments` is always a list and never `null`, so a
+wrapper that iterates it does not break on the review that found nothing.
+
+**The diff** is the one a merge request shows: the merge **base** of `-diff-base`
+and `HEAD`, against a snapshot of the working tree. The merge base, because a
+base branch that moved on since the ticket was cut would otherwise put other
+people's commits in the review — every comment on them correctly placed, and
+posted on somebody else's work. A snapshot of the working tree, taken through a
+temporary index that leaves the index, `HEAD` and the uncommitted work exactly as
+they were, because at this point in the pipeline the coder's change is usually
+**not committed yet** (the wrapper commits after the review) and a file it added
+is untracked, which `git diff` does not show at all. It works inside a `git
+worktree`, which is where the pipeline always runs it, and a base that is not in
+the repository is exit 2 before the gateway is touched — with the `git fetch` that
+is usually what is missing named in the message. A tree that does not differ from
+its base is exit 2 as well, rather than an approve nobody meant.
+
+**How the object comes back, and why it is not a tool.** The reviewer's final
+reply *is* the object, and the instruction asking for it travels in the task's
+user message. A `review` tool with the schema in it was the obvious shape and is
+the one shape that is not available: the gateway keys its KV cache on the request
+prefix — the system prompt plus the tool schemas, computed once per session and
+identical for every session of every role — so a tool only the reviewer needs is a
+cache miss on the first request of every other role in the team. Nothing above the
+user message moves, which is also what lets the next round on the same session
+still hit the cache.
+
+**Every `file:line` is checked against the diff**, and that check is the part
+that matters. A model reading two thousand lines of diff writes down the number
+it can see, which is the line in the file it opened and not a line the hunk
+covers; GitLab answers a position that is not in the diff with one 400 for the
+whole review, after the pipeline has already decided. So:
+
+| what came back | what happens |
+| --- | --- |
+| a line inside one of that file's hunks | kept as a comment, with the path spelled as the diff spells it |
+| a line outside every hunk, a file not in the diff, a line ≤ 0, an unknown severity, an empty body | **one retry**, naming each problem and the hunks that file actually has — and whatever survives it is moved into `summary` |
+| no JSON object, invalid JSON, or a verdict that is neither word | **one retry**, then `status: failed`, exit 1, and **no** `review` field |
+
+Nothing is dropped. A wrong line number is a clerical mistake, not a reason to
+discard a finding, so an unplaceable comment is appended to `summary` with the
+file and line the reviewer wrote. And an unreadable answer is never a silent
+approve: a reviewer whose output could not be read has not approved anything, and
+that is the one failure mode in this pipeline that would let a bad change through
+unseen. The retry is exactly one — a message on the same session, so the prefix
+and the diff above it are already cached — and it is told that it is the last.
+
+Because producing the review is what the run is *for*, a readable review is the
+run's `passed` (exit 0) even with no `-check`, which would otherwise have made
+every successful review `unverified` and exit 1; the verdict itself is in
+`review.verdict`, where the wrapper reads it. A red `-check` beside it still wins
+— that is a fact about the tree — and the review is reported anyway, because the
+wrapper needs it for the comment it posts. A gateway that goes away is still
+`infra_error`: a dropped connection is not a reviewer that failed, and the ticket
+goes back in the queue rather than to a person.
+
+What this deliberately does **not** do is take the edit tool away from the
+reviewer. The in-delegation reviewer has it denied in-process, because the diff
+is about to be applied by that same process and a reviewer grading its own patch
+is not a review. Here the tree belongs to the wrapper, and denying a tool would
+change the role's tool schemas — which *is* the request prefix, so a review run
+and any other run of the same role would key two different caches. That guard
+belongs where the other hard boundaries are: the reviewer role's `tools:` list,
+or a `permission:` block on it with `edit: deny`, in `roles.yaml` — plus the
+[pipeline profile](#the-pipeline-sandbox-profile--examplespipelinerolesyaml). And
+`files_changed` is 0 on a review that kept its hands off, which is the wrapper's
+own check.
+
+Comment bodies and the summary go through the same filter as `-summary` and
+`check_tail`: the values of `*TOKEN*`, `*KEY*`, `*SECRET*` and `*PASSWORD*`
+variables become `[redacted]`, and escapes and control bytes are stripped. These
+strings are pasted into a public merge request by a program that will not read
+them first.
+
+#### The next round on the same session — `-session <uid>`
+
+`-resume` opens the most recent session for a person to type in. A pipeline needs
+the other half: one more message to a session that has already run — the
+reviewer's comments, a fresh check log — and then exit.
+
+```sh
+uid=$(jq -r .session < round1.json)
+./lca -y -role coder -json -session "$uid" -prompt-file comments.md -check ./check.sh
+```
+
+That continues **that** session: its history is loaded under the current system
+prompt, and the round runs as it — the same `x-session-id`, which is what the
+gateway keys its KV-cache affinity on, and therefore the same
+`x-root-session-id`. The point is cost: a second round on a warm prefix is
+cheaper than starting over, and it is also smarter, because the model already
+knows what it tried. One id decides all of it — the recorder adopts the uid, so
+the transcript is appended to the first round's file (both rounds in the one file
+the wrapper attaches to the ticket), the trace appends to the first round's
+`.jsonl`, and the result object's `session` and `transcript` name the same
+session the wrapper passed in.
+
+The **current** system prompt is kept and the saved one dropped, as `/resume`
+does: a saved prompt advertises the tools and the project instructions of the
+round that wrote it, and a model told it can call a tool this build no longer has
+is being lied to. But the two being identical is this flag's whole cost argument,
+so when they differ — a different `-role`, an edited `roles.yaml`, changed project
+instructions — the run says so on stderr: the round still works, it just costs
+what a fresh session costs.
+
+A uid that names no transcript is exit 2, with the path it looked at named,
+because the likeliest way to get there is a wrapper that ran round one under a
+different `LCA_DIR`. A uid is also a **file name**, so only the characters the
+recorder's own ids are made of are accepted: `-session ../../etc/passwd` is a
+wrapper interpolating the wrong variable, and the answer to it is an error and
+not a read. `-session` and `-resume` together is exit 2 as well — they are two
+different things and a wrapper that passes both would have got the interactive
+one.
 
 ### Configuration in the session — `/setup`, `/config`, `/set`, `/save`
 
@@ -2286,6 +2424,7 @@ main.go       entry point: subcommands (init, doctor, eval, report, run, version
 oneshot.go    the one-shot run: -prompt-file, the -json result object, the exit-code table
 budget.go     what one run may spend: wall clock, steps and tokens, and the context they share
 summary.go    -summary: the short markdown a person reads, written by the model in one call
+review.go     -diff-base: the reviewer's per-line verdict, every file:line checked against the diff
 redact.go     secrets, escapes and control bytes out of the two artefacts that leave the machine
 version.go    lca version: the build's sha, the roles.yaml hash
 repl.go       interactive session: command registry (help, menu, dispatch), banner card, all /commands
@@ -2327,7 +2466,7 @@ width_*.go    terminal size (TIOCGWINSZ), falling back to $COLUMNS
 mentions.go   @path completion and <file> attachment
 changes.go    per-session change log behind /diff and /undo (leased, staleness-checked)
 diff.go       LCS line diff for /diff
-sessions.go   transcript listing, /resume picker, startup pruning
+sessions.go   transcript listing, /resume picker, startup pruning, -session: the next round on one session
 recorder.go   audit.jsonl + transcript writing
 discover.go   native Slurm discovery (squeue/scontrol/log/startup-script + probe)
 stream.go     prose filter: hide tool tags, line-buffer for markdown rendering

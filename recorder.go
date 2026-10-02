@@ -31,7 +31,24 @@ type Recorder struct {
 	pid     int
 }
 
-func NewRecorder(cfg Config) (*Recorder, error) {
+func NewRecorder(cfg Config) (*Recorder, error) { return NewRecorderOn(cfg, "") }
+
+// NewRecorderOn is NewRecorder continuing an EXISTING session: `-session <uid>`
+// adopts that uid instead of minting one from the clock and the pid.
+//
+// One field decides the whole of the second round's identity, which is why it is
+// done here and not in four places. Everything downstream reads this id: the
+// session's UID (NewPrimary), and therefore the x-session-id header the gateway
+// keys its KV cache on; the transcript, so the second round is appended to the
+// first's file and the history is visible in one place; the trace, which is
+// opened O_APPEND, so both rounds' turns land in one file; and the `session`
+// field of the result object. Minting a new id and then patching those back up
+// would have been four chances to leave one of them pointing at a session that
+// never existed.
+//
+// The id is validated by the caller, because it becomes a FILE NAME: see
+// resumableSession.
+func NewRecorderOn(cfg Config, id string) (*Recorder, error) {
 	dir := cfg.stateDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -48,7 +65,9 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 	}
 
 	pid := os.Getpid()
-	id := time.Now().Format("20060102-150405") + "-" + strconv.Itoa(pid)
+	if id == "" {
+		id = time.Now().Format("20060102-150405") + "-" + strconv.Itoa(pid)
+	}
 
 	r := &Recorder{
 		dir:     dir,
