@@ -206,7 +206,17 @@ type runResult struct {
 // reported the same way to everyone.
 func (r runResult) exitCode(machine bool) int {
 	legacy := !machine && r.CheckCmd == ""
-	switch r.Status {
+	if legacy && (r.Status == statusBudget || r.Status == statusUnverified) {
+		return exitOK
+	}
+	return statusExitCode(r.Status)
+}
+
+// statusExitCode is the table itself, with no legacy clause: one status, one
+// code. `lca ticket` reads it directly, because that command has no history of
+// `lca "task"` meaning "0 when the model answered" to preserve.
+func statusExitCode(status string) int {
+	switch status {
 	case statusPassed:
 		return exitOK
 	case statusInfra:
@@ -216,16 +226,9 @@ func (r runResult) exitCode(machine bool) int {
 	case statusConfig:
 		return exitUsage
 	case statusBudget:
-		if legacy {
-			return exitOK
-		}
 		return exitBudget
-	case statusUnverified:
-		if legacy {
-			return exitOK
-		}
-		return exitFailed
 	}
+	// failed and unverified both land here: nothing said the task is done.
 	return exitFailed
 }
 

@@ -1,0 +1,81 @@
+# The complete pipeline: block for `lca ticket`, in one piece.
+#
+# The README shows it in two halves — the keys, then the args:/fields: mapping —
+# because they are explained separately. An operator copying only the first half
+# gets nine "lca cannot guess this" errors, which is the error working as
+# intended and a documentation mistake all the same. This file is the whole
+# thing, and a test parses and validates it so it cannot drift from the reader.
+#
+# Every tool name, argument name and reply path below is a PLACEHOLDER in some
+# team's spelling. Yours are in .lca/mcp.lock.json; `lca doctor` prints them.
+#
+# It declares no roles on purpose — the three it NAMES (coder, reviewer,
+# integrator) have to be your team's own. So this is a block to copy into your
+# .lca/roles.yaml beside them, not a file to point LCA_ROLES at: on its own it
+# validates everything except the roles, and says so.
+#
+# Check it the way lca will, once it is in place:
+#
+#   lca ticket -dry-run BSK-1
+pipeline:
+  project: BSK                  # -new only: what the ticket is created under
+  branch_prefix: agent/         # the branch is this + the ticket key
+  remote: origin                # push: true only
+  target_branch: main
+  push: true                    # true or false — there is no safe default
+  rework_rounds: 1              # 0 is legal: one review, no rework
+  roles:
+    coder: coder
+    reviewer: reviewer
+    integrator: integrator      # writes the MR description and the comment
+  tracker:                      # YOUR tool names, out of .lca/mcp.lock.json
+    read: jira__issue_get
+    create: jira__issue_create  # -new only
+    comment: jira__issue_comment
+    transition: jira__issue_transition   # optional, with the two statuses
+    status_done: In Review
+    status_blocked: Needs human
+    args:                           # the server's own argument names
+      read:                         # one-line {…} is fine; indented keys always are
+        issueIdOrKey: "${key}"
+      create:
+        project: "${project}"
+        summary: "${summary}"
+        description: "${body}"
+        issuetype: Task
+      comment:
+        issueIdOrKey: "${key}"
+        body: "${text}"
+      transition:
+        issueIdOrKey: "${key}"
+        transition: "${status}"
+    fields:                         # where in the REPLY each value is
+      key:        key               # a dotted path; `.` is the reply itself
+      summary:    fields.summary
+      body:       fields.description
+      comment_id: id
+  forge:                        # push: true only
+    create_merge_request: gitlab__create_merge_request
+    find_merge_request: gitlab__list_merge_requests
+    args:
+      create_merge_request:
+        source_branch: "${branch}"
+        target_branch: "${target}"
+        title: "${title}"
+        description: "${body}"
+      find_merge_request:
+        source_branch: "${branch}"
+        target_branch: "${target}"
+        state: opened
+    fields:
+      list:   .                     # where the array of merge requests is
+      branch: source_branch         # both ends are re-checked against what lca
+      target: target_branch         # asked for: this branch into another target
+      id:     iid                   # is somebody else's merge request
+      url:    web_url
+  skills:                       # the shared knowledge base, per stage
+    ticket:   [ticket-brief]
+    coder:    [deploy-to-stand, repo-conventions]
+    reviewer: [review-checklist]
+    mr:       [mr-description]
+    report:   [ticket-comment]

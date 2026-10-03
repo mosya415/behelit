@@ -205,7 +205,12 @@ func (c *httpConn) nextID() int64 {
 func (sv *MCPServer) authHeaders(h http.Header) error {
 	for _, ref := range sv.Headers {
 		if !ref.set() {
-			return fmt.Errorf("mcp server %q: $%s is not set, so header %s cannot be built — export it, or lca would send a malformed credential", sv.Name, ref.EnvVar, ref.Name)
+			// Typed, not just worded: a variable that is not in this process's
+			// environment is a thing to fix in the environment, and an unattended caller
+			// that reads "could not reach the server" re-queues it every night without
+			// ever telling anybody. Cron does not inherit a login shell's exports, so
+			// this is the ordinary way a pipeline goes quiet.
+			return &mcpSetupErr{err: fmt.Errorf("mcp server %q: $%s is not set, so header %s cannot be built — export it in the environment this runs in (a cron job does not inherit your shell's exports), or lca would send a malformed credential", sv.Name, ref.EnvVar, ref.Name)}
 		}
 		h.Set(ref.Name, ref.value())
 	}
@@ -518,7 +523,7 @@ func dialMCPStdio(sv *MCPServer) (mcpConn, error) {
 	for _, ref := range sv.Env {
 		if !ref.set() {
 			cancel()
-			return nil, fmt.Errorf("mcp server %q: $%s is not set, so env %s cannot be built — export it", sv.Name, ref.EnvVar, ref.Name)
+			return nil, &mcpSetupErr{err: fmt.Errorf("mcp server %q: $%s is not set, so env %s cannot be built — export it in the environment this runs in (a cron job does not inherit your shell's exports)", sv.Name, ref.EnvVar, ref.Name)}
 		}
 		env = append(env, ref.Name+"="+ref.value())
 	}

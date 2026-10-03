@@ -103,8 +103,13 @@ type RolesConfig struct {
 	TierOrder    []string            // declaration order, for messages and YAML()
 	Tier         string              // the active tier (cfg.Tier): -tier / LCA_TIER
 	Roles        []*Agent
-	Sources      []string
-	Warnings     []string
+	// Pipeline is the pipeline: block (`lca ticket`): every fact about this team's
+	// tracker, forge and branches that lca cannot know. nil when no roles.yaml on
+	// the search path declares one, which is the ordinary case for a project that
+	// never runs the ticket machine.
+	Pipeline *PipelineConfig
+	Sources  []string
+	Warnings []string
 }
 
 // ModelOpts is what roles.yaml says about one model: its transport and the
@@ -208,6 +213,28 @@ func rolesFilePaths(cfg Config) []string {
 	return out
 }
 
+// carriesTeamFacts answers whether a roles.yaml with no roles in it is still
+// worth keeping. Every field named here is a fact about this team that lives
+// nowhere else, so dropping the file drops the fact: the pipeline: block is the
+// one that sent an operator in a circle (the README says to write a file that is
+// only that block), and the rest are listed because the next field added to this
+// type will be invisible the same way unless it is added here too.
+func (rc *RolesConfig) carriesTeamFacts() bool {
+	switch {
+	case rc == nil:
+		return false
+	case rc.Pipeline != nil, rc.HasMembers, rc.Remote != nil:
+		return true
+	case len(rc.Tiers) > 0, len(rc.ModelOpts) > 0, len(rc.Allow) > 0:
+		return true
+	case rc.RunTimeout > 0, rc.RunMaxSteps != 0, rc.RunMaxTokens > 0:
+		return true
+	case rc.Shell, rc.Review != "", rc.Entry != "":
+		return true
+	}
+	return false
+}
+
 func loadRoles(cfg Config) (*RolesConfig, error) {
 	rc := &RolesConfig{Apply: "verified", VerifyAttempts: 2, CheckTimeout: 600, ModelOpts: map[string]*ModelOpts{},
 		Members: map[string]*Member{localMemberName: {Name: localMemberName}}}
@@ -291,6 +318,16 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		if v := defs.str("member"); v != "" {
 			rc.DefaultMember = v
 		}
+		// The pipeline: block (`lca ticket`), merged key by key like defaults: so a
+		// $LCA_ROLES overlay can name a different target branch without restating
+		// the team's tracker tools. Only values that cannot MEAN anything are errors
+		// here; the required-key check belongs to the command that needs them, so a
+		// half-written block still opens an interactive session.
+		pipe, perr := parsePipeline(rc.Pipeline, doc, p)
+		if perr != nil {
+			return nil, perr
+		}
+		rc.Pipeline = pipe
 		if rn := doc.child("remote"); rn != nil || envRemote {
 			if rn != nil {
 				remoteBlock = true
@@ -1024,6 +1061,11 @@ func (rc *RolesConfig) YAML() string {
 	if rc.DefaultMember != "" && !(rc.DefaultMember == legacyMemberName && rc.remoteIsItsOwnSpelling()) {
 		fmt.Fprintf(&b, "  member: %s\n", rc.DefaultMember)
 	}
+	// The pipeline: block, written back verbatim. /role save rewrites the WHOLE
+	// file, so a block that was not rendered here would be silently deleted the
+	// first time somebody saved a team from a session — and with it a team's
+	// tracker and forge tool names, which nothing in lca can reconstruct.
+	b.WriteString(rc.Pipeline.yaml())
 	if len(rc.Allow) > 0 || rc.Shell {
 		b.WriteString("\nsandbox:\n")
 		if len(rc.Allow) > 0 {

@@ -1,7 +1,20 @@
-description: One ticket, end to end: baseline, brief, build on a branch, two reviews, merge, MR, ticket comment.
+description: One ticket as a WORKFLOW, for reference — `lca ticket <key>` is the state machine that does this with gates and idempotency.
 role: lead
 
-# The longest shape lca can run today, written out so the ceilings are visible.
+# There is a COMMAND for this arc now: `lca ticket <key>` (ticket.go). Prefer it.
+# It is a state machine rather than a list, so it has gates, it has idempotency,
+# and re-running it is the resume — it will not produce a second merge request
+# for one ticket. The decisive difference is the boundary: there, every
+# transition (branch, commit, merge, push, merge request, ticket comment) is
+# performed by lca's own code after its gate passed, and a model only writes
+# content. Here, steps 5 to 7 hand a model the tracker and the forge and trust it
+# to use them once.
+#
+# This file stays because it is still the clearest written-out example of what a
+# long `lca run` looks like: the ceilings, the placeholders, the when: clauses
+# and the two reviews, all visible on one page.
+#
+# The longest shape a WORKFLOW can run, written out so the ceilings are visible.
 # `lca run` has NO wall clock of its own on purpose (budget.go): a workflow's
 # units of time are the `timeout:` lines below, which an author writes next to a
 # build and a test suite. So the run's length is the sum of these numbers, and a

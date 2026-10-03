@@ -26,6 +26,12 @@ func main() {
 			os.Exit(runEval(context.Background(), cfg, os.Args[2:]))
 		case "run":
 			os.Exit(runWorkflow(cfg, os.Args[2:]))
+		// `ticket` and not `pipeline`: "the pipeline" already means the operator's
+		// own cron wrapper and "the pipeline profile" already means the sandbox an
+		// unattended agent runs under, and a third meaning would make the README
+		// ambiguous exactly where it has to be precise. ticket.go says the rest.
+		case "ticket":
+			os.Exit(runTicket(cfg, os.Args[2:]))
 		case "init":
 			os.Exit(runInit(cfg, os.Args[2:]))
 		case "doctor":
@@ -400,7 +406,13 @@ func buildOrchestrator(cfg Config, ap *Approver, rec *Recorder, tracer *Tracer) 
 	if err != nil {
 		return nil, fmt.Errorf("roles: %w", err)
 	}
-	if len(roles.Roles) == 0 {
+	// A file with no ROLES in it used to be thrown away whole, which is older than
+	// everything else a roles.yaml can carry. It now also carries the pipeline:
+	// block, members:, tiers:, the sandbox allowlist and the run's budgets — and
+	// the README tells an operator to write a roles.yaml that is ONLY a pipeline:
+	// block, after which `lca ticket` answered "roles.yaml has no pipeline: block"
+	// about the file holding it. Nothing is discarded unless there is nothing in it.
+	if len(roles.Roles) == 0 && !roles.carriesTeamFacts() {
 		roles = nil
 	}
 	jail, err := NewJail(cfg.Root, allowlistOf(cfg, roles), cfg.Unsafe)
@@ -450,6 +462,9 @@ func usage() {
 		"   lca doctor -role <name>      also the sandbox and permission rules in force for that role",
 		"   lca doctor -role <name> -y   the same, answered as `lca -y` would: an ask becomes an allow",
 		"   lca run <name>               run a workflow (deterministic steps; -list, -dry-run)",
+		"   lca ticket <key>             work one ticket: branch, code, review, merge, push, MR, comment",
+		"   lca ticket -new \"<task>\"      open a ticket from that one-liner first, then work it",
+		"   lca ticket <key> -dry-run    every transition, the gate it waits on, the skills per stage",
 		"   lca eval tasks/              run evaluation tasks (see README)",
 		"   lca report                   render the newest trace as one HTML file",
 		"   lca version                  the build's sha and the hash of the roles.yaml in force",

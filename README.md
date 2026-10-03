@@ -29,6 +29,7 @@ trail come from the process (uid/gid) for free.
 - [The sandbox](#the-sandbox--jailgo-toolsgo) — allowlist, shell mode, the GPU policy, [concurrent edits](#concurrent-edits--filelockgo-enginego-editgo)
 - [Internal MCP servers](#internal-mcp-servers--mcpgo-mcpclientgo-mcpcmdgo) — the host allowlist, the pinned tool manifest, read vs. write, `/mcp`
 - [Deterministic workflows — `lca run`](#deterministic-workflows--lca-run-workflowgo)
+- [One ticket, end to end — `lca ticket`](#one-ticket-end-to-end--lca-ticket-ticketgo-ticketcfggo) — the state machine, [its gates](#the-states-and-their-gates), [idempotency](#idempotency-the-state-file-is-a-journal-not-an-authority), [the `pipeline:` block](#the-pipeline-block--every-fact-lca-cannot-know), [`args:`/`fields:`](#a-tool-name-is-not-enough-args-and-fields), [skills per stage](#the-shared-knowledge-base-per-stage), [the git side](#what-the-git-side-does-and-refuses)
 - [Working on other machines: the fleet](#working-on-other-machines-the-fleet--membersgo-remotego)
 - [Agents & orchestration](#agents--orchestration--agentsgo-enginego-taskgo) — agents, [`task` vs. `delegate`](#the-task-tool-vs-delegate), skills, commands, permissions
 - [Terminal style](#terminal-style--uigo) · [Markdown & math](#markdown--math-rendering--markdowngo-mathgo) · [Keeping the loop moving](#keeping-the-loop-moving--enginego)
@@ -2033,6 +2034,395 @@ Both shipped examples carry comments on why each step is where it is:
 [`greenlight.yaml`](examples/workflows/greenlight.yaml) (zero tokens, three
 checks and a triage) and [`harden.yaml`](examples/workflows/harden.yaml) (plan,
 delegate, review, commit).
+
+## One ticket, end to end — `lca ticket`, `ticket.go`, `ticketcfg.go`
+
+`lca run` executes a *list* of steps. `lca ticket` is a **state machine**: it has
+gates, it has idempotency, and it has a resume that must never produce a second
+merge request for one ticket.
+
+```
+lca ticket BSK-123              work that ticket
+lca ticket -new "<one-liner>"   open a ticket first, then work it
+lca ticket BSK-123 -dry-run     every transition, its gate, the skills per stage
+lca ticket BSK-123 -json        one result object on stdout
+lca ticket -list                the tickets with state on this machine
+```
+
+**There is no `-resume`.** Re-running the command *is* the resume: the state is
+found by ticket key, the walk always starts at the first transition, and every
+transition re-proves its own effect against the world before taking it. One cron
+line, whatever happened last night.
+
+The boundary that makes it safe is not the list of transitions — it is that every
+state transition (branch, commit, merge, push, merge request, ticket comment) is
+performed **by lca's own code** at a step boundary, after its gate passed, and
+never by a model holding a shell. The pipeline profile says why in one line: *an
+agent that pushes has taken a decision nobody reviewed.* A model writes CONTENT
+here — the ticket body, the code, the review, the merge request description, the
+comment — and nothing else.
+
+Why `ticket` and not `pipeline`: "the pipeline" already means the operator's own
+cron wrapper (the whole of [the result object](#driven-by-a-program---prompt-file--json-oneshotgo)
+is written to it) and "the pipeline profile" already means
+[`examples/pipeline.roles.yaml`](examples/pipeline.roles.yaml). A third meaning
+would make this README ambiguous exactly where it has to be precise. The
+configuration block stays `pipeline:` — that is the team's delivery pipeline,
+which is a different noun from the unit of work.
+
+### The states and their gates
+
+| state | lca performs | a model writes | waits on |
+|---|---|---|---|
+| `opened` | reads the ticket, or opens one from `-new` | the ticket body (`-new` only) | — |
+| `branched` | the branch and its worktree | — | the ticket exists |
+| `implemented` | runs the coder's `check_cmd` over the result | the code | a branch exists |
+| `reviewed` | takes the diff, records the structured verdict | the review | **the check is green** |
+| `reworked` | starts the next round on the coder's own session | the code again | request_changes, and a round left |
+| `merged` | merges into `target_branch` | — | **green check AND `approve`** |
+| `pushed` | pushes to the remote | — | merged, and `push: true` |
+| `proposed` | finds the merge request, opens one if there is none | its description | the branch is on the remote |
+| `reported` | comments on the ticket, moves its status | the comment | nothing — a blocked run is reported too |
+
+Nothing merges, pushes or proposes unless the check is green **and** the review
+says `approve`. A red check after its attempts ends the run at `implemented`; a
+`request_changes` after the last rework round ends it at `reviewed`. Either way
+the ticket gets a comment saying what is blocked, because an unattended pipeline
+that goes quiet is worse than one that fails loudly. A verdict that could not be
+read is not an approval — [review.go](#the-reviewers-per-line-verdict---diff-base-reviewgo)'s
+own rule: unreadable is failed, never a silent approve.
+
+`push: false` is not a block, it is a **success that ends at `merged`**: the push
+and the merge request are recorded as *skipped*, and the run exits 0.
+
+### Idempotency: the state file is a journal, not an authority
+
+State lives in `$LCA_DIR/tickets/<key>/state.json` (0600, in a 0700 directory,
+rewritten after every transition, secrets scrubbed at the sink). A pid lock keeps
+two processes off one ticket, because two would make two merge requests.
+
+A local file cannot be the truth about a branch on a remote, a merge request on a
+forge or a comment on a tracker. So what the state file is *for* is the evidence
+that lets a probe tell **our** effect from **somebody else's**:
+
+| transition | re-entered by asking | ours when | not ours when |
+|---|---|---|---|
+| `branch` | `rev-parse` | the branch still contains the commit we cut it at | it exists and we never cut it, or no longer contains that commit |
+| `implement` | the recorded head and check | a commit is on the branch and the check is green | — |
+| `review` | the recorded verdict | a verdict for this round exists | — |
+| `merge` | `merge-base --is-ancestor` | our head is already in the target | — |
+| `push` | `ls-remote` | the remote's sha is ours, or contains it | the remote's sha does not contain ours |
+| `propose` | the forge's own find tool, **always** | a merge request for this branch exists | — |
+| `report` | the marker in our own comment | a comment carries this state's marker | — |
+
+Two consequences worth stating. **The state file says `pushed` and the remote
+says otherwise:** the remote wins and the push is simply made again — either it
+never landed or somebody deleted the branch, and pushing the same commits is a
+no-op in the first case and the repair in the second. A remote branch that does
+*not* contain our commit is refused instead, with exit 2 and a comment on the
+ticket: nothing here will force anything over work it cannot account for. And
+**the merge request is never created without asking the forge first**, which is
+why `forge: find_merge_request` is a required key and not a convenience.
+
+Before every remote call the run writes its intent (`pending`) to the state file.
+Everything except opening a ticket is safe to re-enter blind, so a crash in that
+window just re-runs the transition. Opening a ticket is not — it cannot be undone
+and the four configured tracker tools include no search — so a run killed there
+refuses, names the state file, and tells you to re-run as `lca ticket <KEY>`.
+A `-new` run keeps its state under `tickets/new-<hash of the task text>/` until
+the tracker names the ticket, so the same cron line run twice finds the same
+half-finished work instead of opening a second ticket.
+
+A resumed run also **re-derives its gates from the recorded evidence**, not from
+the state word: a document that says `merged` with no green check or no `approve`
+under it is refused rather than continued.
+
+### The `pipeline:` block — every fact lca cannot know
+
+All of it in `roles.yaml`, merged key by key across the search path like
+`defaults:` is, so a `$LCA_ROLES` overlay can change one branch name without
+restating the tracker's tools. **A missing key is an error that names the key** —
+never a guess, never a default that silently does the wrong thing against a real
+tracker. Their jira-mcp alone exposes about seventy tools and no two
+installations name them alike, so every tool name is configuration.
+
+```yaml
+pipeline:
+  project: BSK                  # -new only: what the ticket is created under
+  branch_prefix: agent/         # the branch is this + the ticket key
+  remote: origin                # push: true only
+  target_branch: main
+  push: true                    # true or false — there is no safe default
+  rework_rounds: 1              # 0 is legal: one review, no rework
+  roles:
+    coder: coder
+    reviewer: reviewer
+    integrator: integrator      # writes the MR description and the comment
+  tracker:                      # YOUR tool names, out of .lca/mcp.lock.json
+    read: jira__issue_get
+    create: jira__issue_create  # -new only
+    comment: jira__issue_comment
+    transition: jira__issue_transition   # optional, with the two statuses
+    status_done: In Review
+    status_blocked: Needs human
+  forge:                        # push: true only
+    create_merge_request: gitlab__create_merge_request
+    find_merge_request: gitlab__list_merge_requests
+  skills:                       # the shared knowledge base, per stage
+    ticket:   [ticket-brief]
+    coder:    [deploy-to-stand, repo-conventions]
+    reviewer: [review-checklist]
+    mr:       [mr-description]
+    report:   [ticket-comment]
+```
+
+The two halves above are **one block**: the keys here and the `args:`/`fields:`
+mapping in the next section go into the same `pipeline:`. Copying only this half
+earns nine "lca cannot guess this" errors, which is the reader working as
+intended and a documentation trap all the same — so the whole thing in one piece
+is [`examples/ticket.roles.yaml`](examples/ticket.roles.yaml), which a test
+parses and validates on every run so it cannot drift from the reader.
+
+Required always: `branch_prefix`, `target_branch`, `push`, `rework_rounds`, the
+three `roles:`, `tracker: read`, `tracker: comment`, and — see the next section —
+`tracker: args: read`, `tracker: args: comment` and `tracker: fields: summary`.
+Required with `-new`: `project`, `tracker: create`, `tracker: args: create`,
+`tracker: fields: key`. Required with `push: true`: `remote`, both `forge:` keys,
+both `forge: args:`, `forge: fields: branch` and one of `forge: fields: url` /
+`id`. Required with a status move: `tracker: args: transition`.
+
+The status move is optional **as a group of three** — a transition tool with no
+status could never be called, and a status with no tool to apply it is a team
+that believes lca is moving their ticket while nothing ever does; both halves are
+refused. `tracker: comment` is deliberately not optional: a blocked run has to be
+able to say so.
+
+### A tool name is not enough: `args:` and `fields:`
+
+Knowing that this team's read tool is called `jira__issue_get` says nothing about
+whether its argument is `issueKey`, `issueIdOrKey`, `key` or `id`, and nothing
+about which key of the reply holds the summary. The input schema in
+`.lca/mcp.lock.json` gives lca the *names* a tool takes — and it is used for
+exactly that, see below — but no schema says which of them means "the ticket I am
+asking about". So the mapping is written down once, by the person who knows, and
+**a missing one is an error naming the key**:
+
+```yaml
+pipeline:
+  tracker:
+    read: jira__issue_get
+    args:                           # the server's own argument names
+      read:                         # one-line {…} is fine; indented keys always are
+        issueIdOrKey: "${key}"
+      create:
+        project: "${project}"
+        summary: "${summary}"
+        description: "${body}"
+        issuetype: Task
+      comment:
+        issueIdOrKey: "${key}"
+        body: "${text}"
+      transition:
+        issueIdOrKey: "${key}"
+        transition: "${status}"
+    fields:                         # where in the REPLY each value is
+      key:        key               # a dotted path; `.` is the reply itself
+      summary:    fields.summary
+      body:       fields.description
+      comment_id: id
+  forge:
+    args:
+      create_merge_request:
+        source_branch: "${branch}"
+        target_branch: "${target}"
+        title: "${title}"
+        description: "${body}"
+      find_merge_request:
+        source_branch: "${branch}"
+        target_branch: "${target}"
+        state: opened
+    fields:
+      list:   .                     # where the array of merge requests is
+      branch: source_branch         # both ends are re-checked against what lca
+      target: target_branch         # asked for: this branch into another target
+      id:     iid                   # is somebody else's merge request
+      url:    web_url
+```
+
+What lca substitutes, per call: `read` `${key}`; `create` `${project}`
+`${summary}` `${body}`; `comment` `${key}` `${text}`; `transition` `${key}`
+`${status}`; `create_merge_request` `${branch}` `${target}` `${title}` `${body}`
+`${key}` `${summary}`; `find_merge_request` `${branch}` `${target}`. A
+placeholder a call has no value for is refused when `roles.yaml` is read, so
+`${tikcet}` is caught by `lca` and `lca doctor` and not at 3am by the tracker.
+
+Four things this buys, each of which was a way to be silently wrong:
+
+* **A call must be *about* something.** A `read:` naming no `${key}` reads
+  whatever the tool's default is, a `comment:` with no `${text}` posts an empty
+  comment, a `find_merge_request:` with no `${branch}` asks for every open merge
+  request in the project. Those are refused by name, not accepted.
+* **Bare literals keep their type.** `state: opened` is a string, `points: 3` is
+  a number and `urgent: false` is a boolean, because a tool whose argument is an
+  integer cannot be called with `"42"`. Quote it to force a string. Anything that
+  came from a placeholder is always a string.
+* **The schema is checked for what it can answer.** Before the tracker is
+  touched, every configured tool must exist in the registry, every argument name
+  must be one that tool declares, and every property the tool declares
+  **required** must be given a value. A typo is an error naming the key, with the
+  tool's own argument list in it.
+* **A reply path that does not resolve is an error**, naming the `roles.yaml`
+  key, the path, the tool and the first 200 characters of what came back —
+  because the person reading that line at 08:00 has none of those. It is never a
+  blank filled in: a summary that silently came back empty is a coder sent to
+  implement nothing, and a merge request lca could not read the address of is a
+  ticket comment nobody can act on.
+
+Two deliberate softnesses, both stated rather than hidden. `tracker: fields:
+body` is **optional**: left out, the coder is handed the *whole reply*, which
+guesses no key and is usually raw JSON — name the path to hand it just the
+description. And finding the run's own ticket comment again is done by searching
+the read tool's reply for the marker lca put in it (there is no comment-search
+tool in the block, because lca does not get to assume this tracker has one), so
+**a read tool whose reply does not include the comments can never show lca its
+own marker** and the run will comment again each night. Name a read tool that
+returns them.
+
+### Who writes what, and what lca does with it
+
+| stage | role | writes | lca then |
+|---|---|---|---|
+| `ticket` | `integrator` | a title and a body (`-new` only) | opens the ticket |
+| `coder` | `coder` | code, in the ticket's worktree | commits it, once per verifier attempt |
+| `reviewer` | `reviewer` | the structured verdict | records it; the merge gate reads it |
+| `mr` | `integrator` | a title and a description | finds or creates the merge request |
+| `report` | `integrator` | the ticket comment | posts it, and moves the status |
+
+Each stage is a **fresh child session** except a rework round, which continues
+the coder's own session (`-session`): the model already knows what it tried and
+the gateway's prefix cache makes round two cheap, while a reviewer that inherited
+the coder's account of its own work would not be reviewing anything. The
+reviewer and the two integrator stages carry an `edit * deny` of their own — the
+change was made, checked and reviewed already, and an edit at those stages is
+unreviewed work riding along inside the thing that describes it.
+
+**The write grant.** `newChild` appends `mcp_write * Deny` to every child, and
+`toolsFor` drops a tool whose permission is disabled, so a stage never *sees* a
+write schema: it cannot emit the call and cannot be talked into one by text that
+came out of a ticket. The grants live on one session that lca holds and never
+sends to a gateway, they are exactly the tools the block named, and they are
+narrowed to what this invocation will do — a run without `-new` does not hold the
+grant that opens tickets, and `push: false` holds no forge grant at all. `-y`
+grants none of it.
+
+**Secrets.** A ticket comment and a merge request description are composed from a
+check's output, and a `check.sh` that echoes its environment on failure puts a
+live token there. Both are scrubbed [at the sink](#secrets-out-of-every-artefact--redactgo),
+and the check tail is scrubbed *before* the stage that writes them is handed it,
+so a model is not asked to paraphrase a token into something public. The verifier
+still hands the **coder** its tail unredacted, because that model is being asked
+to fix the cause and a `[redacted]` where the cause was costs it every attempt —
+that difference is deliberate, and the two places say so. `state.json`, the
+`-json` result and the journal in it go through the same scrub.
+
+### What the git side does, and refuses
+
+Every one of these is lca's own code, with `core.hooksPath=/dev/null` and
+`commit.gpgsign=false` on every invocation that could run a hook — a `pre-push`
+hook in a cron job is something that can only hang or fail.
+
+* **The branch** is cut from `target_branch` and not from whatever is in
+  somebody's tree, because what it will produce is a merge request against that
+  branch. It is recorded in `refs/lca/made/<branch>`, so `lca clean --branches`
+  may ever touch it. Re-entering **adopts**: the existing branch, and the
+  existing worktree if git still has one. A worktree that was removed — `lca
+  clean`, a reboot with the state directory on tmpfs — is added back onto the
+  same branch, which is why `branched` proves both halves of its effect.
+* **The merge** happens in the object database (`merge-tree --write-tree`, git
+  2.38 or newer, named in the refusal when it is older) and moves `target_branch`
+  with a **compare-and-swap** on the ref: a target that moved while the merge was
+  computed is refused rather than overwritten, because a lost update here is
+  unreviewed work silently dropped out of a branch somebody is about to release.
+  Nothing is staged, committed, reset or checked out anywhere.
+  **It refuses when a working tree holds the target branch**, naming the
+  directory: moving a branch under a live checkout shows every merged file as a
+  local deletion in that tree's `git status`, and lca does not touch a tree it
+  does not own. Park the pipeline's clone (`git switch --detach`), or point
+  `target_branch` at a branch nobody has checked out. A **conflict** merges
+  nothing, names the files and goes to a person — two changes that both passed
+  review and disagree about the same lines is a decision, not a thing to resolve
+  unattended.
+* **The push** sends one commit to one branch, by **sha**: between the probe that
+  approved it and the push, the local branch may have moved, and what was
+  reviewed is the sha. One fully spelled refspec, so no `push.default` and no
+  `--all`/`--tags` can reinterpret it. **Never `--force`, never
+  `--force-with-lease`.** A remote whose branch does not contain our commit is
+  refused before the push (exit 2, with the reason on the ticket); a rejection
+  that happens anyway is reported as the remote's answer and not as an outage. A
+  remote nobody can reach is `infra_error` — the ticket goes back in the queue.
+
+### The shared knowledge base, per stage
+
+The run is unattended, so the knowledge a human would bring — how this team
+deploys to the stand, what a merge request description has to contain here, what
+the reviewer always checks — has to come from somewhere. That somewhere is the
+[shared skills repository](#agents--orchestration--agentsgo-enginego-taskgo)
+(`LCA_SKILLS`), and `pipeline: skills:` names skills **per stage**: `ticket`,
+`coder`, `reviewer`, `mr`, `report`. Named, never left to the model to pick — a
+stage that runs at 3am must not depend on a model noticing an index line. The
+named skill is loaded and its instructions go into *that* stage's task message,
+in the order the block lists them; precedence is the documented one, so a
+project's own `.lca/skills` still beats the shared repository.
+
+Two things follow:
+
+* **A named skill that is missing from every skills directory is an error** that
+  names the skill, the directories searched and the skills that *were* found. Not
+  a warning, and not a stage quietly running without it: a pipeline running
+  without the team's deploy runbook is worse than one that refuses to start,
+  because the first kind merges. A `skills:` key that is not one of the five
+  stages is refused at load time, for the same reason — `reviewers:` parses,
+  loads nothing, and leaves the reviewer without the checklist.
+* **The run records which skills were in force**, by stage, name and content hash
+  (the whole skill directory, so a runbook whose script was rewritten is a
+  different runbook), in the state file and in the `-json` result. Two pipeline
+  runs of one ticket are otherwise not comparable — the same reason
+  `results.jsonl` carries `roles_hash` and `prompt_hash`.
+
+### `-dry-run` and `-json`
+
+`-dry-run` validates the configuration, resolves the skills, reads any existing
+state, and prints: the facts in force (ticket, branch, target, remote, push,
+rounds, roles, where the state file is and what state it is at); every transition
+with the state it records, whether it `would` run / is already `done` / would be
+`skip`ped / `waits` on something; which stage writes content there and which
+skills that stage gets; each transition's gate sentence in full; and the skills
+in force with their hashes. It touches no tracker, no forge, no remote and no
+model, and writes no state. The two mistakes that stop a real run — a missing key
+and a missing skill — are the two that stop this one.
+
+`-json` writes one object on stdout and moves everything else to stderr. It
+carries the same `status` word and the same
+[exit-code table](#driven-by-a-program---prompt-file--json-oneshotgo) as a
+one-shot run (0 passed, 1 failed, 2 usage/config, 3 infra, 4 budget, 130
+cancelled), plus what only a state machine has: `state` (where the work stands),
+`blocked` and `blocked_at` (the gate's own sentence and the state it stopped in),
+`round`/`rounds`, `branch`/`head`/`pushed_sha`, `merge_request`, the four `check_*`
+fields with the same shape and the same pointer rule as the one-shot object,
+`review`, `skills`, `transitions` (the journal) and `state_file`.
+
+`-dry-run` also prints **the calls**, with this ticket's own key and branch
+substituted into the operator's own argument names. That is the one thing to read
+before the first night: a plan that printed only the tool names would hide the
+half that goes over the wire.
+
+> Not in this build, and named rather than implied: a merge conflict is reported
+> to a person and not handed to the integrator role for one supervised
+> resolution attempt the way a delegation's is ([branch.go](#apply-branch--a-delegation-becomes-a-real-branch--branchgo-cleango));
+> a ticket is worked on this machine only, with no `member:` arm; and the check
+> that runs over the result is the coder role's own `check_cmd`, with no per-run
+> override, because a pipeline whose verifier can be chosen per call has a
+> verifier nobody can audit.
 
 ## Working on other machines: the fleet — `members.go`, `remote.go`
 
