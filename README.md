@@ -2503,6 +2503,13 @@ cancelled), plus what only a state machine has: `state` (where the work stands),
 fields with the same shape and the same pointer rule as the one-shot object,
 `review`, `skills`, `transitions` (the journal) and `state_file`.
 
+`lca ticket -list -json` is the same listing for a loop rather than a person:
+one object with a `tickets` array (always an array, never null), newest first,
+each row carrying `ticket`, `state`, `status`, the gate's own `blocked` sentence,
+`round`/`rounds`, `branch`, `merge_request` and the path to its `state_file`.
+That is what a round-the-clock wrapper reads every few minutes — parsing the
+drawn table for it is how a cron job starts depending on column widths.
+
 `-dry-run` also prints **the calls**, with this ticket's own key and branch
 substituted into the operator's own argument names. That is the one thing to read
 before the first night: a plan that printed only the tool names would hide the

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -124,4 +126,85 @@ func TestTwoTicketKeysNeverShareOneStateDirectory(t *testing.T) {
 		}
 		seen[slug] = key
 	}
+}
+
+// -list is read by a loop, not by a person: a round-the-clock wrapper asks "what
+// is in flight and what stopped where" every few minutes, and parsing a drawn
+// table for that is how a cron job starts depending on column widths.
+func TestTheTicketListHasAMachineReadableForm(t *testing.T) {
+	cfg := Config{Dir: t.TempDir()}
+	cfg.StateDir = cfg.Dir
+
+	// An empty machine answers with an empty ARRAY, never a null: a loop that
+	// iterates it must not have to check.
+	var got struct {
+		Tickets []map[string]any `json:"tickets"`
+	}
+	if err := json.Unmarshal([]byte(captureTicketsJSON(t, cfg)), &got); err != nil {
+		t.Fatalf("an empty machine must still answer with one object: %v", err)
+	}
+	if got.Tickets == nil {
+		t.Fatal("tickets must be [] and never null")
+	}
+
+	for _, st := range []*TicketState{
+		{Ticket: "BSK-1", State: tktPushed, Status: statusPassed, Branch: "agent/BSK-1",
+			Round: 1, Rounds: 2, Updated: "2026-10-03T10:00:00Z",
+			MergeRequest: &TicketMR{ID: "7", URL: "https://forge/r/7"}},
+		{Ticket: "BSK-2", State: tktImplemented, Status: statusFailed, Blocked: "the check stayed red",
+			Round: 2, Rounds: 2, Updated: "2026-10-03T11:00:00Z"},
+	} {
+		dir := ticketDir(cfg, st.Ticket)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		st.Version = tktStateVersion
+		if err := saveTicketState(dir, st); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := json.Unmarshal([]byte(captureTicketsJSON(t, cfg)), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tickets) != 2 {
+		t.Fatalf("both tickets, got %d", len(got.Tickets))
+	}
+	// Newest first, so a loop's first row is the one that just moved.
+	if got.Tickets[0]["ticket"] != "BSK-2" {
+		t.Fatalf("newest first: %v", got.Tickets[0]["ticket"])
+	}
+	// The three fields a loop switches on, and the one a person is sent to.
+	for _, k := range []string{"ticket", "state", "status", "state_file"} {
+		if got.Tickets[0][k] == nil || got.Tickets[0][k] == "" {
+			t.Fatalf("%q is missing from %v", k, got.Tickets[0])
+		}
+	}
+	if got.Tickets[0]["blocked"] != "the check stayed red" {
+		t.Fatalf("the gate's own sentence is what tells the loop whether to retry: %v", got.Tickets[0])
+	}
+	if got.Tickets[1]["merge_request"] != "https://forge/r/7" {
+		t.Fatalf("a ticket that already has a merge request says where: %v", got.Tickets[1])
+	}
+}
+
+// captureTicketsJSON runs the listing with stdout on a pipe, because that is
+// the only way to assert what a wrapper would actually read.
+func captureTicketsJSON(t *testing.T, cfg Config) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "list*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := printTicketsJSON(cfg, f); code != exitOK {
+		t.Fatalf("listing exited %d", code)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

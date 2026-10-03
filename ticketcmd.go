@@ -163,6 +163,15 @@ func runTicket(cfg Config, args []string) int {
 	}
 
 	if *list {
+		// -json here for the same reason it exists on a run: the thing that reads
+		// this is a loop, not a person. A round-the-clock wrapper asks "what is in
+		// flight and what stopped where" every few minutes, and parsing a drawn
+		// table for that is how a cron job starts depending on column widths.
+		if *jsonOut {
+			// stdout is still stdout here: the swap below belongs to a RUN, which has
+			// model lines and notes to move out of the way. A listing has neither.
+			return printTicketsJSON(cfg, os.Stdout)
+		}
 		printTickets(cfg)
 		return exitOK
 	}
@@ -942,4 +951,51 @@ func (rc *RolesConfig) pipelineOf() *PipelineConfig {
 		return nil
 	}
 	return rc.Pipeline
+}
+
+// printTicketsJSON is -list -json: one object, so a wrapper can switch on it.
+// `tickets` is an array and never null, for runResult.Comments' reason — a loop
+// that iterates it must not meet a null on an empty machine.
+func printTicketsJSON(cfg Config, out *os.File) int {
+	type row struct {
+		Ticket  string `json:"ticket"`
+		State   string `json:"state"`
+		Status  string `json:"status"`
+		Blocked string `json:"blocked,omitempty"`
+		Round   int    `json:"round"`
+		Rounds  int    `json:"rounds"`
+		Branch  string `json:"branch,omitempty"`
+		MR      string `json:"merge_request,omitempty"`
+		Updated string `json:"updated"`
+		Dir     string `json:"state_file"`
+	}
+	rows := []row{}
+	ents, _ := os.ReadDir(ticketsDir(cfg))
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(ticketsDir(cfg), e.Name())
+		st, err := loadTicketState(dir)
+		if err != nil {
+			continue
+		}
+		r := row{Ticket: st.Ticket, State: st.State, Status: st.Status, Blocked: st.Blocked,
+			Round: st.Round, Rounds: st.Rounds, Branch: st.Branch, Updated: st.Updated,
+			Dir: filepath.Join(dir, "state.json")}
+		if st.MergeRequest != nil {
+			r.MR = firstNonEmpty(st.MergeRequest.URL, st.MergeRequest.ID)
+		}
+		rows = append(rows, r)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Updated > rows[j].Updated })
+	enc := json.NewEncoder(out)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(struct {
+		Tickets []row `json:"tickets"`
+	}{rows}); err != nil {
+		fmt.Fprintln(os.Stderr, "writing the list failed: "+err.Error())
+		return exitInfra
+	}
+	return exitOK
 }
