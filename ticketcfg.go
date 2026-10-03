@@ -40,13 +40,15 @@ const (
 	tktStageTicket   = "ticket"   // -new: the model writes the ticket body
 	tktStageCoder    = "coder"    // the implementation, and every rework round
 	tktStageReviewer = "reviewer" // the structured verdict against the diff
+	tktStageResolve  = "resolve"  // the one supervised attempt at a merge conflict
 	tktStageMR       = "mr"       // the merge request's description
 	tktStageReport   = "report"   // the comment that goes back on the ticket
 )
 
 // tktStages is the set, in the order the stages happen, which is also the order
 // -dry-run prints them and the order the state file records them in.
-var tktStages = []string{tktStageTicket, tktStageCoder, tktStageReviewer, tktStageMR, tktStageReport}
+var tktStages = []string{tktStageTicket, tktStageCoder, tktStageReviewer, tktStageResolve,
+	tktStageMR, tktStageReport}
 
 // PipelineConfig is roles.yaml's pipeline: block. Push and Rounds are POINTERS
 // for the reason runResult.CheckExit is one: false and 0 are both meaningful
@@ -66,6 +68,21 @@ type PipelineConfig struct {
 	Target       string // the branch the work merges into
 	Push         *bool  // whether this pipeline may push at all
 	Rounds       *int   // rework rounds after a request_changes; 0 is legal
+
+	// ResolveConflicts is the one opt-in in the whole block that has a safe
+	// default, and the default is OFF.
+	//
+	// Everything else here is a fact lca cannot guess, so a missing key is a
+	// refusal. This one is a DECISION: a branch that no longer merges into the
+	// target can either go to a person or get one supervised attempt by the
+	// integrator role, and both answers are defensible. Off, because resolving a
+	// conflict is choosing which of two intentions survives, and a default that
+	// decides is a default nobody chose — a team that wants it says so by name.
+	//
+	// A pointer for Push's reason even so: `false` written on purpose and nothing
+	// written at all read the same to the run, but they do not read the same to
+	// /role save, which must not add a key the operator never typed.
+	ResolveConflicts *bool
 
 	Coder      string // which role implements
 	Reviewer   string // which role judges the diff
@@ -221,6 +238,13 @@ func (pc *PipelineConfig) pipelinePush() bool {
 	return pc != nil && pc.Push != nil && *pc.Push
 }
 
+// resolveConflicts is the opt-in read with its documented default: nothing
+// written means a conflict goes to a person, which is what lca did before this
+// key existed and what it still does for every team that never writes it.
+func (pc *PipelineConfig) resolveConflicts() bool {
+	return pc != nil && pc.ResolveConflicts != nil && *pc.ResolveConflicts
+}
+
 // parsePipeline merges one roles.yaml's pipeline: block into pc, key by key, so
 // a team file and a $LCA_ROLES overlay compose the way defaults: does — the
 // later file wins per key and does not erase the keys it is silent about.
@@ -259,6 +283,13 @@ func parsePipeline(pc *PipelineConfig, doc *yNode, path string) (*PipelineConfig
 			return nil, fmt.Errorf("%s: pipeline: push: %w", path, err)
 		}
 		pc.Push = &b
+	}
+	if v := strings.TrimSpace(n.str("resolve_conflicts")); v != "" {
+		b, err := parsePipelineBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: pipeline: resolve_conflicts: %w", path, err)
+		}
+		pc.ResolveConflicts = &b
 	}
 	if v := strings.TrimSpace(n.str("rework_rounds")); v != "" {
 		k, err := strconv.Atoi(v)
@@ -1031,6 +1062,13 @@ func resolveStageSkills(pc *PipelineConfig, skills map[string]*Skill, dirs []str
 		if stage == tktStageTicket && !need.creating {
 			continue
 		}
+		// The same narrowing, for the same reason: with resolve_conflicts off no
+		// integrator is ever sent at a conflict, so that stage's skills would be
+		// loaded by nothing — and holding a team to a file lca is not going to read
+		// is the mistake the `ticket` line above was written to undo.
+		if stage == tktStageResolve && !pc.resolveConflicts() {
+			continue
+		}
 		for _, name := range pc.Skills[stage] {
 			sk := skills[name]
 			if sk == nil {
@@ -1168,6 +1206,9 @@ func (pc *PipelineConfig) yaml() string {
 	}
 	if pc.Rounds != nil {
 		fmt.Fprintf(&b, "  rework_rounds: %d\n", *pc.Rounds)
+	}
+	if pc.ResolveConflicts != nil {
+		fmt.Fprintf(&b, "  resolve_conflicts: %t\n", *pc.ResolveConflicts)
 	}
 	sub := func(head string, kv [][2]string, more ...string) {
 		var inner strings.Builder

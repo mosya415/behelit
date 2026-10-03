@@ -40,6 +40,17 @@ type fakeWorld struct {
 	worktrees   map[string]string   // branch → where it is checked out
 	worktreeErr error
 
+	// the conflict. conflictFiles is what MergeConflicts answers — empty means the
+	// branch merges into the target — and the rest is what the one supervised
+	// attempt at it does.
+	conflictFiles string
+	resolveFiles  string // what MergeTargetIn reports; defaults to conflictFiles
+	resolveErr    error  // the integrator stage could not finish
+	resolveHead   string // the commit it left, "" for "it committed nothing"
+	resolveCheck  *TicketCheck
+	lost          string // the reviewed paths ResolvedAt says did not survive
+	abandonRef    string
+
 	// the forge
 	mr    *TicketMR
 	mrNum int
@@ -205,13 +216,70 @@ func (w *fakeWorld) MergeIn(branch, target, sha string) (string, error) {
 	return out, nil
 }
 
-func (w *fakeWorld) RemoteHead(remote, branch string) (string, bool, error) {
+// The conflict side of the repository. The fake keeps it as one string because
+// the machine only ever asks two things of it — does it collide, and which paths
+// — and the git that answers those for real has tests of its own against a real
+// repository (ticketgit_test.go).
+func (w *fakeWorld) MergeConflicts(branch, target string) (string, bool, error) {
+	w.hit("mergeconflicts")
+	return w.conflictFiles, w.conflictFiles != "", nil
+}
+
+func (w *fakeWorld) MergeTargetIn(branch, target, dir string) (string, string, error) {
+	w.hit("mergetargetin")
+	if dir == "" {
+		w.t.Fatal("MergeTargetIn was called with no worktree, so the merge would have happened in the operator's own tree")
+	}
+	return w.heads[target], firstNonEmpty(w.resolveFiles, w.conflictFiles), nil
+}
+
+func (w *fakeWorld) ResolvedAt(branch, dir, approved, target string) (string, string, error) {
+	w.hit("resolvedat")
+	head := w.heads[branch]
+	if head == "" || head == approved {
+		return "", "", fmt.Errorf("nothing was committed on %s", branch)
+	}
+	return head, w.lost, nil
+}
+
+func (w *fakeWorld) AbandonResolution(branch, dir, approved string) (string, error) {
+	w.hit("abandon")
+	w.heads[branch] = approved
+	return w.abandonRef, nil
+}
+
+// Resolve is the integrator's one attempt, as the machine sees it: a commit on
+// the branch and a check verdict. The default is a resolution that worked, so a
+// test that cares about a failure says which failure it is.
+func (w *fakeWorld) Resolve(_ context.Context, in tktStageIn) (tktCodeOut, error) {
+	w.hit("stage:" + in.Stage)
+	w.hit("instr:" + in.Stage + ":" + in.Instructions)
+	if in.Conflict.Files == "" {
+		w.t.Fatal("the resolve stage must be told which files collided")
+	}
+	if w.resolveErr != nil {
+		return tktCodeOut{Session: "integrator-sess", Head: w.resolveHead}, w.resolveErr
+	}
+	head := firstNonEmpty(w.resolveHead, "resolved999")
+	w.heads[in.Branch] = head
+	w.ancestry[head] = append([]string{in.Conflict.Base, w.heads[in.Target]}, w.ancestry[in.Conflict.Base]...)
+	// The branch now carries the target, which is what makes the attempt
+	// re-enterable: the next pass through the probe finds no conflict left.
+	w.conflictFiles = ""
+	check := w.check
+	if w.resolveCheck != nil {
+		check = *w.resolveCheck
+	}
+	return tktCodeOut{Session: "integrator-sess", Head: head, Check: check}, nil
+}
+
+func (w *fakeWorld) RemoteHead(_ context.Context, remote, branch string) (string, bool, error) {
 	w.hit("remotehead")
 	sha, ok := w.remotes[remote+"/"+branch]
 	return sha, ok, nil
 }
 
-func (w *fakeWorld) PushBranch(remote, branch, sha string) error {
+func (w *fakeWorld) PushBranch(_ context.Context, remote, branch, sha string) error {
 	w.hit("pushbranch")
 	w.remotes[remote+"/"+branch] = sha
 	return nil
@@ -1443,39 +1511,61 @@ func planRow(t *testing.T, out, name string) string {
 func TestAPlanIsHeldToTheSameBudgetRuleAsTheRun(t *testing.T) {
 	f := newTktRepoFix(t, "BSK-21")
 	f.park(t)
-	armed := func(rc *RolesConfig) *runBudget {
-		b, err := newRunBudget(rc, 0, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, cancel := b.start(context.Background())
-		t.Cleanup(cancel)
-		return b
-	}
 
-	f.orch.budget = armed(&RolesConfig{RunMaxSteps: stepsUnlimited})
-	for _, dry := range []bool{false, true} {
-		w := newFakeWorld(t)
-		r := fresh(t, w, pipeFrom(t, fullPipeline))
-		r.orch = f.orch
-		err := r.preflight(dry, tktNeed{})
-		if err == nil {
-			t.Fatalf("dry=%v: unattended and unbounded in every dimension is the one combination nobody can afford", dry)
-		}
-		if !strings.Contains(err.Error(), "max_steps") {
-			t.Fatalf("dry=%v: the refusal names the key: %v", dry, err)
+	// The two configurations with no clock on them, and the second is the one the
+	// guard used to let through: it read `max_steps == unlimited`, so a file that
+	// merely SET a step count passed. A step is not a dimension a hang moves in —
+	// a gateway that streams four tokens and goes silent advances none and spends
+	// none — so a run with 200 steps and no clock is as unbounded as one with
+	// `unlimited`, and for the one failure neither ceiling can see.
+	for _, rc := range []*RolesConfig{
+		{RunMaxSteps: stepsUnlimited},
+		{RunMaxSteps: 200},
+	} {
+		f.orch.budget = armedBudget(t, rc)
+		for _, dry := range []bool{false, true} {
+			w := newFakeWorld(t)
+			r := fresh(t, w, pipeFrom(t, fullPipeline))
+			r.orch = f.orch
+			err := r.preflight(dry, tktNeed{})
+			if err == nil {
+				t.Fatalf("max_steps=%d dry=%v: unattended with no clock is the one combination nobody can afford", rc.RunMaxSteps, dry)
+			}
+			// The key to ADD, because only a clock cancels — a message naming the key
+			// that is already there sends the operator to the wrong line.
+			if !strings.Contains(err.Error(), "timeout:") {
+				t.Fatalf("max_steps=%d dry=%v: the refusal names the key: %v", rc.RunMaxSteps, dry, err)
+			}
 		}
 	}
 
 	// And one real ceiling is enough, so what is refused is the configuration and
 	// not the plan.
-	f.orch.budget = armed(&RolesConfig{RunMaxSteps: stepsUnlimited, RunTimeout: 45 * time.Minute})
-	w := newFakeWorld(t)
-	r := fresh(t, w, pipeFrom(t, fullPipeline))
-	r.orch = f.orch
-	if err := r.preflight(true, tktNeed{}); err != nil {
-		t.Fatalf("one real ceiling is enough: %v", err)
+	for _, rc := range []*RolesConfig{
+		{RunMaxSteps: stepsUnlimited, RunTimeout: 45 * time.Minute},
+		{RunMaxSteps: stepsUnlimited, RunMaxTokens: 4_000_000},
+	} {
+		f.orch.budget = armedBudget(t, rc)
+		w := newFakeWorld(t)
+		r := fresh(t, w, pipeFrom(t, fullPipeline))
+		r.orch = f.orch
+		if err := r.preflight(true, tktNeed{}); err != nil {
+			t.Fatalf("one real ceiling is enough: %v", err)
+		}
 	}
+}
+
+// armedBudget is a run budget as newTicketRun arms one, for the tests that drive
+// preflight directly.
+func armedBudget(t *testing.T, rc *RolesConfig) *runBudget {
+	t.Helper()
+	b, err := newRunBudget(rc, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cancel := b.start(context.Background())
+	t.Cleanup(cancel)
+	return b
 }
 
 // A credential variable nobody exported is the ordinary first-night mistake — a
@@ -1495,8 +1585,11 @@ func TestAPlanNamesTheCredentialVariableNobodyExported(t *testing.T) {
 		t.Fatalf("an exported token is the whole requirement: %v", err)
 	}
 	t.Setenv("JIRA_MCP_TOKEN", "")
+	// A clock, because preflight asks for one before it asks about credentials and
+	// this test is about the credential.
+	b := armedBudget(t, &RolesConfig{RunTimeout: 45 * time.Minute})
 	for _, dry := range []bool{false, true} {
-		r := &tktRun{orch: &Orchestrator{}, pc: pc}
+		r := &tktRun{orch: &Orchestrator{budget: b}, pc: pc}
 		err := r.preflight(dry, tktNeed{})
 		if err == nil {
 			t.Fatalf("dry=%v: every call to that server would be refused before it left", dry)
@@ -1518,6 +1611,7 @@ func TestAPlanNamesTheCredentialVariableNobodyExported(t *testing.T) {
 // have been paid for. One `git worktree list` proves it in the plan.
 func TestAPlanSaysWhenTheTargetBranchIsCheckedOutHere(t *testing.T) {
 	f := newTktRepoFix(t, "BSK-20")
+	f.orch.budget = armedBudget(t, &RolesConfig{RunTimeout: 45 * time.Minute})
 	w := newFakeWorld(t)
 	r := fresh(t, w, pipeFrom(t, fullPipeline))
 	r.orch = f.orch
@@ -1646,7 +1740,7 @@ func TestEveryTransitionHasAProbeAGateAndADo(t *testing.T) {
 	// Every state is reachable: each one is some transition's To, and each has a
 	// resume entry.
 	for _, state := range []string{tktOpened, tktBranched, tktImplemented, tktReviewed,
-		tktReworked, tktMerged, tktPushed, tktProposed, tktReported} {
+		tktReworked, tktResolved, tktMerged, tktPushed, tktProposed, tktReported} {
 		found := false
 		for _, tr := range tktSpine() {
 			if tr.To == state {
@@ -1662,16 +1756,30 @@ func TestEveryTransitionHasAProbeAGateAndADo(t *testing.T) {
 	}
 }
 
-func TestOnlyOpeningATicketRefusesToBeReEnteredBlind(t *testing.T) {
+// Exactly two transitions refuse to be re-entered blind, and each of them has to
+// have its own sentence for it: opening a ticket, which no tool can undo and no
+// configured tool can search for, and the integrator's one attempt at a
+// conflict, which is a budget of one and not a call to repeat. Every other
+// transition either proves its own effect or is a no-op when repeated, and a
+// `Redo: false` added to one of those would silently turn a recoverable crash
+// into a ticket a person has to unstick by hand.
+func TestOnlyTwoTransitionsRefuseToBeReEnteredBlind(t *testing.T) {
+	once := map[string]bool{tktOpen: true, tktResolve: true}
 	for _, tr := range tktSpine() {
-		if tr.Name == tktOpen {
+		if once[tr.Name] {
 			if tr.Redo {
-				t.Fatal("opening a ticket cannot be undone and no configured tool can search for one: it must not be re-entered blind")
+				t.Fatalf("%s must not be re-entered blind after a crash", tr.Name)
+			}
+			if tr.once == nil {
+				t.Fatalf("%s refuses a blind re-entry and says nothing about why", tr.Name)
 			}
 			continue
 		}
 		if !tr.Redo {
 			t.Fatalf("%s must be safe to re-enter — every other transition either probes its own effect or is a no-op when repeated", tr.Name)
+		}
+		if tr.once != nil {
+			t.Fatalf("%s is re-enterable, so its refusal sentence can never be printed", tr.Name)
 		}
 	}
 }
@@ -2171,6 +2279,120 @@ func TestAnUnbuyableReportStageIsWrittenFromTheJournalInstead(t *testing.T) {
 	for _, want := range []string{"BLOCKED at " + tktImplemented, r.st.Marker} {
 		if !strings.Contains(w.comments[0], want) {
 			t.Fatalf("the comment lca wrote itself must carry %q:\n%s", want, w.comments[0])
+		}
+	}
+}
+
+// ── the conflict, at the level of the machine ───────────────────────────────
+//
+// The git of a conflict is tested against a real repository (ticketgit_test.go).
+// What is left here is what only the machine can answer: the key that turns it
+// on, what it does to the plan, and that the stage gets the skills a team named
+// for it — the one thing a stage running at 3am cannot be left to notice.
+
+func TestResolvingConflictsIsOffUntilTheOperatorNamesTheKey(t *testing.T) {
+	off := pipeFrom(t, fullPipeline)
+	if off.ResolveConflicts != nil {
+		t.Fatal("a key nobody wrote must stay unwritten, so /role save cannot add one")
+	}
+	if off.resolveConflicts() {
+		t.Fatal("resolving a conflict is a decision, and a default that decides is a default nobody chose")
+	}
+	on := pipeFrom(t, fullPipeline+"  resolve_conflicts: true\n")
+	if !on.resolveConflicts() {
+		t.Fatal("the documented key must turn it on")
+	}
+	// Round-tripped through the writer /role save uses: a team's file must come
+	// back saying what it said.
+	back := pipeFrom(t, on.yaml())
+	if !back.resolveConflicts() {
+		t.Fatalf("a round trip lost the key:\n%s", on.yaml())
+	}
+	if said := pipeFrom(t, fullPipeline+"  resolve_conflicts: false\n"); said.ResolveConflicts == nil || *said.ResolveConflicts {
+		t.Fatalf("`false` written on purpose is not the same as nothing written: %+v", said.ResolveConflicts)
+	}
+	// And YAML's dozen spellings of truth are refused here for the reason push:
+	// refuses them: a pipeline that quietly resolves nothing looks exactly like a
+	// pipeline that never had a conflict.
+	if _, err := parsePipeline(nil, parseYAMLish(fullPipeline+"  resolve_conflicts: maybe\n"), "roles.yaml"); err == nil ||
+		!strings.Contains(err.Error(), "resolve_conflicts") {
+		t.Fatalf("a value that is not true or false must name the key: %v", err)
+	}
+}
+
+func TestTheResolveStageIsGivenTheSkillsItWasNamedFor(t *testing.T) {
+	base := t.TempDir()
+	shared := filepath.Join(base, "shared")
+	writeSkill(t, shared, "how-we-resolve", "how this team resolves conflicts", "take both sides", nil)
+	t.Setenv("LCA_SKILLS", shared)
+	skills := loadSkills(filepath.Join(base, "proj"), filepath.Join(base, "proj", ".lca"))
+
+	pc := pipeFrom(t, fullPipeline+"  resolve_conflicts: true\n  skills:\n    resolve: [how-we-resolve]\n")
+	sk, err := resolveStageSkills(pc, skills, []string{shared}, tktNeed{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sk) != 1 || sk[0].Stage != tktStageResolve {
+		t.Fatalf("the resolve stage's skills must resolve: %+v", sk)
+	}
+
+	w := newFakeWorld(t)
+	w.conflictFiles = "f.txt"
+	w.ancestry["work111-r0"] = []string{"base000"}
+	w.heads["agent/BSK-1"] = "work111-r0"
+	st := &TicketState{Ticket: "BSK-1", State: tktReviewed, Summary: "x", Branch: "agent/BSK-1",
+		BranchAt: "base000", Worktree: "/tmp/wt/agent/BSK-1", Head: "work111-r0",
+		Verdict: tktApprove, Review: &reviewReport{Verdict: tktApprove, Comments: []reviewComment{}},
+		Check: TicketCheck{Cmd: "go test", Exit: &zeroExit, Attempts: 1}}
+	r := newRun(t, w, pc, st)
+	r.skills, r.st.Skills = sk, sk
+
+	if status, reason := r.execute(); status != statusPassed {
+		t.Fatalf("%s (%s)\njournal: %+v", status, reason, r.st.Journal)
+	}
+	if w.calls["stage:resolve"] != 1 {
+		t.Fatalf("the conflict must have cost exactly one attempt: %d", w.calls["stage:resolve"])
+	}
+	if w.calls["instr:resolve:"+stageInstructions(sk, tktStageResolve)] != 1 {
+		t.Fatal("the named skill's instructions go into THAT stage's task message")
+	}
+	// With the key off, the stage's skills are not even required: a team that
+	// never resolves conflicts must not be held to a file lca is not going to read.
+	offPC := pipeFrom(t, fullPipeline+"  skills:\n    resolve: [not-a-skill-on-this-machine]\n")
+	if _, err := resolveStageSkills(offPC, skills, []string{shared}, tktNeed{}); err != nil {
+		t.Fatalf("a stage this run will never buy must not stop it: %v", err)
+	}
+}
+
+// The plan is what an operator reads before the first night, and the conflict
+// has a row in it either way: a `skip` saying the key is off, or a row that says
+// what lca itself would perform.
+func TestThePlanSaysWhatHappensToAConflict(t *testing.T) {
+	for _, tc := range []struct{ yaml, want string }{
+		{fullPipeline, "resolve_conflicts is false"},
+		{fullPipeline + "  resolve_conflicts: true\n", "nothing may merge yet"},
+	} {
+		pc := pipeFrom(t, tc.yaml)
+		r := newRun(t, newFakeWorld(t), pc, &TicketState{Ticket: "BSK-1", State: tktStart})
+		row := false
+		for _, tr := range r.spine {
+			if tr.Name != tktResolve {
+				continue
+			}
+			row = true
+			res, why := gateOf(tr, r)
+			if res != gateSkip {
+				t.Fatalf("a plan for a fresh ticket cannot be standing at a conflict: %v %q", res, why)
+			}
+			if !strings.Contains(why, tc.want) {
+				t.Fatalf("the plan must say %q, not %q", tc.want, why)
+			}
+			if tr.Does == "" || !strings.Contains(tr.Does, "integrator") {
+				t.Fatalf("the row has to say who would do it: %q", tr.Does)
+			}
+		}
+		if !row {
+			t.Fatal("the conflict is a transition of its own, so it has a row")
 		}
 	}
 }

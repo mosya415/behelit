@@ -222,7 +222,23 @@ func (o *Orchestrator) writeSummary(s *Session, f summaryFacts) string {
 	f.tail = forPublication(f.tail)
 	f.check = forPublication(f.check)
 	f.reason = forPublication(f.reason)
-	body := forPublication(o.askForSummary(s, f))
+	// The one closing call, unless the run was stopped for being out of TOKENS —
+	// in which case lca writes the file from the facts instead of buying one more
+	// request with money the operator's number said was gone. This call is the
+	// most expensive shape a request has: a cold prefix by design (summarySystem,
+	// so the run's KV cache survives it), the whole fact block and the
+	// conversation tail as prefill, and up to summaryMaxTokens of completion. The
+	// clock's grace is a different matter and is left alone: a few seconds past
+	// the deadline is what the grace is FOR, and the summary is the one thing a
+	// person reads tomorrow. A spent token ceiling has no such grace — budget.go
+	// says a spent token budget stops the model, and the exception it carves out
+	// is the verifier, which costs nothing.
+	body := ""
+	if o.budget.tokensSpent() {
+		s.event("summary_unbought", map[string]any{"why": o.budget.tripped()})
+	} else {
+		body = forPublication(o.askForSummary(s, f))
+	}
 	if strings.TrimSpace(body) == "" {
 		// The model did not answer — the gateway went away mid-run, or the clock ran
 		// out before it finished a sentence. The facts are still facts, so lca writes
@@ -266,11 +282,12 @@ func (o *Orchestrator) askForSummary(s *Session, f summaryFacts) string {
 		// run that had just been stopped for being out of tokens.
 	}, Thinking: "off", MaxTokens: summaryMaxTokens}, StreamSink{})
 	s.traceTurn(0, res, fb, start, nil, err)
-	// Counted whether or not it answered: a request that timed out mid-stream was
-	// still bought. The RUN's budget as well as the session's — the two used to
-	// disagree by exactly this call, so the trace's budget_exceeded event reported
-	// half the number the result object did for the same run.
-	s.orch.budget.spend(res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens)
+	// The RUN's budget is charged by s.chat, which is where a request is made and
+	// therefore where it is counted — tokens and the step both. It is counted
+	// whether or not the call answered: a request that timed out mid-stream was
+	// still bought, and the two accounts of a run used to disagree by exactly this
+	// call. The session's own stats are still kept here, because they are this
+	// session's and nothing else adds to them.
 	s.stats.PromptTokens += res.Usage.PromptTokens
 	s.stats.CachedTokens += res.Usage.CachedTokens
 	s.stats.OutputTokens += res.Usage.CompletionTokens

@@ -301,6 +301,17 @@ func (o *Orchestrator) newChild(parent *Session, ag *Agent, desc string) (*Sessi
 	if !mentions(ag.Rules, "task") && !mentions(ag.BaseRules, "task") {
 		child.extra = append(child.extra, Rule{"task", "*", Deny})
 	}
+	// `delegate` belongs beside them, and did not have it: permissionOf("delegate")
+	// falls through defaultRules' `* * Allow`, so the call was not even a door. A
+	// subagent that can delegate reaches a role the caller's own configuration
+	// never named — on that role's member:, under that member's allow: list and
+	// that member's rules — which is a wider authority than the one the caller was
+	// granted, arrived at by one tool call. Named the same two ways the tool itself
+	// is granted: a rules: entry, or an exact tools: set that lists it.
+	if !mentions(ag.Rules, "delegate") && !mentions(ag.BaseRules, "delegate") &&
+		!(ag.ToolsSet && contains(ag.Tools, "delegate")) {
+		child.extra = append(child.extra, Rule{"delegate", "*", Deny})
+	}
 	// A write leaves this machine and lands in somebody's ticket. An overnight run
 	// must not be able to comment on one because a model thought it would help, and
 	// a background child cannot be asked. This is the single chokepoint — task,

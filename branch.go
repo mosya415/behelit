@@ -152,14 +152,48 @@ func freeBranch(top, want string) string {
 //     gitCmd's error message contains the command line, so "does the usage
 //     mention --write-tree" cannot be asked of it.
 func gitRun(dir string, env []string, stdin []byte, args ...string) (stdout, stderr string, code int) {
-	cmd := exec.Command("git", args...)
+	return gitRunIn(context.Background(), dir, env, stdin, args...)
+}
+
+// gitRunIn is gitRun with the caller's context, which is what lets the RUN's
+// deadline reach a git invocation that talks to a network. It is gitCmdIn's
+// treatment with gitRun's exit code kept, and the two halves of that treatment
+// are both load-bearing here:
+//
+//   - the DEADLINE. `ls-remote` and `push` are the only two git operations in
+//     this program that touch a remote, and both used to run with no deadline of
+//     any kind. A forge host that accepts the TCP connection and then sends
+//     nothing — a half-open firewall state, a hung gitlab-shell, a load balancer
+//     that stopped forwarding — left git blocked in read(2) for ever, with the
+//     ticket lock held and the ticket claimed, and `-timeout` could not reach it
+//     because nothing passed a context in. Worse: `lca ticket` holds SIGTERM
+//     through signal.NotifyContext, so cron's `timeout 3600 lca ticket …`
+//     cancelled a context nobody was selecting on and the process survived every
+//     TERM. Only SIGKILL ended it, and nothing alerted anybody. gitCmdTimeout is
+//     the inner bound — the same ten minutes, and for the same reason its own
+//     comment gives — so a caller with no deadline of its own is still bounded.
+//   - NO CONTROLLING TERMINAL. GIT_TERMINAL_PROMPT governs git's own prompt and
+//     nothing else: ssh's key-passphrase prompt and gpg's pinentry open /dev/tty
+//     directly, so a run started from a tmux pane or a pty-ful CI runner could
+//     sit for ever on `Enter passphrase for key …` printed to a screen nobody is
+//     watching — and to neither of the two streams captured here, so the
+//     transcript, the trace and the state file all show the run simply stopping
+//     at `push` with no explanation. noPromptEnv() sets the three askpass
+//     variables for the programs that read them and inProcessGroup's Setsid
+//     removes the terminal outright, which is the half that holds against a
+//     program that reads none of them.
+func gitRunIn(ctx context.Context, dir string, env []string, stdin []byte, args ...string) (stdout, stderr string, code int) {
+	ctx, cancel := context.WithTimeout(ctx, gitCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(noPromptEnv(), env...)
 	cmd.Env = append(cmd.Env, "GIT_AUTHOR_NAME=lca", "GIT_AUTHOR_EMAIL=lca@localhost",
-		"GIT_COMMITTER_NAME=lca", "GIT_COMMITTER_EMAIL=lca@localhost", "GIT_TERMINAL_PROMPT=0")
+		"GIT_COMMITTER_NAME=lca", "GIT_COMMITTER_EMAIL=lca@localhost")
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
+	inProcessGroup(cmd)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -170,6 +204,16 @@ func gitRun(dir string, env []string, stdin []byte, args ...string) (stdout, std
 		code = cmd.ProcessState.ExitCode()
 	default:
 		code = -1 // git did not start at all
+	}
+	// A killed child reports exit code -1, which every caller already reads as "no
+	// answer from git" — the right classification for a timeout — but says nothing
+	// about WHY, and the why is the whole value of the record. Appended to stderr
+	// because that is the stream the callers that compose a message read.
+	if cerr := ctx.Err(); cerr != nil {
+		errb.WriteString(fmt.Sprintf("\ngit %s: %v after %s", strings.Join(args, " "), cerr, gitCmdTimeout))
+		if code == 0 {
+			code = -1
+		}
 	}
 	return out.String(), errb.String(), code
 }

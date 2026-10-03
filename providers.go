@@ -55,6 +55,11 @@ func (p *Provider) apiKey() string {
 	}
 	for _, e := range p.KeyEnv {
 		if v := os.Getenv(e); v != "" {
+			// This endpoint's key, by name, for redact.go: whichever variable actually
+			// answered is the one whose value must not reach an artefact. The preset
+			// names mostly carry KEY and would be guessed, and the point is not to
+			// depend on that.
+			declareSecretEnv(e)
 			return v
 		}
 	}

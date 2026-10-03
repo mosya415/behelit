@@ -105,6 +105,13 @@ func ticketUsage() {
 		"  lca ticket BSK-123 -json     one result object on stdout; everything else on stderr",
 		"  lca ticket -list             the tickets with state on this machine",
 		"",
+		" The run's ceilings, over roles.yaml's defaults: block, one at a time:",
+		"   -timeout <d>                 wall clock for the whole run (45m, 2700s)",
+		"   -max-steps <n>|unlimited     step ceiling for the run, over every role's own",
+		"   -max-tokens <n>              prompt+completion ceiling, every stage and subagent",
+		" One of -timeout or -max-tokens has to exist, here or in the file: a step count",
+		" cannot end a gateway that goes silent mid-stream.",
+		"",
 		" There is no -resume. Re-running the command IS the resume: the state is found",
 		" by ticket key, every transition re-proves its own effect against the world, and",
 		" the ones already done are skipped. One cron line, whatever happened last night.",
@@ -127,7 +134,23 @@ func runTicket(cfg Config, args []string) int {
 	dry := fset.Bool("dry-run", false, "print every transition, its gate and its skills; change nothing")
 	jsonOut := fset.Bool("json", false, "one result object on stdout")
 	list := fset.Bool("list", false, "list the tickets with state on this machine")
+	// The run's three ceilings, spelled as oneShot spells them, because the thing
+	// on the other end of both commands is the same cron line. Without them the
+	// whole budget of a `lca ticket` run was whatever roles.yaml's defaults: said
+	// and there was no way to say anything else: a wrapper that wants THIS ticket
+	// held to twenty minutes had to rewrite the team's file to get it, and a
+	// retried ticket could not be given a shorter night than the first attempt.
+	// They resolve through newRunBudget, so the flag wins over the file for each
+	// ceiling independently and the team's other two survive overriding one.
+	timeoutFlag := fset.Duration("timeout", 0, "wall-clock ceiling for the whole run")
+	maxStepsFlag := fset.String("max-steps", "", "step ceiling for the run, over every role's own, or `unlimited`")
+	maxTokensFlag := fset.Int("max-tokens", 0, "prompt+completion ceiling for the run, subagents included")
 	if err := fset.Parse(rest); err != nil {
+		return exitUsage
+	}
+	runSteps, serr := parseStepCeiling("-max-steps", *maxStepsFlag)
+	if serr != nil {
+		errLine("%v", serr)
 		return exitUsage
 	}
 	if key == "" && fset.NArg() > 0 {
@@ -167,7 +190,7 @@ func runTicket(cfg Config, args []string) int {
 	}
 
 	started := time.Now()
-	r, err := newTicketRun(cfg, key, *newTask, *dry)
+	r, err := newTicketRun(cfg, key, *newTask, *dry, tktCeilings{timeout: *timeoutFlag, maxSteps: runSteps, maxTokens: *maxTokensFlag})
 	if err != nil {
 		// Row 2 of the table: a missing configuration key, a missing skill, a state
 		// file from another tree. Nothing about the task was decided and there is no
@@ -226,7 +249,17 @@ func (r *tktRun) close() {
 // Every failure here is a mistake in the call or in a file, which is the row of
 // the table that says "alert somebody, do not touch the ticket" — and finding
 // any of them out after a model has read a tree costs a run for nothing.
-func newTicketRun(cfg Config, key, newTask string, dry bool) (*tktRun, error) {
+// tktCeilings is what the command line said about the run's budget, on its way
+// to newRunBudget. A struct and not three arguments because a budget is one
+// thing and because the next ceiling (there was a third already) belongs in the
+// same place rather than at the end of a signature nobody can read.
+type tktCeilings struct {
+	timeout   time.Duration
+	maxSteps  int // including stepsUnlimited
+	maxTokens int
+}
+
+func newTicketRun(cfg Config, key, newTask string, dry bool, lim tktCeilings) (*tktRun, error) {
 	// Nobody at the keyboard, ever: this command is made to be a cron line, so
 	// every question becomes an immediate recorded refusal rather than a worktree
 	// and a claimed ticket held until somebody notices.
@@ -305,7 +338,7 @@ func newTicketRun(cfg Config, key, newTask string, dry bool) (*tktRun, error) {
 	// job. Everything the run starts hangs off this context — a check command's
 	// process group, a stdio MCP server, a subagent — so cancelling it once is
 	// what makes "no child left behind" a property of the shape.
-	budget, berr := newRunBudget(orch.roles, 0, 0, 0)
+	budget, berr := newRunBudget(orch.roles, lim.timeout, lim.maxSteps, lim.maxTokens)
 	if berr != nil {
 		r.close()
 		return nil, berr
@@ -343,9 +376,20 @@ func (r *tktRun) preflight(dry bool, need tktNeed) error {
 	// person here to read the turns and press Ctrl-C. oneShot refuses the same
 	// pairing for the same reason; this one has more of it to refuse, because a
 	// ticket buys up to five stages and a rework round buys two of them again.
+	//
+	// A real ceiling, and a step count is not one. The guard used to let any run
+	// through whose max_steps was merely SET, and a hang advances no steps and
+	// spends no tokens: a gateway that accepts the POST, streams four tokens and
+	// goes silent costs one step and up to ninety minutes, and one coder stage at
+	// fifty steps of that can sit for days while a ticket buys five stages and a
+	// rework round. Only a clock cancels — budget.go's own header says so, and
+	// engine.go hands a step a WithCancel context and never a deadline — so a
+	// clock, or a token ceiling that at least stops advancing, is what is demanded
+	// here. No number is invented for it: the ceiling is a fact about this team's
+	// night and belongs in their file, the way push: has no safe default either.
 	b := r.orch.budget
-	if b.steps() == stepsUnlimited && !b.bounded() {
-		return usageErrf("roles.yaml defaults: max_steps is unlimited and nothing else bounds this run — add timeout: (say 2700) or max_tokens:, or give a step count. `lca ticket` answers to a cron line, and an unattended run has to have one real ceiling.")
+	if !b.bounded() {
+		return usageErrf("nothing bounds this run in time — add `timeout:` (say 2700) to roles.yaml's defaults: block, or `max_tokens:`. A step count is not enough: `lca ticket` answers to a cron line, and a gateway that goes silent mid-stream advances no steps and spends no tokens, so only a clock can end it.")
 	}
 	// The credentials the configured servers were given, by name. The run would
 	// otherwise reach its first call and stop there.
@@ -597,7 +641,11 @@ func (r *tktRun) reportCtx() (context.Context, context.CancelFunc) {
 	if r.orch != nil {
 		b = r.orch.budget
 	}
-	return context.WithDeadline(context.Background(), b.closingDeadline(time.Now()))
+	// reportDeadline and not closingDeadline: this transition writes to a tracker
+	// over somebody's network, and the summary's three-second grace is below the
+	// floor of a comment plus a status transition over a VPN. budget.go says why
+	// the two differ.
+	return context.WithDeadline(context.Background(), b.reportDeadline(time.Now()))
 }
 
 // result is the object -json writes and the text outcome is printed from. One

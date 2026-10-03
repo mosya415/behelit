@@ -1481,6 +1481,23 @@ failing request with its `Authorization` header, a deploy script that logs
 not ours and we cannot ask it to behave, so the **environment** is the source of
 truth.
 
+A name pattern is a **guess**, though, and the guess is wrong about exactly the
+credentials a team declares by hand: `GH_PAT`, `JIRA_PAT`, `BSK_AUTH`,
+`GITLAB_BEARER`, `NPM_AUTH`, `DOCKER_AUTH` and a `DATABASE_URL` whose DSN carries
+the password contain none of the four words. So the guess is an **addition**, not
+the source of truth, and what the operator has already named wins:
+
+- every `${env:…}` an `mcp:` server's `headers:` or `env:` references,
+- `api_key_env` from `config.json`, and whichever provider key variable answered,
+- `defaults: redact_env: [GH_PAT, DATABASE_URL]` in `roles.yaml`, for a variable
+  no config block references — the one a `check_cmd` or a deploy script reads.
+  It is merged across the files on the search path rather than replaced, so a
+  `$LCA_ROLES` overlay naming one more credential keeps the team file's list.
+
+A declared variable still has to look like a credential (the value test below),
+because declaring `GITLAB_TOKEN_FILE` must not redact the path out of the one
+line that said which file was missing.
+
 Three decisions worth knowing:
 
 - It sits at the **write boundary** of each artefact, on the bytes, not on the
@@ -2079,6 +2096,7 @@ which is a different noun from the unit of work.
 | `implemented` | runs the coder's `check_cmd` over the result | the code | a branch exists |
 | `reviewed` | takes the diff, records the structured verdict | the review | **the check is green** |
 | `reworked` | starts the next round on the coder's own session | the code again | request_changes, and a round left |
+| `resolved` | merges `target_branch` into the ticket's branch; on a conflict, gives the integrator its one attempt | the resolution | mergeable, and one attempt unspent |
 | `merged` | merges into `target_branch` | — | **green check AND `approve`** |
 | `pushed` | pushes to the remote | — | merged, and `push: true` |
 | `proposed` | finds the merge request, opens one if there is none | its description | the branch is on the remote |
@@ -2095,6 +2113,40 @@ own rule: unreadable is failed, never a silent approve.
 `push: false` is not a block, it is a **success that ends at `merged`**: the push
 and the merge request are recorded as *skipped*, and the run exits 0.
 
+#### A merge conflict: `resolve_conflicts`
+
+By default a branch that no longer merges into `target_branch` **goes to a
+person**: nothing is merged, nothing is pushed, the branch is left where it is
+and the ticket comment names the colliding files. That is right as a default and
+wrong as the only option, because the commonest real conflict is the target
+branch having moved under a change that is otherwise finished and approved — so
+`resolve_conflicts: true` buys the integrator role **one** supervised attempt at
+it. Default off, because resolving a conflict is choosing which of two intentions
+survives, and a default that decides is a default nobody chose.
+
+The shape is the whole point:
+
+- the attempt happens on the **ticket's branch**, never on the target. lca merges
+  `target_branch` *into* the branch, in the worktree it cut for this ticket, and
+  the coder's own `check_cmd` runs again over the result. What reaches the target
+  afterwards is still an ordinary merge of a branch whose check is green;
+- **the reviewer reads the resolution.** A resolution is a change nobody reviewed,
+  so the verdict under it is cleared and the walk goes back to `review` with the
+  resolved diff in front of it. The gate does not get weaker: the merge still
+  wants a green check *and* an `approve`, and both now belong to the commit that
+  is actually going to land. The round does not advance — a rework round is the
+  budget for a reviewer that asked for changes, and nobody asked for these;
+- **three ways it can fail, and all three end as a conflict for a person**, with
+  the files named: the integrator does not resolve it (the engine refuses to
+  commit a tree that still holds `<<<<<<<`), the check over the result is red, or
+  the resolution *drops the ticket's own change* — which passes a check as easily
+  as a correct one, so it is caught by comparing what the merge would land on the
+  target against the diff that was approved. In every case the branch is put back
+  at the approved commit and the rejected attempt is kept on
+  `refs/lca/resolve/<branch>`, which the refusal names and `git show` reads;
+- **one attempt, ever.** It is recorded before it is made, so a run killed inside
+  it does not try again on the next night: the gate blocks and says so.
+
 ### Idempotency: the state file is a journal, not an authority
 
 State lives in `$LCA_DIR/tickets/<key>/state.json` (0600, in a 0700 directory,
@@ -2110,6 +2162,7 @@ that lets a probe tell **our** effect from **somebody else's**:
 | `branch` | `rev-parse` | the branch still contains the commit we cut it at | it exists and we never cut it, or no longer contains that commit |
 | `implement` | the recorded head and check | a commit is on the branch and the check is green | — |
 | `review` | the recorded verdict | a verdict for this round exists | — |
+| `resolve` | `merge-tree --write-tree`, and the recorded attempt | the branch merges into the target, or our own resolution is still on it | our resolution is no longer on the branch |
 | `merge` | `merge-base --is-ancestor` | our head is already in the target | — |
 | `push` | `ls-remote` | the remote's sha is ours, or contains it | the remote's sha does not contain ours |
 | `propose` | the forge's own find tool, **always** | a merge request for this branch exists | — |
@@ -2125,10 +2178,13 @@ ticket: nothing here will force anything over work it cannot account for. And
 why `forge: find_merge_request` is a required key and not a convenience.
 
 Before every remote call the run writes its intent (`pending`) to the state file.
-Everything except opening a ticket is safe to re-enter blind, so a crash in that
-window just re-runs the transition. Opening a ticket is not — it cannot be undone
-and the four configured tracker tools include no search — so a run killed there
-refuses, names the state file, and tells you to re-run as `lca ticket <KEY>`.
+Two transitions are not safe to re-enter blind and everything else is, so a crash
+in that window just re-runs the transition. Opening a ticket cannot be undone and
+the four configured tracker tools include no search, so a run killed there
+refuses, names the state file, and tells you to re-run as `lca ticket <KEY>`. The
+integrator's one attempt at a conflict is a budget of one rather than a call to
+repeat, so a run killed inside it hands the conflict to a person instead of
+sending a second integrator at whatever the first one left.
 A `-new` run keeps its state under `tickets/new-<hash of the task text>/` until
 the tracker names the ticket, so the same cron line run twice finds the same
 half-finished work instead of opening a second ticket.
@@ -2154,6 +2210,7 @@ pipeline:
   target_branch: main
   push: true                    # true or false — there is no safe default
   rework_rounds: 1              # 0 is legal: one review, no rework
+  resolve_conflicts: false      # default: a merge conflict goes to a person
   roles:
     coder: coder
     reviewer: reviewer
@@ -2172,6 +2229,7 @@ pipeline:
     ticket:   [ticket-brief]
     coder:    [deploy-to-stand, repo-conventions]
     reviewer: [review-checklist]
+    resolve:  [how-we-resolve]  # resolve_conflicts: true only
     mr:       [mr-description]
     report:   [ticket-comment]
 ```
@@ -2182,6 +2240,10 @@ earns nine "lca cannot guess this" errors, which is the reader working as
 intended and a documentation trap all the same — so the whole thing in one piece
 is [`examples/ticket.roles.yaml`](examples/ticket.roles.yaml), which a test
 parses and validates on every run so it cannot drift from the reader.
+
+`resolve_conflicts` is the one key in the block with a safe default and so the
+one that is not required: everything else here is a fact lca cannot guess, and
+this is a decision — see [A merge conflict](#a-merge-conflict-resolve_conflicts).
 
 Required always: `branch_prefix`, `target_branch`, `push`, `rework_rounds`, the
 three `roles:`, `tracker: read`, `tracker: comment`, and — see the next section —
@@ -2410,9 +2472,12 @@ refusal that is local and deterministic is one this stops on too — it exits 2
 wherever the real run would:
 
 * a missing key, and a named skill that is not on this machine;
-* `defaults: max_steps: unlimited` with nothing else bounding the run — this
-  command answers to a cron line, and an unattended run has to have one real
-  ceiling;
+* **no `defaults: timeout:` and no `defaults: max_tokens:`** — this command
+  answers to a cron line, and an unattended run has to have one real ceiling. A
+  step count is not one: a gateway that accepts the request, streams four tokens
+  and goes silent advances no steps and spends no tokens, so only a clock can end
+  it. There is no default number, because how long your team's night is is not
+  something lca can know;
 * a `${env:…}` credential a configured server needs and nobody exported into
   *this* environment, named by variable (a cron job inherits no shell, so this is
   the ordinary first-night mistake; the run would otherwise be row 2 on its first

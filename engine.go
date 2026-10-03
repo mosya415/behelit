@@ -1057,6 +1057,52 @@ var isolationRules = Ruleset{
 	{"run", "* -ok *", Ask},
 }
 
+// sharedRefDenies is the list above written as DENY, for a session nobody is
+// watching.
+//
+// An Ask is a guard only while there is a keyboard behind it. `lca ticket` calls
+// TrustAll() by construction — it answers to a cron line — and `lca run` does
+// unless -ask, and Confirm consults Trusts() BEFORE the unattended refusal. So
+// every Ask above becomes an auto-yes in exactly the run the guard was written
+// for: a stage could type `git push origin HEAD:refs/heads/main` and land
+// unreviewed, unchecked work on the remote's main, and nothing would have asked
+// anybody. Deny is read by Evaluate itself and by runAction's per-segment walk,
+// and no amount of standing trust turns it into a yes.
+//
+// The list is every git invocation that writes a ref, a remote, a config or a
+// reflog — what a worktree SHARES with the repository it was cut from — plus the
+// ones that rewrite the branch a gate already approved (reset, rebase, commit,
+// am, cherry-pick) and the two option forms that would otherwise carry any of
+// them past a glob: `git -C <elsewhere>` runs in another tree, and `git -c
+// <anything> push` is still a push. Reading git is untouched — status, log,
+// diff, show, rev-parse, for-each-ref are how a session works out what it is
+// looking at.
+//
+// What lca itself does with refs is unaffected: commitWork, MergeIn, PushBranch
+// and the one supervised resolution all run git directly (gitCmd/gitRun) and
+// never through the model's run_command. That is the whole of ticket.go's
+// "there is no transition a model can reach by typing a command".
+var sharedRefDenies = Ruleset{
+	{"run", "git push *", Deny},
+	{"run", "git stash *", Deny},
+	{"run", "git branch *", Deny},
+	{"run", "git tag *", Deny},
+	{"run", "git update-ref *", Deny},
+	{"run", "git remote *", Deny},
+	{"run", "git config *", Deny},
+	{"run", "git worktree *", Deny},
+	{"run", "git reflog *", Deny},
+	{"run", "git gc *", Deny},
+	{"run", "git commit *", Deny},
+	{"run", "git merge *", Deny},
+	{"run", "git rebase *", Deny},
+	{"run", "git am *", Deny},
+	{"run", "git cherry-pick *", Deny},
+	{"run", "git reset *", Deny},
+	{"run", "git -C *", Deny},
+	{"run", "git -c *", Deny},
+}
+
 func (s *Session) event(kind string, fields map[string]any) {
 	if s.parent != nil {
 		if fields == nil {
@@ -1247,6 +1293,18 @@ type pendingCall struct {
 	ms          int64
 }
 
+// stopForBudget ends a session because the RUN's budget is spent, gracefully:
+// the operator is told which ceiling it was, the trace records it with the
+// numbers that spent it, and the transcript is saved. One function because the
+// loop asks twice — once before it builds the request, once before it sends it
+// — and a budget stop that saved the transcript on one path and not the other
+// would lose the turn that went over.
+func (s *Session) stopForBudget(why string, step int) {
+	s.view.Warn("STOPPED — " + why)
+	s.event("budget_exceeded", map[string]any{"why": why, "steps": step, "run_tokens": s.orch.budget.tokens()})
+	s.saveTranscript()
+}
+
 // Run drives the agent loop for the transcript as it stands (the caller has
 // appended the user message): call the model, execute the tools it asks for,
 // feed results back, repeat until it answers without tools or hits the step
@@ -1271,9 +1329,7 @@ func (s *Session) Run(ctx context.Context) error {
 		// spent the last of the budget, and the next request would be bought with
 		// money the run does not have.
 		if why := s.orch.budget.over(); why != "" {
-			s.view.Warn("STOPPED — " + why)
-			s.event("budget_exceeded", map[string]any{"why": why, "steps": step, "run_tokens": s.orch.budget.tokens()})
-			s.saveTranscript()
+			s.stopForBudget(why, step)
 			return nil
 		}
 		last := maxSteps != stepsUnlimited && step == maxSteps-1
@@ -1314,6 +1370,18 @@ func (s *Session) Run(ctx context.Context) error {
 			req.Tools = schemas
 		}
 
+		// And the same question again, now that the request EXISTS and can be
+		// priced. The check at the top of the loop is a reading; this one is a
+		// reservation, and the difference is what a fan-out does to a ceiling: the
+		// `task` calls of one reply run in parallel goroutines, so without this
+		// every one of them read the budget before any of them had spent, and the
+		// ceiling was overshot by a whole request per concurrent slot. Released
+		// below, once chat has charged what the reply really cost.
+		why, released := s.orch.budget.admit(estimateTokens(send))
+		if why != "" {
+			s.stopForBudget(why, step)
+			return nil
+		}
 		// A cancelable step context; on the interactive primary a scoped SIGINT
 		// handler lets Ctrl-C abort a runaway generation mid-flight.
 		stepCtx, cancel := context.WithCancel(ctx)
@@ -1323,6 +1391,10 @@ func (s *Session) Run(ctx context.Context) error {
 		sv.Start(s.client.Model())
 		turnStart := time.Now()
 		res, fallbacks, err := s.chat(stepCtx, req, sv.Sink())
+		// After chat, which charged every gateway request this call made: the
+		// estimate is replaced by the bill, in that order, so a concurrent session
+		// never sees a window in which neither is counted.
+		released()
 		for _, fb := range fallbacks {
 			s.event("gw_fallback", map[string]any{"from": fb.From, "to": fb.To, "reason": fb.Reason, "wait_ms": fb.WaitMs})
 		}
@@ -1339,13 +1411,13 @@ func (s *Session) Run(ctx context.Context) error {
 		if err == nil {
 			s.stats.Replies++
 		}
-		// The run's token ceiling is counted HERE and not from s.stats, because
-		// s.stats is one session's and the ceiling is the run's: a lead and the four
-		// coders it delegated to spend one ticket's tokens between them. The same is
-		// true of the step ceiling, and for the same reason plus one more: this
-		// loop's own `step` restarts at 0 on every verifier attempt.
-		s.orch.budget.spend(res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens)
-		s.orch.budget.spendStep()
+		// The run's ceilings are NOT counted here any more, and the move is the
+		// point: s.chat charges them, once per gateway REQUEST, because one chat()
+		// call can be three requests (a cut reply is repeated whole) and this line
+		// only ever saw the last one's usage. The reasons for counting them on the
+		// run and not on s.stats stand unchanged — s.stats is one session's while
+		// the ceiling is the run's, and this loop's own `step` restarts at 0 on
+		// every verifier attempt — they just belong where the requests are made.
 		if res.Usage.PromptTokens > 0 {
 			s.event("usage", map[string]any{"model": s.client.Ref(), "prompt": res.Usage.PromptTokens, "cached": res.Usage.CachedTokens,
 				"completion": res.Usage.CompletionTokens, "tok_s": res.Usage.TokPerSec()})

@@ -285,6 +285,124 @@ func tktCoderTranscript(cfg Config, uid string) (string, error) {
 // and diffing against the tip puts somebody else's commits in front of the
 // reviewer — which produces correctly-placed comments on work this ticket never
 // touched, and then posts them on a merge request.
+// ── the one supervised attempt at a conflict ────────────────────────────────
+
+// Resolve gives the integrator the merge MergeTargetIn left in the ticket's own
+// worktree: the markers, the unmerged index, and the coder's own check over
+// whatever it writes.
+//
+// It rides the ordinary path and adds nothing to it — the same jail rooted at
+// the ticket's worktree, the same sandbox, the same per-attempt commitWork,
+// which refuses to commit a tree that still holds `<<<<<<<` and so makes "did
+// not finish" a thing lca learns here rather than on a shared branch. No
+// permission gate of its own, and that is deliberate: a delegation's resolution
+// needed one because it was written into the OPERATOR'S files, while this one
+// lands on a branch lca cut, in front of the same three gates as the code it is
+// reconciling — a green check, a reviewer, and a merge lca performs.
+//
+// A FRESH child and never the coder's session, which is the opposite of a rework
+// round. A rework continues the coder because the model is being asked to finish
+// its own thought; a resolution is being asked to hold two intentions at once,
+// and the one thing it must not do is arrive already committed to one of them.
+func (m *tktStageRun) Resolve(ctx context.Context, in tktStageIn) (tktCodeOut, error) {
+	role := m.orch.agents[m.pc.Integrator]
+	if role == nil {
+		return tktCodeOut{}, usageErrf("pipeline: roles: integrator: %q is not a role in this roles.yaml", m.pc.Integrator)
+	}
+	// The CODER's check and not the integrator's: the question a resolution has to
+	// answer is the same question the implementation answered — is this ticket
+	// done — and a pipeline whose conflict path is verified by a different command
+	// than its code path has two definitions of done.
+	check := m.checkCmd(m.orch.agents[m.pc.Coder])
+	wt, err := m.worktreeOf(in)
+	if err != nil {
+		return tktCodeOut{}, err
+	}
+	sess, err := m.child(role, "one stage of a ticket")
+	if err != nil {
+		return tktCodeOut{}, err
+	}
+	if err := m.bindTree(sess, wt); err != nil {
+		return tktCodeOut{}, err
+	}
+
+	var b strings.Builder
+	m.instruct(&b, in)
+	fmt.Fprintf(&b, `You are in a git worktree holding an UNFINISHED MERGE. Ticket %s was
+implemented on %s, its check passed and a reviewer approved it — and then %s,
+the branch it is going to merge into, moved underneath it. %s has just been
+merged into this branch and the two sides touched the same region.
+
+Conflicted files:
+  %s
+
+The files contain conflict markers: the part under <<<<<<< HEAD is this
+ticket's own approved change, and the part under ======= down to >>>>>>> is
+what %s has grown since this branch was cut. Resolve every one of them so that
+BOTH intentions survive — this ticket's change AND what the target branch now
+does. Delete every marker. Then stop.
+
+Do not undo this ticket's work to make the conflict go away. Taking the target
+branch's side of every file would pass the check and land nothing, and lca
+compares the result against the approved diff: a resolution that drops this
+ticket's change is refused and handed to a person.
+
+`, in.Ticket.Key, in.Branch, in.Target, in.Target,
+		strings.Join(strings.Split(orNone(in.Conflict.Files), ", "), "\n  "), in.Target)
+	if check != "" {
+		fmt.Fprintf(&b, "Definition of done: `%s` exits 0 in this tree. A verifier runs it after you stop; its exit code decides, not your judgement.\n", check)
+	} else {
+		b.WriteString("There is no check command, so leave the tree so that it builds.\n")
+	}
+	b.WriteString(`
+Do not commit, do not branch, do not merge anything else and do not push: lca
+commits what you leave in the tree. There is no tool here that reaches the
+tracker or the forge.
+
+This is the ONLY attempt. If the check does not pass, or the merge is not
+finished, or this ticket's change does not survive it, the conflict goes to a
+person and nothing is merged.
+`)
+
+	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: b.String()})
+	sess.view.Begin()
+	start := time.Now()
+	// ONE, the literal number, and not o.verifyAttempts() — branch.go's reason
+	// word for word: verify_attempts is the team's budget for a CODER fixing its
+	// own work against a check it can read, and feeding a failed check back to a
+	// third role so it can rewrite a merge it did not write, twice, is the
+	// silent-overwrite failure wearing a hat. The prompt above says "the only
+	// attempt", and a number an operator could raise in roles.yaml would make that
+	// sentence a lie.
+	v := sess.RunVerifiedAll(ctx, tktCheckList(check), 1)
+	sess.view.Finish(v.Status, time.Since(start))
+	if err := sess.saveTranscript(); err != nil {
+		warnLine("the integrator's transcript could not be saved: %v", err)
+	}
+	m.orch.rec.Event("ticket_stage", map[string]any{"stage": tktStageResolve, "round": in.Round,
+		"session": sess.UID, "status": v.Status, "attempts": v.Attempts, "exit": v.Exit})
+
+	out := tktCodeOut{Session: sess.UID, Check: TicketCheck{Cmd: check, Attempts: v.Attempts,
+		Tail: v.Tail, Logs: v.CheckLogs}}
+	if v.Checked {
+		exit := v.Exit
+		out.Check.Exit = &exit
+	}
+	// The head is read BEFORE the status is judged, which Implement does not need
+	// to do and this does: doResolve tells "nothing was committed, so nothing was
+	// resolved" from "a resolution exists and nothing judged it" by whether there
+	// is a commit, and those two go to different places — one is the integrator
+	// not managing it, the other is a gateway or a clock that stopped mid-attempt.
+	if head, found, herr := m.headOf(wt, in.Branch); herr == nil && found && head != in.Conflict.Base {
+		out.Head = head
+	}
+	switch v.Status {
+	case "error", "cancelled":
+		return out, firstErr(v.Err, fmt.Errorf("the %s stage stopped without a result: %s", tktStageResolve, orNone(v.Tail)))
+	}
+	return out, nil
+}
+
 func (m *tktStageRun) Review(ctx context.Context, in tktStageIn) (*reviewReport, error) {
 	role := m.orch.agents[m.pc.Reviewer]
 	if role == nil {
@@ -497,6 +615,14 @@ func tktOutcomeText(st *TicketState) string {
 	if st.PushedSha != "" {
 		fmt.Fprintf(&b, "pushed to %s as %s\n", st.Remote, shortSha(st.PushedSha))
 	}
+	// The conflict, where there was one. It is a fact the journal holds and the
+	// comment is the only place anybody will see it: a target branch that moved
+	// under a finished change is the one thing in this arc that a person may have
+	// to finish by hand, and a comment that says "not merged" without saying why
+	// sends them to read a diff to find out.
+	if st.Resolve != nil {
+		fmt.Fprintf(&b, "merge conflict: %s\n", tktResolveText(st.Resolve))
+	}
 	if st.MergeRequest != nil {
 		fmt.Fprintf(&b, "merge request: %s\n", orNone(firstNonEmpty(st.MergeRequest.URL, st.MergeRequest.ID)))
 	} else {
@@ -512,6 +638,27 @@ func tktOutcomeText(st *TicketState) string {
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// tktResolveText is the conflict and what became of the one attempt at it, as
+// the ticket comment carries it. Facts only, in lca's own words, because the
+// stage that writes the comment is told to invent nothing and this is the part
+// of the run it has no other way of knowing about.
+func tktResolveText(res *TicketResolve) string {
+	what := map[string]string{
+		tktResolveDone:    "the integrator merged " + shortSha(res.Target) + " in and resolved it as " + shortSha(res.Head) + "; the check ran again over the result and a reviewer read the resolution",
+		tktResolveNone:    "the integrator did not resolve it, so nothing was merged",
+		tktResolveRed:     "the integrator resolved it and the check over the result was red, so nothing was merged",
+		tktResolveDropped: "the integrator resolved it by dropping this ticket's own change to " + orNone(res.Lost) + ", which lca refuses, so nothing was merged",
+	}[res.Outcome]
+	if what == "" {
+		what = "the run stopped inside the one supervised attempt at it, so nothing judged what was left and nothing was merged"
+	}
+	out := fmt.Sprintf("%s collided with the target branch (%s) — %s", orNone(res.Files), shortSha(res.Target), what)
+	if res.Kept != "" {
+		out += ". The rejected attempt is kept at " + res.Kept
+	}
+	return out
 }
 
 // tktCheckText is the check as a fact, and the tail with it: the tail is what
@@ -598,7 +745,17 @@ func (m *tktStageRun) ask(ctx context.Context, stage, roleName, task string, wt 
 	// edit here would be unreviewed work riding into the merge request that
 	// describes something else. RefreshSystem for the reason Review gives: a deny
 	// appended after Msgs[0] was built is a tool still advertised in the prefix.
-	sess.extra = append(sess.extra, Rule{"edit", "*", Deny})
+	// …and they run nothing and delegate nothing. These three stages are handed
+	// every fact they are asked to write about — tktOutcomeText, tktCheckText and
+	// tktReviewText compose them from the journal, and doReport falls back to the
+	// first of them when no model can be bought at all — so a paragraph is the
+	// whole job, and `run_command` and `task` buy a child process and whole
+	// subagent sessions for it. The authority half matters more than the spend:
+	// these stages are the ones called with no worktree, so bindTree never ran and
+	// sharedRefDenies were never appended, and an unattended run trusts what it is
+	// asked — which left `git push` inside a stage that exists to write prose.
+	// A prose stage reads: read_file, grep, glob, list_dir. Nothing else.
+	sess.extra = append(sess.extra, Rule{"edit", "*", Deny}, Rule{"run", "*", Deny}, Rule{"task", "*", Deny})
 	sess.RefreshSystem()
 	sess.Msgs = append(sess.Msgs, Message{Role: "user", Content: task})
 	sess.view.Begin()
@@ -628,6 +785,11 @@ func (m *tktStageRun) child(role *Agent, desc string) (*Session, error) {
 	if err != nil {
 		return nil, usageErrf("%v", err)
 	}
+	// No delegation out of a stage, whatever roles.yaml says about this role. A
+	// ticket's roles are the three the pipeline: block named and validate checked;
+	// a stage that can reach a fourth is a stage whose authority that block does
+	// not describe — and the fourth role's member:, sandbox and rules come with it.
+	sess.extra = append(sess.extra, Rule{"delegate", "*", Deny})
 	// Not resumable by task id: a stage is reached once per round and the state
 	// file is what a resume reads. The session itself lives as long as this call.
 	m.orch.forgetChild(sess.ID)
@@ -650,6 +812,14 @@ func (m *tktStageRun) bindTree(sess *Session, wt *worktree) error {
 	sess.jl = jl
 	sess.isolated = true
 	sess.branch, sess.wt = wt.branch, wt
+	// And the half isolated does NOT give: isolationRules rates the shared-ref git
+	// commands Ask, which is a guard with a keyboard behind it, and this command
+	// has no keyboard — newTicketRun calls TrustAll() on purpose, so an Ask here is
+	// an auto-yes and a stage could push the branch itself. The three gates named
+	// above are the ones a model cannot reach only if the commands that reach past
+	// them are DENIED, so they are, in the same words Review and ask use for edit.
+	// extra is last in rules(), so this beats isolationRules' `run: * Allow`.
+	sess.extra = append(sess.extra, sharedRefDenies...)
 	// After the jail and the branch and before the task message: RefreshSystem
 	// rebuilds Msgs[0] from this role's own system prompt, which is the prefix the
 	// gateway caches, and the environment block in it names the tree.

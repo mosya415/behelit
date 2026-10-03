@@ -64,6 +64,11 @@ type runBudget struct {
 	prompt, completion, cached int
 	steps_                     int    // model requests made by the whole run
 	reason                     string // why the run must stop; "" while it may continue
+	// inflight is the estimated prompt of the requests that have been admitted and
+	// not yet answered. It is a reservation and not a spend: it bounds what
+	// concurrent sessions may admit (see admit) and it never reaches the cost
+	// report, because an estimate in a cost line is a number nobody can reconcile.
+	inflight int
 	// armed says a RUN is in progress. The ceilings are a property of the run and
 	// not of the process: start() arms them and only a one-shot, an eval task and
 	// a workflow call it. Without this a `defaults: max_tokens` in roles.yaml
@@ -259,10 +264,87 @@ func (b *runBudget) spend(prompt, completion, cached int) {
 	if !b.armed {
 		return
 	}
-	spent := b.prompt + b.completion
-	if b.maxTokens > 0 && spent >= b.maxTokens && b.reason == "" {
-		b.reason = fmt.Sprintf("the run's token budget is spent: %s of %s prompt+completion tokens",
-			ctxfmt(spent), ctxfmt(b.maxTokens))
+	if b.maxTokens > 0 && b.prompt+b.completion >= b.maxTokens && b.reason == "" {
+		b.reason = b.spentReasonLocked()
+	}
+}
+
+// spentReasonLocked is the one sentence that names a spent token ceiling. It is
+// one function because three places have to say it — the spend that crosses the
+// line, the admission that will not buy another request, and the reason the
+// result object carries — and three spellings of one fact is how a transcript
+// and a JSON field come to disagree about the same run. Caller holds b.mu.
+func (b *runBudget) spentReasonLocked() string {
+	return fmt.Sprintf("the run's token budget is spent: %s of %s prompt+completion tokens",
+		ctxfmt(b.prompt+b.completion), ctxfmt(b.maxTokens))
+}
+
+// admit is the gate in front of one model request: over(), plus a RESERVATION
+// of what the request is about to cost.
+//
+// over() alone used to answer it, and every session in the run read that answer
+// at the same instant: execCalls runs a reply's `task` calls in parallel
+// goroutines and runChild admits LCA_MAX_PARALLEL of them at once, so all of
+// them asked "is there budget left", all of them were told yes, and the first
+// spend() landed only once all of them had already sent. The overshoot was not
+// the one request this design accepts on purpose — the reply that goes one token
+// over must still be paid for — but one request PER CONCURRENT SLOT, each a full
+// prefill on a fresh subagent transcript. On a fleet tuned with
+// LCA_MAX_PARALLEL=16 that made the ceiling a suggestion: sixteen prefills past
+// a number the operator wrote down.
+//
+// So the estimate is held under the same mutex as the spend, and the Nth
+// session sees the N-1 requests already in flight. What is reserved is the
+// PROMPT estimate (a completion is not knowable before it is generated), and it
+// is deliberately kept OUT of the reported totals: tokens(), spentTokens() and
+// the cost line stay the gateway's own numbers, because an estimate in a cost
+// report is a figure nobody can reconcile with an invoice.
+//
+// The request under way is never refused for its own estimate, only for other
+// requests' — the first request of a run must always be buyable, or a ceiling
+// smaller than one prefill would buy nothing at all and report a run that never
+// started. That keeps the accepted overshoot at exactly one request, whatever
+// the slot count.
+//
+// The returned release must be called once the reply has landed and chat has
+// charged what it really cost, on every path out.
+func (b *runBudget) admit(est int) (string, func()) {
+	noop := func() {}
+	if b == nil {
+		return "", noop
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.armed {
+		return "", noop
+	}
+	if b.reason != "" {
+		return b.reason, noop
+	}
+	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
+		b.reason = fmt.Sprintf("the run's %s time budget is spent", b.timeout)
+		return b.reason, noop
+	}
+	if b.maxTokens > 0 && b.prompt+b.completion+b.inflight >= b.maxTokens {
+		// Declared over on what is already committed, rather than on waiting to see
+		// it land: the sessions in flight are sending the very tokens this ceiling
+		// exists to stop, and finding out for certain costs exactly them.
+		if b.inflight > 0 {
+			b.reason = fmt.Sprintf("the run's token budget is spent: %s of %s prompt+completion tokens, with ~%s more already in flight",
+				ctxfmt(b.prompt+b.completion), ctxfmt(b.maxTokens), ctxfmt(b.inflight))
+		} else {
+			b.reason = b.spentReasonLocked()
+		}
+		return b.reason, noop
+	}
+	if est < 0 {
+		est = 0
+	}
+	b.inflight += est
+	return "", func() {
+		b.mu.Lock()
+		b.inflight -= est
+		b.mu.Unlock()
 	}
 }
 
@@ -311,6 +393,23 @@ func (b *runBudget) over() string {
 	return ""
 }
 
+// tokensSpent names the one ceiling of the three that must not be allowed to
+// buy a closing call: the TOKENS. The clock's grace exists so the run can still
+// say what happened (summary.go, reportCtx), and the verifier and the report
+// cost no tokens — but the closing summary is a whole model request, on a cold
+// prefix by design, and buying it after the run was stopped for being out of
+// tokens spends what the operator's number said was gone. The header above
+// promises "a spent token budget stops the MODEL"; this is what lets the one
+// remaining model call keep that promise.
+func (b *runBudget) tokensSpent() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.armed && b.maxTokens > 0 && b.prompt+b.completion >= b.maxTokens
+}
+
 // tripped is over() for the status decision: the same question asked after the
 // run, when the only thing left is to name what ended it. It is deliberately the
 // same cached reason, so the line in the transcript, the reason in the JSON and
@@ -344,6 +443,30 @@ func (b *runBudget) closingDeadline(now time.Time) time.Time {
 		hard = floor
 	}
 	return hard
+}
+
+// reportDeadline bounds the other closing act — the ticket's report: the
+// comment on the ticket and the status transition that stop an unattended
+// pipeline from going silent (ticket.go).
+//
+// It is NOT closingDeadline, and the difference is the whole point. A spent
+// clock leaves the summary its grace of a few seconds, which is enough: the
+// summary streams from a gateway lca has just been talking to, and what the
+// model does not supply lca writes itself. The report does something else. It
+// makes a model call AND two writes to a tracker over somebody's network, and a
+// Jira comment plus a transition do not complete in three seconds over a VPN —
+// so the floor that bounded the summary cut the report off instead, and the
+// commonest unattended failure there is (the night's clock running out) ended
+// with nothing said on the ticket. That is the exact silence the transition
+// exists to prevent, so the report gets the grant a run with all the time in the
+// world already gives a closing call, and never less. The bound still exists:
+// what was wrong was its size, not its presence.
+func (b *runBudget) reportDeadline(now time.Time) time.Time {
+	floor := now.Add(summaryBudget)
+	if lim := b.closingDeadline(now); lim.After(floor) {
+		return lim
+	}
+	return floor
 }
 
 // describe is the budget as doctor and the banner print it: only the ceilings

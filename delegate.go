@@ -428,6 +428,17 @@ func runDelegateTool(tc *ToolCtx, a Args) string {
 			roleName, target.Label()))
 	}
 	child.isolated = true
+	// isolationRules rates the shared-ref git commands Ask because a worktree
+	// shares refs, stashes and config with the user's repository. That guard is
+	// inert in the one run it was written for: `lca run` calls TrustAll() unless
+	// -ask, and Confirm consults Trusts() before the unattended refusal, so every
+	// one of those Asks auto-approves and the subagent could push its scratch
+	// branch or move a local ref — around the parent's apply: step, which is
+	// supposed to be the only way a delegation's work reaches anything. With
+	// nobody to ask, the honest answer is no.
+	if o.ap.unattendedWhy() != "" {
+		child.extra = append(child.extra, sharedRefDenies...)
+	}
 	// Under apply: branch the ENGINE commits the work, once per verifier attempt,
 	// from RunVerifiedAll. The model is never asked to commit: no new tool, no
 	// change to the request prefix, and a role cannot forget.

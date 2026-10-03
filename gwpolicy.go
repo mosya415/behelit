@@ -110,9 +110,30 @@ type fallbackEvent struct {
 
 // chat performs one model call under the gateway policy. It returns the
 // result, the model that produced it, and the switches/waits it took.
+//
+// It is also where the RUN pays for what it buys, and that has to be here
+// rather than in the callers, because one chat() can be several requests. A
+// reply cut after the first byte is repeated whole, up to LCA_GW_CUT_RETRIES; a
+// failure before the first byte buys one attempt on the next model; a chain
+// that is not up is walked again after a wait. Charged from the caller — which
+// is what engine.go did, once per chat() call, with the LAST res.Usage — a
+// flaky gateway turned `-max-steps 200` into 600 requests and threw the
+// discarded attempts' usage away with their res. So every attempt is one step
+// and whatever usage it reported, counted at the one place that knows how many
+// attempts there were, and a fourth caller of chat() cannot forget to do it.
 func (s *Session) chat(ctx context.Context, req ChatRequest, sink StreamSink) (ChatResult, []fallbackEvent, error) {
 	req.Headers = s.headers()
 	deadline := time.Now().Add(gwMaxWait())
+	// The per-call ceiling may not outlive the run. gwMaxWait is 15 minutes by
+	// design — a drained chain coming back is worth waiting for — but it is a
+	// bound on ONE call, reset on every one, and the sleeps below are the only
+	// thing between a 503 and the morning. The context carries the run's own
+	// deadline (and, for the closing calls, the closing one), so the earlier of
+	// the two is the real ceiling and the error names the budget rather than
+	// leaving a cancelled context to be classified as something else.
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
 	var events []fallbackEvent
 	settled := s.modelIdx // the model this session has been using
 	cuts := 0
@@ -132,6 +153,11 @@ func (s *Session) chat(ctx context.Context, req ChatRequest, sink StreamSink) (C
 
 	for {
 		res, err := s.client.Chat(ctx, req, sink)
+		// One gateway request, charged before anything can decide to make another.
+		// A cut stream reports no usage at all — the usage chunk is the last thing
+		// on the wire and it never arrived — so lca does not invent one: what it
+		// can count honestly is the REQUEST, which is what the step ceiling is for.
+		s.chargeRequest(res.Usage)
 		if err == nil || ctx.Err() != nil {
 			return res, events, err
 		}
@@ -202,6 +228,21 @@ func (s *Session) chat(ctx context.Context, req ChatRequest, sink StreamSink) (C
 			return res, events, err
 		}
 	}
+}
+
+// chargeRequest puts one gateway request on the RUN's budget: its tokens and
+// its step. Both have to be the run's and not the session's — a lead and the
+// four coders it delegated to spend one ticket between them — and both have to
+// be per REQUEST and not per turn, which is the part that was missing: an
+// auto-compaction, a closing summary and every repeat of a cut reply are
+// requests the operator pays for that no step ceiling ever saw, so `-max-steps
+// N` bounded requests at something like 3N and the recorded step count said N.
+func (s *Session) chargeRequest(u Usage) {
+	if s == nil || s.orch == nil {
+		return
+	}
+	s.orch.budget.spend(u.PromptTokens, u.CompletionTokens, u.CachedTokens)
+	s.orch.budget.spendStep()
 }
 
 func gwCutRetries() int {

@@ -3225,9 +3225,7 @@ func TestTheResultObjectAndTheSummaryAreRedacted(t *testing.T) {
 	t.Setenv("JIRA_PASSWORD", "hunter2hunter2")
 	// envSecrets is read once per process, so this test states what it needs
 	// rather than relying on the order tests run in.
-	secretsOnce = sync.Once{}
-	secretVals = nil
-	t.Cleanup(func() { secretsOnce = sync.Once{}; secretVals = nil })
+	dropSecrets(t)
 
 	// First the sinks, which is what the wrapper publishes: check_tail and reason
 	// in the result object, and the summary file.
@@ -3279,8 +3277,7 @@ func TestTheResultObjectAndTheSummaryAreRedacted(t *testing.T) {
 	}
 	// A short value is not a secret, and redacting it would destroy the output.
 	t.Setenv("TINY_KEY", "ok")
-	secretsOnce = sync.Once{}
-	secretVals = nil
+	dropSecrets(t)
 	if got := forPublication("everything is ok here"); got != "everything is ok here" {
 		t.Fatalf("a two-character value must not redact the whole log: %q", got)
 	}

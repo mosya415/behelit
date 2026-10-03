@@ -85,6 +85,7 @@ const (
 	tktImplemented = "implemented" // the coder changed files and its check passed
 	tktReviewed    = "reviewed"    // the reviewer produced a structured verdict
 	tktReworked    = "reworked"    // request_changes fed back on the same session
+	tktResolved    = "resolved"    // the branch and the target branch do not collide
 	tktMerged      = "merged"      // the branch merged into the target branch
 	tktPushed      = "pushed"      // the branch is on the remote
 	tktProposed    = "proposed"    // a merge request exists
@@ -99,6 +100,7 @@ const (
 	tktImplement = "implement"
 	tktReview    = "review"
 	tktRework    = "rework"
+	tktResolve   = "resolve"
 	tktMerge     = "merge"
 	tktPush      = "push"
 	tktPropose   = "propose"
@@ -110,6 +112,24 @@ const (
 const (
 	tktApprove = "approve"
 	tktChanges = "request_changes"
+)
+
+// What became of the integrator's one attempt at a conflict. Recorded in the
+// state file because this is the only question in the machine that NOTHING
+// outside can answer: the world can be asked whether a branch exists or a merge
+// request is open, but "has the integrator already had its attempt" is a fact
+// about this ticket's budget, and a budget lives where the rounds live.
+//
+// Three of the four are failures and all three end the same way — a conflict for
+// a person, with the files named — but they are told apart because they send
+// different people to different places: a red check is a resolution to read, a
+// dropped change is a resolution to distrust, and an unresolved merge is a merge
+// nobody has started.
+const (
+	tktResolveDone    = "resolved"     // the merge is on the branch and its check is green
+	tktResolveNone    = "unresolved"   // the markers are still there, or nothing was committed
+	tktResolveRed     = "check_failed" // a resolution that does not pass the check is not one
+	tktResolveDropped = "work_dropped" // it "resolved" the conflict by throwing the ticket's change away
 )
 
 // The journal's outcome words, the same three a workflow step uses, plus the one
@@ -176,6 +196,14 @@ type TicketState struct {
 	MergedAt  string `json:"merged_at,omitempty"`
 	PushedSha string `json:"pushed_sha,omitempty"`
 
+	// Resolve is the one supervised conflict attempt this ticket gets, written
+	// BEFORE the attempt is made and never cleared. It is the whole of the "one
+	// attempt, ever" rule: a second night that finds it set does not try again,
+	// whatever it says, and a run killed inside the attempt leaves it with no
+	// outcome — which the gate reads as spent, because a process that died in
+	// there may have left a resolution nobody judged.
+	Resolve *TicketResolve `json:"resolve,omitempty"`
+
 	MergeRequest *TicketMR `json:"merge_request,omitempty"`
 	CommentID    string    `json:"comment_id,omitempty"`
 	// MovedTo is the status the transition tool actually applied, recorded after
@@ -185,6 +213,16 @@ type TicketState struct {
 	// `report already`, and the board never moved — with the result object and the
 	// journal both saying the ticket had been reported.
 	MovedTo string `json:"moved_to,omitempty"`
+	// Moving is the status whose transition call was in flight when this process
+	// last wrote — Pending, one level down, and for the same reason. MovedTo is
+	// written AFTER the call, so the window between the call landing and the save
+	// used to lose the only record that it had: the next night read MovedTo == ""
+	// as "never made", called Move again, and a tracker whose transition is only
+	// available from the ORIGINAL status refused it — so a ticket whose work was
+	// merged and proposed failed its report every night from then on, for ever,
+	// because nothing ever recorded the move. The comment half has a marker on the
+	// ticket to prove it; the move half has only this.
+	Moving string `json:"moving,omitempty"`
 	// Marker is the line this run puts in its own ticket comment. The tracker's
 	// comments are the only place a re-run can look to find out whether it already
 	// commented, because a comment has no natural key — so the run writes one.
@@ -220,6 +258,25 @@ type TicketState struct {
 	Started string       `json:"started"`
 	Updated string       `json:"updated"`
 	Journal []TicketStep `json:"journal"`
+}
+
+// TicketResolve is the integrator's one attempt at a merge conflict, as the
+// state file keeps it.
+//
+// Base and Target are the two commits the attempt was ABOUT, and they are here
+// so a person reading this file tomorrow can reproduce it with two shas instead
+// of guessing which tip of which branch moved. Files is the conflict as git
+// named it at the moment it happened, which is the one sentence the ticket
+// comment cannot compose afterwards: by morning the target has moved again.
+type TicketResolve struct {
+	Round   int    `json:"round"`
+	Base    string `json:"base"`            // the approved branch tip the attempt started from
+	Target  string `json:"target"`          // the target commit that was merged into it
+	Files   string `json:"files,omitempty"` // the colliding paths, comma separated
+	Head    string `json:"head,omitempty"`  // the commit the attempt left, when it left one
+	Kept    string `json:"kept,omitempty"`  // the ref a rejected attempt was parked on
+	Lost    string `json:"lost,omitempty"`  // the reviewed paths a dropped resolution threw away
+	Outcome string `json:"outcome,omitempty"`
 }
 
 // TicketCheck is what the coder's check decided, in the three fields the result
@@ -518,8 +575,35 @@ type tktRepo interface {
 	// commit; a branch that grew past it carries work nothing judged, and a merge
 	// is the half of this machine that cannot be re-done.
 	MergeIn(branch, target, sha string) (string, error)
-	RemoteHead(remote, branch string) (string, bool, error)
-	PushBranch(remote, branch, sha string) error
+	// MergeConflicts is MergeIn's question asked without doing anything: would
+	// this branch merge into the target, and which paths collide if it would not.
+	// It is asked before an integrator is bought, because buying one to find out
+	// is the expensive way round.
+	MergeConflicts(branch, target string) (files string, conflicted bool, err error)
+	// MergeTargetIn merges the TARGET into the ticket's branch, inside the
+	// ticket's own worktree, and stops there — on a conflict with the markers, the
+	// unmerged index and MERGE_HEAD left exactly where a resolution is made.
+	//
+	// This direction and never the other. The target branch is the one ref in this
+	// program nothing may touch speculatively: it is what everybody else branches
+	// from. Merging it into the ticket's branch puts the whole decision inside a
+	// branch lca cut, owns and can throw away, and what reaches the target
+	// afterwards is still an ordinary merge of a branch whose check is green.
+	MergeTargetIn(branch, target, dir string) (targetSha, files string, err error)
+	// ResolvedAt judges what the attempt left: the commit on the branch, and the
+	// reviewed paths whose change did NOT survive it. Both are git's answers; see
+	// ticketgit.go for how the second is computed, because a resolution that drops
+	// the ticket's work passes a check as easily as a correct one.
+	ResolvedAt(branch, dir, approved, target string) (head, lost string, err error)
+	// AbandonResolution puts the branch and its worktree back at the approved
+	// commit and parks the rejected attempt on a ref it names, so a refusal hands
+	// a person the conflict AND what the integrator tried at it.
+	AbandonResolution(branch, dir, approved string) (ref string, err error)
+	// The two that reach a network, and the only two here that take a context:
+	// see ticketgit.go for why a ref read over ssh is a different kind of call
+	// from a rev-parse.
+	RemoteHead(ctx context.Context, remote, branch string) (string, bool, error)
+	PushBranch(ctx context.Context, remote, branch, sha string) error
 }
 
 // tktForge is the forge's two tools. Find is not a convenience: it is the only
@@ -547,6 +631,9 @@ type tktStageIn struct {
 	Check   TicketCheck
 	Review  *reviewReport
 	State   *TicketState
+	// Conflict is what the resolve stage is being sent at: the two commits and the
+	// paths git said collide. Zero for every other stage.
+	Conflict TicketResolve
 }
 
 // tktCodeOut is what the coder stage produced: lca reads the check's verdict
@@ -564,6 +651,12 @@ type tktModels interface {
 	WriteTicket(ctx context.Context, in tktStageIn, task string) (TicketBody, error)
 	Implement(ctx context.Context, in tktStageIn) (tktCodeOut, error)
 	Review(ctx context.Context, in tktStageIn) (*reviewReport, error)
+	// Resolve is the integrator's one attempt at the conflict MergeTargetIn left
+	// in the worktree. It is a code stage and not a prose one — it hands back a
+	// commit and a check verdict, like Implement — because a resolution is a
+	// change, and the only thing that may decide whether a change is good here is
+	// the check and the reviewer.
+	Resolve(ctx context.Context, in tktStageIn) (tktCodeOut, error)
 	WriteMR(ctx context.Context, in tktStageIn) (TicketMR, error)
 	WriteComment(ctx context.Context, in tktStageIn) (string, error)
 }
@@ -643,16 +736,23 @@ type tktTransition struct {
 	Why   string // the sentence -dry-run prints under the gate
 
 	// Redo says this transition is safe to re-enter blind after a crash that may
-	// have landed its remote call. Everything here is — a branch cut twice is one
+	// have landed its remote call. Most of them are — a branch cut twice is one
 	// branch, a merge already made is a no-op, a push of the same sha changes
 	// nothing, a merge request is found before it is created, a comment carries a
-	// marker — except opening a ticket, which no configured tool can search for
-	// and no tool can undo.
+	// marker — and two are not: opening a ticket, which no configured tool can
+	// search for and no tool can undo, and the integrator's one attempt at a
+	// conflict, which is a budget of one and not a call to repeat.
 	Redo bool
 
 	gate  func(*tktRun) (tktGateResult, string)
 	probe func(*tktRun) (tktProof, error)
 	do    func(*tktRun) error
+	// once is what a run is told when a previous process died INSIDE this
+	// transition and the probe says the effect is not there. Only the two
+	// transitions whose Redo is false have one, and they say nothing alike: one is
+	// "there may be a ticket I cannot ask about", the other is "there may be a
+	// resolution nobody judged". One shared sentence named the wrong fear in both.
+	once func(*tktRun) string
 }
 
 // tktSpine is the machine, in order. Every state is reachable, every transition
@@ -669,6 +769,10 @@ func tktSpine() []*tktTransition {
 			return tktProof{proofAbsent, ""}, nil
 		},
 		do: (*tktRun).doOpen,
+		once: func(r *tktRun) string {
+			return fmt.Sprintf("a previous run was killed inside `%s` and this build has no configured way to ask the tracker whether that call landed — refusing to open a second ticket. If the ticket exists, re-run as `lca ticket <KEY>`; if it does not, remove %s.",
+				tktOpen, filepath.Join(r.dir, "state.json"))
+		},
 	}, {
 		Name: tktBranch, To: tktBranched, Redo: true,
 		Does: "create the branch and its worktree",
@@ -735,6 +839,42 @@ func tktSpine() []*tktTransition {
 		},
 		probe: func(r *tktRun) (tktProof, error) { return tktProof{proofAbsent, ""}, nil },
 		do:    (*tktRun).doRework,
+	}, {
+		// The one state in the machine that exists for a conflict, and it sits HERE —
+		// after the verdict and before the merge — because the conflict worth one
+		// supervised attempt is the one the task names: a change that is finished and
+		// approved, standing in front of a target branch that moved underneath it.
+		// Earlier than this and lca would buy an integrator to reconcile work the
+		// reviewer is about to send back anyway.
+		Name: tktResolve, To: tktResolved, Stage: tktStageResolve, Redo: false,
+		Does: "merge the target branch into the ticket's branch; on a conflict, give the integrator its one attempt",
+		Gate: "mergeable, and one attempt unspent",
+		Why:  "the check is green, the verdict is approve, and no attempt at this conflict has been made yet",
+		gate: func(r *tktRun) (tktGateResult, string) {
+			// Off is the documented default and today's behaviour: a conflict is a
+			// person's decision, and skipping here means the merge refuses it in the
+			// same words it always has.
+			if !r.pc.resolveConflicts() {
+				return gateSkip, "pipeline: resolve_conflicts is false, so a merge conflict goes to a person"
+			}
+			// NOT a block: the merge's own gate is the one place the two gates speak,
+			// and two transitions blocking on one sentence would only move the journal
+			// row an operator reads. Skipping here can let nothing through — merge is
+			// next, with the same two questions.
+			if !r.st.checkGreen() || !r.st.approved() {
+				return gateSkip, "nothing may merge yet, so there is nothing to resolve"
+			}
+			if res := r.st.Resolve; res != nil && res.Outcome != tktResolveDone {
+				return gateBlocked, r.resolveWhy()
+			}
+			return gateOpen, ""
+		},
+		probe: (*tktRun).probeResolve,
+		do:    (*tktRun).doResolve,
+		once: func(r *tktRun) string {
+			return fmt.Sprintf("a previous run was killed inside the integrator's one supervised attempt at this conflict, so there may be a resolution on %s that no check ran over and no reviewer read — and the attempt is a budget of one, not a call to repeat. The conflict is a person's now: %s is still there to merge into %s by hand.",
+				r.st.Branch, r.st.Branch, r.st.Target)
+		},
 	}, {
 		Name: tktMerge, To: tktMerged, Redo: true,
 		Does: "merge the branch into the target branch",
@@ -824,6 +964,26 @@ type tktRun struct {
 	// have been paid for.
 	targetHeldBy string
 
+	// conflicted is the colliding paths, as the probe just read them out of git.
+	// Carried from the probe to the `do` rather than asked twice, because the two
+	// questions are seconds apart and the answer is the sentence a person reads:
+	// a second read taken after the merge has begun would name the paths that are
+	// still unmerged, which is a smaller list and the wrong one.
+	conflicted string
+
+	// rereview says THIS process made a resolution a moment ago and the reviewer
+	// has not read it yet. One bit, set once by doResolve and consumed once by
+	// walk, and deliberately not the question it looks like.
+	//
+	// The question — "is there a resolution with no verdict under it" — is true in
+	// two different situations and only one of them wants the walk to go backwards:
+	// it is also true after a review that came back UNREADABLE, which is a run that
+	// has to stop rather than ask again. Asked that way the backward edge would be
+	// correct only because `resolve`'s own gate skips an unapproved change two
+	// transitions later, which is a guard in the wrong place for the job. A bit
+	// that means "I just did this" cannot be wrong about it.
+	rereview bool
+
 	// commented says the ticket already carries THIS run's comment, so the report
 	// transition owes only the status move. The two halves of the report are
 	// proved separately (probeReport), and re-posting a comment the marker has
@@ -886,6 +1046,35 @@ func (r *tktRun) reviewWhy() string {
 	return "the reviewer did not approve this change: " + r.st.Verdict
 }
 
+// resolveWhy is the conflict as a person is told about it — in the journal, in
+// the result object and in the ticket comment, which is why it is written once.
+//
+// It is reached when an attempt is RECORDED and did not end in a resolution,
+// which includes the attempt that was killed half way: a process that died in
+// there may have left a resolution nobody judged, so "spent" and "spent badly"
+// are the same answer here and the sentence says which it was.
+func (r *tktRun) resolveWhy() string {
+	res := r.st.Resolve
+	if res == nil {
+		return ""
+	}
+	what := map[string]string{
+		tktResolveNone:    r.pc.Integrator + " did not resolve it",
+		tktResolveRed:     r.pc.Integrator + " resolved it and the check over the result was red",
+		tktResolveDropped: r.pc.Integrator + " resolved it by dropping this ticket's own change to " + orNone(res.Lost),
+		"":                "the run was killed inside the attempt, so nothing judged what it left",
+	}[res.Outcome]
+	if what == "" {
+		what = r.pc.Integrator + "'s attempt ended as " + res.Outcome
+	}
+	msg := fmt.Sprintf("%s does not merge into %s without a decision somebody has to make — %s conflict, and the one supervised attempt is spent: %s. Nothing was merged and nothing was pushed; %s is still there to merge by hand",
+		r.st.Branch, r.st.Target, orNone(res.Files), what, r.st.Branch)
+	if res.Kept != "" {
+		msg += fmt.Sprintf(" (the rejected attempt is kept at %s — `git show %s`)", res.Kept, res.Kept)
+	}
+	return msg
+}
+
 // roundsSpent is the back half of both rework sentences — the gate's skip reason
 // and the blocked sentence that goes on the ticket. Written out rather than
 // through plural(), which prefixes the count and so produced "the 1 rework round
@@ -918,6 +1107,11 @@ func (r *tktRun) stageIn(stage string) tktStageIn {
 	}
 	if stage == tktStageCoder {
 		in.Session = r.st.Coder
+	}
+	// The resolve stage is the one that is not told what to write but WHERE the
+	// decision is: the conflict, as the attempt recorded it a moment ago.
+	if stage == tktStageResolve && r.st.Resolve != nil {
+		in.Conflict = *r.st.Resolve
 	}
 	return in
 }
@@ -986,6 +1180,25 @@ func (r *tktRun) walk() (blocked, at string, err error) {
 			i = r.index(tktImplement)
 			continue
 		}
+		// And the second one, for the same reason read the other way round: a
+		// RESOLUTION IS A CHANGE NOBODY REVIEWED. The verdict under it was about the
+		// commit the integrator merged into, not about the merge it wrote, so
+		// doResolve clears it and the walk goes back to the reviewer with the
+		// resolved diff in front of it.
+		//
+		// The gate is not weaker for it, which is the whole test: `merge` still asks
+		// for a green check AND an approve, and both now belong to the commit that is
+		// actually going to land. Re-reviewing costs one reviewer stage on the rare
+		// night a target branch moved; NOT re-reviewing would mean the one kind of
+		// change that is hardest to get right — the one where two intentions meet —
+		// is the only kind that reaches a shared branch unread. The round does not
+		// advance: a rework round is the budget for a reviewer that asked for
+		// changes, and nobody asked for these.
+		if tr.Name == tktResolve && r.rereview {
+			r.rereview = false
+			i = r.index(tktReview)
+			continue
+		}
 		i++
 	}
 	return "", "", nil
@@ -1031,8 +1244,7 @@ func (r *tktRun) enter(tr *tktTransition) error {
 		return err
 	}
 	if pr.kind == proofAbsent && r.st.Pending == tr.Name && !tr.Redo {
-		why := fmt.Sprintf("a previous run was killed inside `%s` and this build has no configured way to ask the tracker whether that call landed — refusing to open a second ticket. If the ticket exists, re-run as `lca ticket <KEY>`; if it does not, remove %s.",
-			tr.Name, filepath.Join(r.dir, "state.json"))
+		why := tr.once(r)
 		finish(tktFailed, why, "", "")
 		return usageErrf("%s", why)
 	}
@@ -1121,7 +1333,7 @@ func (r *tktRun) auditState() error {
 // -1 for a state the build does not know, which walk has already refused.
 func tktOrder(state string) int {
 	for i, s := range []string{tktStart, tktOpened, tktBranched, tktImplemented, tktReviewed,
-		tktReworked, tktMerged, tktPushed, tktProposed, tktReported} {
+		tktReworked, tktResolved, tktMerged, tktPushed, tktProposed, tktReported} {
 		if s == state {
 			return i
 		}
@@ -1365,6 +1577,191 @@ func (r *tktRun) doRework() error {
 	return nil
 }
 
+// probeResolve asks the only question this transition's effect can be read off:
+// does the ticket's branch stand in front of the target branch without a
+// collision. Not "did I record an attempt" — the gate owns that, because an
+// attempt is a budget — but "is the thing an attempt exists to produce in
+// place".
+//
+// Two ways it can be, and the second is the one that makes a resolution
+// re-enterable: a resolution this ticket already made is a merge commit that
+// CONTAINS the target, so a walk that comes back through here after the
+// re-review finds it and buys nobody. The clean case answers the same question
+// for the ninety-nine nights out of a hundred where nothing collided at all.
+func (r *tktRun) probeResolve() (tktProof, error) {
+	if res := r.st.Resolve; res != nil && res.Outcome == tktResolveDone && res.Head != "" {
+		head, found, err := r.w.Repo.BranchHead(r.st.Branch)
+		if err != nil {
+			return tktProof{}, err
+		}
+		if found {
+			in, cerr := r.w.Repo.Contains(res.Head, head)
+			if cerr != nil {
+				return tktProof{}, cerr
+			}
+			if in {
+				return tktProof{proofMine, fmt.Sprintf("%s resolved this conflict at %s, which is still on %s",
+					r.pc.Integrator, shortSha(res.Head), r.st.Branch)}, nil
+			}
+		}
+		// The resolution is gone and the attempt is spent, so there is nothing left
+		// for this run to do that would be safe: cutting the branch again would throw
+		// away a decision somebody's integrator made, and attempting it a second time
+		// is the thing this whole transition is bounded against. Row 2 of the table —
+		// alert a person, touch nothing.
+		return tktProof{proofForeign, fmt.Sprintf("%s was resolved at %s and that commit is not on %s any more — the one supervised attempt at this conflict is spent, so lca will not make another. %s has to be merged into %s by hand",
+			r.st.Branch, shortSha(res.Head), r.st.Branch, r.st.Branch, r.st.Target)}, nil
+	}
+	files, conflicted, err := r.w.Repo.MergeConflicts(r.st.Branch, r.st.Target)
+	if err != nil {
+		return tktProof{}, err
+	}
+	if !conflicted {
+		return tktProof{proofMine, fmt.Sprintf("%s merges into %s without a conflict, so there is nothing to resolve",
+			r.st.Branch, r.st.Target)}, nil
+	}
+	r.conflicted = files
+	return tktProof{proofAbsent, ""}, nil
+}
+
+// doResolve is the one supervised attempt, and the order of its five steps is
+// the whole safety argument:
+//
+//  1. the attempt is RECORDED BEFORE IT IS MADE. A process killed anywhere below
+//     this line leaves `resolve` pending with no outcome, and the next night's
+//     gate reads that as spent — because a run that died in here may have left a
+//     resolution on the branch that no check ran over, and asking a second
+//     integrator to reconcile the first one's half-finished answer is how a
+//     release gets a silent wrong one;
+//  2. the TARGET is merged into the BRANCH, never the other way round, in the
+//     worktree lca cut for this ticket. Nothing touches the target branch until
+//     the ordinary merge at the ordinary gate;
+//  3. the integrator gets the conflict, once, with the coder's own check over
+//     the result — the same verifier the implementation was held to;
+//  4. what it left is judged by git and not by the model: a commit, a green
+//     check, and the ticket's own reviewed change still in it;
+//  5. anything short of all three puts the branch back at the approved commit,
+//     parks the attempt on a ref, and hands a person the conflict with the files
+//     named.
+func (r *tktRun) doResolve() error {
+	if strings.TrimSpace(r.st.Worktree) == "" {
+		return fmt.Errorf("ticket %s has no worktree recorded, so there is nowhere to resolve a conflict in", r.st.Ticket)
+	}
+	approved := r.st.Head
+	res := &TicketResolve{Round: r.st.Round, Base: approved, Files: r.conflicted}
+	r.st.Resolve = res
+	r.save()
+
+	target, files, err := r.w.Repo.MergeTargetIn(r.st.Branch, r.st.Target, r.st.Worktree)
+	res.Target = target
+	if files != "" {
+		res.Files = files // git's own list, from the merge itself
+	}
+	r.save()
+	if err != nil {
+		// git would not start the merge at all: a worktree with uncommitted work in
+		// it, a branch that is not the one checked out there, a collision above the
+		// project's own directory. MergeTargetIn leaves nothing behind on this path,
+		// so no attempt was made and none is spent — the next night tries again.
+		r.st.Resolve = nil
+		r.save()
+		return err
+	}
+	if files == "" {
+		// The target moved between the probe and this line, into something that
+		// merges. Nothing is owed and nothing is spent: the merge is put back and the
+		// ordinary merge transition, three lines down the spine, does what it always
+		// does. Keeping the merge instead would put a commit on the branch that no
+		// reviewer read, to no purpose.
+		if _, aerr := r.w.Repo.AbandonResolution(r.st.Branch, r.st.Worktree, approved); aerr != nil {
+			return aerr
+		}
+		r.st.Resolve = nil
+		r.save()
+		warnLine("%s merged into %s cleanly after all — the target moved while this run was looking at it, and no attempt was spent", r.st.Target, r.st.Branch)
+		return nil
+	}
+
+	out, serr := r.w.Models.Resolve(r.ctx, r.stageIn(tktStageResolve))
+	res.Head = out.Head
+	if out.Session != "" && !contains(r.st.Sessions, out.Session) {
+		r.st.Sessions = append(r.st.Sessions, out.Session)
+	}
+	r.save()
+	give := func(outcome, detail string) error {
+		res.Outcome = outcome
+		ref, aerr := r.w.Repo.AbandonResolution(r.st.Branch, r.st.Worktree, approved)
+		if aerr != nil {
+			// Without somewhere to put the attempt the branch is left where it is, which
+			// is branch.go's own choice on this path and for its reason: a committed
+			// answer a person can read beats a tidy branch that silently discarded one.
+			warnLine("the rejected resolution on %s could not be put back: %v", r.st.Branch, aerr)
+		}
+		res.Kept = ref
+		r.save()
+		if detail != "" {
+			return fmt.Errorf("%s\n%s", r.resolveWhy(), detail)
+		}
+		return fmt.Errorf("%s", r.resolveWhy())
+	}
+	switch {
+	case serr != nil && out.Head == "":
+		// Nothing was committed, which is the shape a resolution that was never made
+		// has: commitWork refuses to commit a tree that still holds `<<<<<<<`, so an
+		// integrator that stopped without finishing cannot leave marker text on a
+		// branch. The cause goes in the journal beside the conflict.
+		res.Outcome = tktResolveNone
+		if _, aerr := r.w.Repo.AbandonResolution(r.st.Branch, r.st.Worktree, approved); aerr != nil {
+			warnLine("the unfinished merge in %s could not be put back: %v", r.st.Worktree, aerr)
+		}
+		r.save()
+		return fmt.Errorf("%s — %v", r.resolveWhy(), serr)
+	case serr != nil:
+		// A commit exists and nothing judged it: the gateway went away, or the run's
+		// budget ran out mid-attempt. The attempt stays spent for the reason step 1
+		// gives, the error is returned UNWRAPPED so classifyRunErr can still tell an
+		// infra outage from a decision, and the branch is put back.
+		ref, aerr := r.w.Repo.AbandonResolution(r.st.Branch, r.st.Worktree, approved)
+		if aerr != nil {
+			warnLine("the unjudged resolution on %s could not be put back: %v", r.st.Branch, aerr)
+		}
+		res.Kept = ref
+		r.save()
+		return serr
+	}
+	// The resolution's check is NOT written over the implementation's until the
+	// resolution is accepted, and that is a correctness point and not tidiness: a
+	// rejected resolution is thrown away, so recording its red exit code as this
+	// ticket's check would make every later night report "`go test` still failed"
+	// about a commit whose check was green — and block the review transition on a
+	// change nobody had changed.
+	if out.Check.Exit == nil || *out.Check.Exit != 0 {
+		return give(tktResolveRed, tktCheckText(out.Check))
+	}
+	head, lost, herr := r.w.Repo.ResolvedAt(r.st.Branch, r.st.Worktree, approved, res.Target)
+	if herr != nil {
+		// git says what is on the branch is not the resolution of this merge: nothing
+		// was committed, the merge was never finished, or the tip is not a merge of
+		// the two commits the attempt was about at all.
+		res.Head = ""
+		return give(tktResolveNone, herr.Error())
+	}
+	res.Head, res.Lost = head, lost
+	if lost != "" {
+		return give(tktResolveDropped, "")
+	}
+	// It holds. The resolution is now what the branch is, so it is what the merge
+	// gate has to be about: the head moves to it, the check that just passed is
+	// the check of record, and the verdict is CLEARED — walk reads that as "go
+	// back to the reviewer", because a resolution is a change nobody has read.
+	res.Outcome = tktResolveDone
+	r.st.Head, r.st.Check = head, out.Check
+	r.st.Verdict, r.st.Review = "", nil
+	r.rereview = true
+	r.save()
+	return nil
+}
+
 func (r *tktRun) probeMerge() (tktProof, error) {
 	if r.st.Head == "" {
 		return tktProof{proofAbsent, ""}, nil
@@ -1406,7 +1803,7 @@ func (r *tktRun) doMerge() error {
 }
 
 func (r *tktRun) probePush() (tktProof, error) {
-	sha, found, err := r.w.Repo.RemoteHead(r.st.Remote, r.st.Branch)
+	sha, found, err := r.w.Repo.RemoteHead(r.ctx, r.st.Remote, r.st.Branch)
 	if err != nil {
 		return tktProof{}, err
 	}
@@ -1436,7 +1833,7 @@ func (r *tktRun) probePush() (tktProof, error) {
 }
 
 func (r *tktRun) doPush() error {
-	if err := r.w.Repo.PushBranch(r.st.Remote, r.st.Branch, r.st.Head); err != nil {
+	if err := r.w.Repo.PushBranch(r.ctx, r.st.Remote, r.st.Branch, r.st.Head); err != nil {
 		return err
 	}
 	r.st.PushedSha = r.st.Head
@@ -1464,6 +1861,20 @@ func (r *tktRun) probePropose() (tktProof, error) {
 		if r.st.MergeRequest != nil && (r.st.MergeRequest.ID != "" || r.st.MergeRequest.URL != "") {
 			return tktProof{proofForeign, fmt.Sprintf("%s says there is no open merge request for %s, and this ticket already has one recorded: %s. lca will not open a second merge request for one ticket — look at that one (it may have been closed or merged), and remove merge_request from %s if this ticket really does need a new one.",
 				r.pc.Forge.FindMR, r.st.Branch, firstNonEmpty(r.st.MergeRequest.URL, r.st.MergeRequest.ID),
+				filepath.Join(r.dir, "state.json"))}, nil
+		}
+		// The same contradiction with the record one line earlier. Pending names this
+		// transition, so a previous process died INSIDE it and enter() wrote that to
+		// disk BEFORE the create call precisely to say "this call may have landed" —
+		// and MergeRequest is empty because the save after the call never happened.
+		// The find's `state: opened` filter cannot see a merge request a reviewer has
+		// since closed or merged, so "none" here is not an absence either. Redo stays
+		// true, because every OTHER way into this transition really is safe to
+		// repeat; it is this one pairing that is not, and enter()'s pending refusal
+		// is skipped for a Redo transition, so the reading has to happen here.
+		if r.st.Pending == tktPropose {
+			return tktProof{proofForeign, fmt.Sprintf("a previous run was killed inside `%s` for %s, so a merge request may already have been opened — and %s, whose documented filter is `state: opened`, says there is no open one for that branch, which is also what a closed or merged merge request looks like. lca will not open a second merge request for one ticket: look for a closed or merged merge request on %s, and clear pending from %s once you know.",
+				tktPropose, r.st.Branch, r.pc.Forge.FindMR, r.st.Branch,
 				filepath.Join(r.dir, "state.json"))}, nil
 		}
 		return tktProof{proofAbsent, ""}, nil
@@ -1635,10 +2046,33 @@ func (r *tktRun) doReport() error {
 	if status == "" {
 		return nil
 	}
+	// A move this process is re-entering: the record below says a previous one was
+	// inside the call, so it may have landed. Calling again is the one move that
+	// cannot be taken back cheaply — on a tracker whose transition is only
+	// available from the original status the second call is refused and the report
+	// fails for ever — so it is not called again. It is recorded as applied and
+	// said out loud, because an unattended run that goes quiet is the failure this
+	// whole transition exists to prevent, and a status a person can check in two
+	// seconds is cheaper than a run that fails every night.
+	if r.st.Moving == status {
+		warnLine("a previous run was killed inside `%s` of %s to %s, so that move may already have applied — lca will not apply it twice; check the ticket's status", r.pc.Tracker.Transition, r.st.Ticket, status)
+		r.st.MovedTo, r.st.Moving = status, ""
+		return nil
+	}
+	// The intent on disk before the call, the way enter() does it for a transition
+	// as a whole. A crash between these two lines is the only window left where
+	// the tracker and the journal can disagree, and this is what makes the
+	// disagreement visible rather than silent.
+	r.st.Moving = status
+	r.save()
 	if err := r.w.Tracker.Move(r.ctx, r.pc.Tracker.Transition, r.st.Ticket, status); err != nil {
+		// The call returned, so there is no doubt about it: it did not land, and the
+		// next run is free to make it. Only a process that never got an answer leaves
+		// the record standing.
+		r.st.Moving = ""
 		return err
 	}
-	r.st.MovedTo = status
+	r.st.MovedTo, r.st.Moving = status, ""
 	return nil
 }
 

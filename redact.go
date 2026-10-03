@@ -64,14 +64,53 @@ var secretNameParts = []string{"token", "key", "secret", "password", "passwd", "
 const minSecretLen = 6
 
 var (
-	secretsOnce sync.Once
-	secretVals  []string
+	secretsMu    sync.Mutex
+	secretVals   []string
+	secretNamed  []string // the names the loaded configuration declares
+	secretsGen   int      // bumped by every name declareSecretEnv adds
+	secretsBuilt = -1     // the generation secretVals was built from
 )
+
+// declareSecretEnv names a variable that holds a credential because the
+// OPERATOR said so, in a file: an MCP server's headers:/env: ${env:…}
+// reference, config.json's api_key_env, the provider whose key env is in force,
+// roles.yaml's defaults: redact_env:.
+//
+// This exists because the name heuristic below is a GUESS, and the guess is
+// wrong about exactly the credentials a team declares by hand. `headers:
+// {Authorization: {env: GH_PAT, prefix: "Bearer "}}` is scrubbed out of that
+// server's own replies by MCPServer.secrets() — and "GH_PAT" contains none of
+// token/key/secret/password/credential, so envSecrets() never saw it and
+// redactSecrets() was a no-op on it everywhere else. A failing check that echoed
+// its environment, or a request line carrying `Bearer <GH_PAT>`, then went
+// verbatim into the merge request body, the ticket comment, state.json, run.log,
+// the check log and the trace — and a merge request description and a tracker
+// comment cannot be unpublished. JIRA_PAT, BSK_AUTH, GITLAB_BEARER, NPM_AUTH,
+// DOCKER_AUTH and DATABASE_URL (a DSN with the password in it) are all the same
+// shape. This is the file's own rule — where there is no source, lca asks the
+// operator to name it — applied to the one place a guess had replaced it.
+//
+// Additive and idempotent, and safe at any time: envSecrets rebuilds when the
+// set has grown, so a server configured by a live /mcp reload halfway through a
+// run is covered from its next write on rather than from the next process.
+func declareSecretEnv(names ...string) {
+	secretsMu.Lock()
+	defer secretsMu.Unlock()
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n == "" || contains(secretNamed, n) {
+			continue
+		}
+		secretNamed = append(secretNamed, n)
+		secretsGen++
+	}
+}
 
 // envSecrets is every spelling of every value to hide, longest first so that a
 // token which contains a shorter one is replaced whole rather than left with its
-// tail showing. Read once: the environment of a run does not change under it,
-// and every line of a 20 000-line check output passes through here.
+// tail showing. Built once per declaration: the environment of a run does not
+// change under it, so the list is only rebuilt when declareSecretEnv has named
+// something new — a handful of times while the configuration loads, and never
+// again while a 20 000-line check output passes through here.
 //
 // Every SPELLING, because the artefacts are not plain text. A transcript and a
 // trace record are JSON and a report is HTML, and both escape some bytes on the
@@ -86,8 +125,18 @@ var (
 // which is nearly all of them — escapes to itself in both, so the three
 // spellings collapse to one and a scan costs what it always did.
 func envSecrets() []string {
-	secretsOnce.Do(func() {
+	secretsMu.Lock()
+	defer secretsMu.Unlock()
+	if secretsBuilt == secretsGen {
+		return secretVals
+	}
+	secretsBuilt, secretVals = secretsGen, nil
+	{
 		env := os.Environ()
+		named := make(map[string]bool, len(secretNamed))
+		for _, n := range secretNamed {
+			named[n] = true
+		}
 		// The names, as a set, for looksSecretValue's last question: a variable
 		// whose value is another variable's NAME (`BSK_API_KEY_ENV=BSK_TOKEN`, the
 		// indirection a dozen tools use) must not redact that name everywhere it
@@ -104,7 +153,15 @@ func envSecrets() []string {
 				continue
 			}
 			name, val := kv[:i], kv[i+1:]
-			if !looksSecretName(name) || !looksSecretValue(val, names) {
+			// Declared beats the name heuristic and only the name heuristic:
+			// looksSecretValue still has the last word, because a declared variable
+			// whose value is a PATH to the credential (GITLAB_TOKEN_FILE), or the name
+			// of another variable, is a value whose redaction destroys the one line
+			// that said which file or which variable was missing.
+			if !named[name] && !looksSecretName(name) {
+				continue
+			}
+			if !looksSecretValue(val, names) {
 				continue
 			}
 			for _, sp := range []string{val, jsonInner(val), esc(val)} {
@@ -120,7 +177,7 @@ func envSecrets() []string {
 				secretVals[j], secretVals[j-1] = secretVals[j-1], secretVals[j]
 			}
 		}
-	})
+	}
 	return secretVals
 }
 

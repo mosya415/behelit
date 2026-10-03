@@ -2618,6 +2618,24 @@ func runWorkflow(cfg Config, args []string) int {
 		b.timeout = 0
 		orch.budget = b
 	}
+	// And the refusal oneShot and `lca ticket` both make, adapted to the clock
+	// this command has just dropped. `lca run` is unattended by construction —
+	// nobody is asked anything unless -ask is given — and with no defaults: block
+	// it had no ceiling of ANY kind: no clock by design, no step total, no token
+	// total, and each step's own `timeout:` bounds that step's wall time while the
+	// model requests inside it fall back to fifty per session with no run-wide
+	// sum. Asked only of a workflow that buys model requests: a workflow of shell
+	// steps is bounded by its steps' timeouts and has nothing to run away. No
+	// number is invented for it — how long this team's night is belongs in their
+	// file, the way push: has no safe default either.
+	if wfBuysModel(wf) && !orch.budget.declared() {
+		errLine("nothing bounds the models in this workflow — add `max_steps:` or `max_tokens:` to roles.yaml's defaults: block. `lca run` is unattended, it drops the clock on purpose (its steps carry their own timeout:), so the step or token total is the only ceiling left.")
+		orch.rec.Event("usage_error", map[string]any{"why": "lca run with model steps and no run-wide ceiling"})
+		return 2
+	}
+	// The budget beside the step table, because an absent ceiling is invisible
+	// otherwise and "none" is the one value worth reading twice.
+	runner.log.header("== budget %s ==", orch.budget.describe())
 	wfCtx, wfCancel := orch.budget.start(context.Background())
 	defer wfCancel()
 	orch.setRunContext(wfCtx)
@@ -2625,6 +2643,24 @@ func runWorkflow(cfg Config, args []string) int {
 	code := runner.Run(wfCtx)
 	orch.rec.Event("workflow_end", map[string]any{"workflow": wf.Name, "run": st.Run, "status": st.Status, "exit": code})
 	return code
+}
+
+// wfBuysModel says whether this workflow spends anything a run-wide ceiling
+// would bound: a prompt step is one agent loop, a delegate step is a whole
+// subagent with a review and its rework rounds. A workflow of `run:` steps
+// spends child processes, which the steps' own timeout: already bounds, and
+// refusing that for the want of a model ceiling would be a refusal about
+// nothing.
+func wfBuysModel(wf *Workflow) bool {
+	if wf == nil {
+		return false
+	}
+	for _, s := range wf.Steps {
+		if s.Kind == stepPrompt || s.Kind == stepDelegate {
+			return true
+		}
+	}
+	return false
 }
 
 // checkResume refuses a resume that would continue against different work. A

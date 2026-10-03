@@ -698,6 +698,16 @@ func (m *MCPSet) build(name string, sc MCPServerConfig) *MCPServer {
 		return sv
 	}
 	sv.Env = es
+	// The operator named these variables as credentials by referencing them here,
+	// so redact.go is told their NAMES rather than left guessing from the spelling
+	// — GH_PAT and JIRA_PAT hold a credential and contain none of the words the
+	// guess looks for. secrets() below scrubs them out of THIS server's replies and
+	// can do no more: a check_cmd that echoes `Bearer $GH_PAT` on its way down is
+	// output this program never handled, and it goes into the merge request body
+	// and the ticket comment, neither of which can be unpublished.
+	for _, h := range append(append([]MCPHeader(nil), hs...), es...) {
+		declareSecretEnv(h.EnvVar)
+	}
 
 	switch sv.Transport {
 	case "http":

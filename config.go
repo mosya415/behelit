@@ -167,6 +167,10 @@ func applyFileConfig(c *Config, fc *FileConfig, srcs map[string]settingSource) {
 	if fc.APIKeyEnv != "" {
 		if v := os.Getenv(fc.APIKeyEnv); v != "" {
 			c.APIKey, c.APIKeyEnv = v, fc.APIKeyEnv
+			// Named by the operator in a file, so redact.go has it by name: the key
+			// itself is scrubbed out of nothing else, and a gateway that 401s with the
+			// request it was sent puts it in a check tail.
+			declareSecretEnv(fc.APIKeyEnv)
 			mark(srcs, "api_key", fileSourceOf(*c, fc.From["api_key_env"]), "api_key_env → "+fc.From["api_key_env"])
 		}
 	}

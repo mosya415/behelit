@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -744,9 +743,7 @@ func TestSecretsDoNotReachTheTrackerOrTheForge(t *testing.T) {
 	t.Setenv("BSK_DEPLOY_TOKEN", "glpat-abcdefghij1234567890")
 	// envSecrets() is read once per process, so a test that sets a variable has to
 	// drop the memo — the same thing redact_test.go does.
-	secretsOnce = sync.Once{}
-	secretVals = nil
-	t.Cleanup(func() { secretsOnce = sync.Once{}; secretVals = nil })
+	dropSecrets(t)
 	s, pc, trk, fg := stubWorld(t)
 	fake := newFakeWorld(t)
 	two := 2

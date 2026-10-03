@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -17,17 +16,39 @@ import (
 const fakeToken = "sk-live-9d41-this-is-not-a-real-token"
 
 // armSecrets puts credentials in the environment and makes the scrub read them.
-// envSecrets is a sync.Once, so a test states what it needs rather than relying
-// on the order tests run in — and puts it back, because every other test in the
-// package shares this process.
+// envSecrets caches, so a test states what it needs rather than relying on the
+// order tests run in — and puts it back, because every other test in the package
+// shares this process.
 func armSecrets(t *testing.T, kv map[string]string) {
 	t.Helper()
 	for k, v := range kv {
 		t.Setenv(k, v)
 	}
-	secretsOnce = sync.Once{}
-	secretVals = nil
-	t.Cleanup(func() { secretsOnce = sync.Once{}; secretVals = nil })
+	dropSecrets(t)
+}
+
+// dropSecrets throws the cached list away so the next envSecrets() rebuilds from
+// the environment and the declarations as they stand now.
+func dropSecrets(t *testing.T) {
+	t.Helper()
+	clear := func() {
+		secretsMu.Lock()
+		defer secretsMu.Unlock()
+		secretVals, secretNamed, secretsGen, secretsBuilt = nil, nil, 0, -1
+	}
+	clear()
+	t.Cleanup(clear)
+}
+
+// emptySecrets pins the list EMPTY: the environment a test runs in may hold a
+// real *_TOKEN of its own, so "nothing to look for" is stated directly rather
+// than by unsetting variables nobody here can enumerate.
+func emptySecrets(t *testing.T) {
+	t.Helper()
+	dropSecrets(t)
+	secretsMu.Lock()
+	secretsBuilt, secretsGen = 0, 0
+	secretsMu.Unlock()
 }
 
 // P2-2: the values of *TOKEN* / *KEY* / *SECRET* / *PASSWORD* variables are
@@ -217,14 +238,7 @@ func TestASecretSplitAcrossTwoWritesIsStillFound(t *testing.T) {
 // With no credential in the environment — every development machine, and every
 // test but these — the scrub is a nil check and the bytes are not copied at all.
 func TestWithNoSecretsTheScrubIsFree(t *testing.T) {
-	// The environment this test runs in may well hold a real *_TOKEN of its own,
-	// so the list is emptied directly rather than by unsetting variables nobody
-	// here can enumerate: the Once is consumed with a no-op, which is what
-	// "nothing to look for" looks like from the inside.
-	secretsOnce = sync.Once{}
-	secretVals = nil
-	secretsOnce.Do(func() {})
-	t.Cleanup(func() { secretsOnce = sync.Once{}; secretVals = nil })
+	emptySecrets(t)
 	b := []byte("a transcript with nothing to hide in it")
 	if got := redactBytes(b); &got[0] != &b[0] {
 		t.Fatal("with no secrets redactBytes must return the same slice, not a copy")

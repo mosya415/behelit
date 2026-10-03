@@ -729,6 +729,21 @@ func cleanRepo(top string, cfg Config, branches, dry bool, named []string) int {
 			gitCmd(top, nil, nil, "update-ref", "-d", ref)
 		}
 	}
+	// A rejected conflict resolution is keyed by the ticket BRANCH it was made on,
+	// and it is worth keeping exactly as long as that branch is: it is the only
+	// copy of what the integrator tried, and the refusal that stopped the ticket
+	// names it. Once somebody has merged or deleted the branch, the decision has
+	// been made and the attempt is litter.
+	for _, ref := range eachRef(top, "refs/lca/resolve/") {
+		branch := strings.TrimPrefix(ref, "refs/lca/resolve/")
+		if _, _, code := gitRun(top, nil, nil, "rev-parse", "--verify", "-q", "refs/heads/"+branch); code == 0 {
+			continue
+		}
+		say("drop the rejected conflict resolution %s", ref)
+		if !dry {
+			gitCmd(top, nil, nil, "update-ref", "-d", ref)
+		}
+	}
 	// The authorship markers are keyed by BRANCH, not by session, so they are
 	// matched against the branch and not against the sid map above. A marker that
 	// outlived its branch would make a later branch of the same name deletable

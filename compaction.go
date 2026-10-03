@@ -78,14 +78,15 @@ func (s *Session) Compact(ctx context.Context, auto bool) error {
 		{Role: "user", Content: prompt},
 	}, Thinking: cs.thinking()}, StreamSink{})
 	cs.traceTurn(0, res, fb, start, nil, err)
-	// Counted, because this is the single most expensive request a long run makes:
-	// the whole conversation goes up as the prompt. Uncounted, a run that
-	// auto-compacted three times against a 120 KB window spent roughly 360k prompt
-	// tokens on the operator's GPUs that -max-tokens never saw and the ticket's
-	// cost line never mentioned — and the compactor may be a different role
-	// ("cheap"), whose own session's stats go nowhere at all, which is why the
-	// budget is the thing that has to hold them.
-	s.orch.budget.spend(res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.CachedTokens)
+	// The run's budget is charged by cs.chat and not from here any more — tokens
+	// AND the step, which is the half this line could never supply. This is the
+	// single most expensive request a long run makes (the whole conversation goes
+	// up as the prompt) and the loop can fire it once per step, so counting its
+	// tokens while not counting the request turned `-max-steps 50` into up to 100
+	// model requests with the step count still reading 50. Charging it where the
+	// request is made gets both, and the reason it must be the RUN's budget stands:
+	// the compactor may be a different role ("cheap"), whose own session's stats go
+	// nowhere at all.
 	s.stats.PromptTokens += res.Usage.PromptTokens
 	s.stats.CachedTokens += res.Usage.CachedTokens
 	s.stats.OutputTokens += res.Usage.CompletionTokens

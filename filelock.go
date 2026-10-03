@@ -242,6 +242,15 @@ func leaseAt(lp, name string, stale time.Duration) (func(), error) {
 				m.Unlock()
 				return nil, fmt.Errorf("%s is being written by another lca right now — retry the change in a moment", name)
 			}
+			// Paced like the two other retries in this file, and it was not: four
+			// subagents editing one file is the contention this header describes, and
+			// a racer that keeps losing link(2) and then finding the lock released
+			// looped as fast as the filesystem would answer for the whole two-second
+			// deadline — a CreateTemp and an unlink per iteration under
+			// .git/lca-locks. It ended on time, so it was churn rather than a hang,
+			// but on a slow or networked .git it made the contention it was reacting
+			// to worse. The holder is milliseconds away; the same 25 ms tick.
+			time.Sleep(leasePoll)
 			continue
 		}
 		// The clock for "held too long" is the recorded time, or the file's mtime

@@ -95,14 +95,21 @@ type RolesConfig struct {
 	// default for a role that declares none and `check_timeout` bounds one check,
 	// while these three bound the WHOLE run — every role, every subagent, every
 	// retry — and are what `-timeout`, `-max-steps` and `-max-tokens` override.
-	RunTimeout   time.Duration       // defaults: timeout:
-	RunMaxSteps  int                 // defaults: max_steps:
-	RunMaxTokens int                 // defaults: max_tokens:
-	Review       string              // defaults.review: the reviewer for roles that name none
-	Tiers        map[string][]string // tiers: — named model chains, validated like a role's
-	TierOrder    []string            // declaration order, for messages and YAML()
-	Tier         string              // the active tier (cfg.Tier): -tier / LCA_TIER
-	Roles        []*Agent
+	RunTimeout   time.Duration // defaults: timeout:
+	RunMaxSteps  int           // defaults: max_steps:
+	RunMaxTokens int           // defaults: max_tokens:
+	Review       string        // defaults.review: the reviewer for roles that name none
+	// RedactEnv is defaults: redact_env: — the names of variables that hold a
+	// credential, said by the only party who knows. redact.go guesses from the
+	// spelling of a name, and the guess misses GH_PAT, JIRA_PAT, BSK_AUTH and a
+	// DATABASE_URL whose DSN carries the password; the MCP block and api_key_env
+	// cover the ones a config file already references, and this covers the rest —
+	// the variable a check_cmd or a deploy script reads and lca never touches.
+	RedactEnv []string
+	Tiers     map[string][]string // tiers: — named model chains, validated like a role's
+	TierOrder []string            // declaration order, for messages and YAML()
+	Tier      string              // the active tier (cfg.Tier): -tier / LCA_TIER
+	Roles     []*Agent
 	// Pipeline is the pipeline: block (`lca ticket`): every fact about this team's
 	// tracker, forge and branches that lca cannot know. nil when no roles.yaml on
 	// the search path declares one, which is the ordinary case for a project that
@@ -314,6 +321,16 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 		}
 		if v := defs.str("review"); v != "" {
 			rc.Review = v
+		}
+		// Merged and never replaced, unlike the scalars above: an $LCA_ROLES overlay
+		// naming one more credential must not drop the team file's list, and a name
+		// that is no longer a credential costs nothing to keep scrubbing.
+		if a := defs.child("redact_env"); a != nil {
+			for _, n := range listOrCSV(a) {
+				if !contains(rc.RedactEnv, n) {
+					rc.RedactEnv = append(rc.RedactEnv, n)
+				}
+			}
 		}
 		if v := defs.str("member"); v != "" {
 			rc.DefaultMember = v
@@ -601,6 +618,10 @@ func loadRoles(cfg Config) (*RolesConfig, error) {
 	if rc.Entry != "" && byName[rc.Entry] == nil {
 		return nil, fmt.Errorf("entry role %q is not defined", rc.Entry)
 	}
+	// Here and not at a use site: this is the one place that has read every file on
+	// the search path, and the scrub has to know the names before the first
+	// artefact is written, not before the first one that happens to mention one.
+	declareSecretEnv(rc.RedactEnv...)
 	return rc, nil
 }
 
@@ -1057,6 +1078,12 @@ func (rc *RolesConfig) YAML() string {
 	}
 	if rc.Review != "" {
 		fmt.Fprintf(&b, "  review: %s\n", rc.Review)
+	}
+	// Written back for the reason the pipeline: block is: /role save rewrites the
+	// WHOLE file, and a list lca dropped here is a credential that reaches a ticket
+	// comment the first time somebody saves a team from a session.
+	if len(rc.RedactEnv) > 0 {
+		fmt.Fprintf(&b, "  redact_env: [%s]\n", strings.Join(rc.RedactEnv, ", "))
 	}
 	if rc.DefaultMember != "" && !(rc.DefaultMember == legacyMemberName && rc.remoteIsItsOwnSpelling()) {
 		fmt.Fprintf(&b, "  member: %s\n", rc.DefaultMember)

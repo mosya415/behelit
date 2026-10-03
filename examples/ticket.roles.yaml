@@ -17,6 +17,39 @@
 # Check it the way lca will, once it is in place:
 #
 #   lca ticket -dry-run BSK-1
+
+# Two keys that are not in the pipeline: block and that `lca ticket` will not run
+# without, or will run worse without. They belong in the same defaults: block your
+# roles already use, and they are here because an operator who copies only the
+# block below has a pipeline with no clock on it.
+defaults:
+  # The one ceiling an unattended run has to have. A step count is not one: a
+  # gateway that accepts the request, streams four tokens and goes silent
+  # advances no steps and spends no tokens, and only a clock cancels the run.
+  # `lca ticket` refuses to start without timeout: or max_tokens:. There is no
+  # default, because how long your team's night is is not something lca can know.
+  timeout: 45m
+  # The other two ceilings, and the reason they are commented out rather than
+  # filled in: the clock above ends a night, and these two bound what the night
+  # may BUY. max_steps is every model request the run makes — every stage, every
+  # verify attempt, every rework round, every subagent, the compactor and the
+  # closing summary, all in one total. max_tokens is prompt+completion over the
+  # same. A ticket that is five stages for one team is twelve for another, so
+  # lca will not guess either number; run the pipeline once and read the
+  # `tokens` and `steps` fields of the result object, then write them down here
+  # with room to spare. Both are also `lca ticket` flags, for the night when one
+  # ticket needs a shorter leash than the team's file gives it.
+  # max_steps: 200
+  # max_tokens: 4000000
+  # The variables that hold a credential, by name. lca scrubs them out of the
+  # ticket comment, the merge request body, the transcript, the trace and the
+  # check log. It also guesses from the spelling — anything with TOKEN, KEY,
+  # SECRET or PASSWORD in its name — and the guess misses GH_PAT, JIRA_PAT,
+  # BSK_AUTH and a DATABASE_URL whose DSN carries the password. Anything the
+  # mcp: block or api_key_env already references is covered without being listed;
+  # this is for the variable your check_cmd or your deploy script reads.
+  # redact_env: [GH_PAT, DATABASE_URL]
+
 pipeline:
   project: BSK                  # -new only: what the ticket is created under
   branch_prefix: agent/         # the branch is this + the ticket key
@@ -24,6 +57,11 @@ pipeline:
   target_branch: main
   push: true                    # true or false — there is no safe default
   rework_rounds: 1              # 0 is legal: one review, no rework
+  # A branch that no longer merges into target_branch goes to a person by
+  # default. true buys the integrator ONE supervised attempt at it, on the
+  # ticket's own branch, after which the check runs again and the reviewer reads
+  # the resolution. Off here because resolving a conflict is a decision.
+  resolve_conflicts: false
   roles:
     coder: coder
     reviewer: reviewer

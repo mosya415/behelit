@@ -258,14 +258,33 @@ func (a *Approver) Confirm(kind, header, preview string) (approved, auto bool) {
 		err  error
 	}
 	got := make(chan answer, 1)
+	// abandoned is closed when this question is over without an answer — the
+	// Ctrl-C path below. The goroutine is still inside ReadString then and there
+	// is no way to interrupt a blocking read of a terminal, so it will finish, and
+	// the line it finishes with belongs to whatever asked NEXT. Sending it into
+	// `got` — which is buffered, so the send always succeeds — dropped it on the
+	// floor: the first character the operator typed at the next question was
+	// swallowed by a question that was already over, and the `y` they typed
+	// arrived as the empty line that means deny. Handed back through in.Put
+	// instead, which is where Drain/TakePending already put anything typed before
+	// a question appeared, so the next prompt treats it as the type-ahead it is.
+	abandoned := make(chan struct{})
 	go func() {
 		l, e := a.in.ReadString('\n')
-		got <- answer{l, e}
+		select {
+		case <-abandoned:
+			if e == nil {
+				a.in.Put(l)
+			}
+		default:
+			got <- answer{l, e}
+		}
 	}()
 	var line string
 	select {
 	case <-sigch:
 		a.interrupted.Store(true)
+		close(abandoned)
 		fmt.Println("   " + warn("%s interrupted — nothing ran", gDown))
 		return false, false
 	case res := <-got:

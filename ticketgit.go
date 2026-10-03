@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -412,11 +413,18 @@ func mergeConflictFiles(out string) string {
 	return strings.Join(names, ", ")
 }
 
-func (g *tktGit) RemoteHead(remote, branch string) (string, bool, error) {
+// RemoteHead and PushBranch take the RUN'S context, and they are the only two
+// methods on this interface that do. They are the only two that talk to a
+// network: everything else here is local plumbing against the object database,
+// which cannot block on anybody else's machine. A remote that accepts the
+// connection and then says nothing is the shape that cost a whole night — the
+// ticket lock held, the ticket claimed, and SIGTERM unable to end it — so the
+// deadline the operator named has to reach these two. gitRunIn carries it.
+func (g *tktGit) RemoteHead(ctx context.Context, remote, branch string) (string, bool, error) {
 	if strings.TrimSpace(remote) == "" {
 		return "", false, usageErrf("pipeline: remote: nothing says which remote to push %s to", branch)
 	}
-	out, errs, code := gitRun(g.top, nil, nil, "ls-remote", "--heads", "--exit-code", remote, "refs/heads/"+branch)
+	out, errs, code := gitRunIn(ctx, g.top, nil, nil, "ls-remote", "--heads", "--exit-code", remote, "refs/heads/"+branch)
 	switch code {
 	case 0:
 	case 2:
@@ -454,12 +462,12 @@ func (g *tktGit) RemoteHead(remote, branch string) (string, bool, error) {
 //     rejection is the right outcome and the message says so.
 //   - hooks off and --no-verify: a pre-push hook belongs to the person who wrote
 //     it, and in a cron job it is something that can only hang or fail.
-func (g *tktGit) PushBranch(remote, branch, sha string) error {
+func (g *tktGit) PushBranch(ctx context.Context, remote, branch, sha string) error {
 	if strings.TrimSpace(sha) == "" {
 		return fmt.Errorf("nothing is recorded as the commit to push for %s, so there is nothing to push", branch)
 	}
 	args := append(hooksOff(), "push", "--no-verify", remote, sha+":refs/heads/"+branch)
-	out, errs, code := gitRun(g.top, nil, nil, args...)
+	out, errs, code := gitRunIn(ctx, g.top, nil, nil, args...)
 	if code == 0 {
 		return nil
 	}
@@ -476,4 +484,361 @@ func (g *tktGit) PushBranch(remote, branch, sha string) error {
 			remote, shortSha(sha), branch, text)
 	}
 	return &infraErr{what: "git remote " + remote, err: fmt.Errorf("pushing %s to %s failed: %s", branch, remote, text)}
+}
+
+// ── the one supervised attempt at a conflict ─────────────────────────────────
+//
+// Four operations, and the shape of them is the point: the TARGET BRANCH is
+// never touched by any of it. A conflict is resolved by merging the target INTO
+// the ticket's branch, inside the worktree lca cut for this ticket, so every
+// write below lands on a ref lca made and can throw away — and what reaches the
+// target afterwards is still MergeIn's ordinary merge of a branch whose check is
+// green and whose diff a reviewer read. The gate does not move; only the branch
+// standing in front of it does.
+//
+// `reset --hard` and `merge --abort` appear here, which the top of this file
+// swears never happens. They happen in LCA'S OWN WORKTREE and nowhere else —
+// the directory CutBranch made, with the owner file beside it that says so —
+// which is the one place §3's never-list does not reach, exactly as handBack
+// says for the resolution worktree of a delegation. Nothing here runs in the
+// operator's tree, and the one ref outside this ticket's branch that any of it
+// writes is refs/lca/resolve/<branch>, which `git branch` never lists.
+
+// pathspec confines a question to the project inside the repository, the same
+// confinement commitWork's commit and diff() already use: a file above the
+// project's own directory is not this ticket's work, whoever changed it.
+func (g *tktGit) pathspec() []string {
+	if g.sub == "" || g.sub == "." {
+		return nil
+	}
+	return []string{"--", g.sub}
+}
+
+// worktreeTop is the worktree's own root, read from the worktree rather than
+// remembered. Every git question below is asked THERE and not in the project
+// directory inside it, because `git diff` prints paths relative to where it was
+// run and a path list that means something different per project layout is a
+// path list no comparison can be written against.
+func (g *tktGit) worktreeTop(dir string) (string, error) {
+	out, err := gitCmd(dir, nil, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("%s is not a git worktree any more, so the conflict cannot be resolved in it: %w", dir, err)
+	}
+	top := strings.TrimSpace(out)
+	if top == "" {
+		return "", fmt.Errorf("%s is not a git worktree any more", dir)
+	}
+	return top, nil
+}
+
+// MergeConflicts is MergeIn's question with none of its consequences: it reads
+// the same two tips and runs the same `merge-tree --write-tree`, and the only
+// thing it writes is a tree object nobody references.
+//
+// It exists so the question is asked BEFORE an integrator is bought. MergeIn
+// asks it at the moment it matters and must keep doing so — a target branch that
+// moved in between is the whole reason any of this exists — so this is a
+// cheaper, earlier copy of the same question and never a substitute for it.
+func (g *tktGit) MergeConflicts(branch, target string) (string, bool, error) {
+	if ok, ver := g.orch.mergeTree3Way(g.top); !ok {
+		return "", false, usageErrf("asking whether %s merges into %s needs `git merge-tree --write-tree`, which arrived in git 2.38, and this git is %s",
+			branch, target, ver)
+	}
+	old, found, err := g.BranchHead(target)
+	if err != nil {
+		return "", false, err
+	}
+	if !found {
+		return "", false, usageErrf("pipeline: target_branch: %q is not a branch in %s", target, g.top)
+	}
+	head, found, err := g.BranchHead(branch)
+	if err != nil {
+		return "", false, err
+	}
+	if !found {
+		return "", false, fmt.Errorf("%s is gone, so there is nothing to ask about merging into %s", branch, target)
+	}
+	out, errs, code := gitRun(g.top, nil, nil, "merge-tree", "--write-tree", old, head)
+	switch code {
+	case 0:
+		return "", false, nil
+	case 1:
+		return mergeConflictFiles(out), true, nil
+	}
+	return "", false, fmt.Errorf("asking git whether %s merges into %s failed: %s", branch, target,
+		strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 4, 400)))
+}
+
+// MergeTargetIn merges the target branch into the ticket's branch in the
+// ticket's own worktree and stops at the conflict, leaving the markers, the
+// unmerged index and MERGE_HEAD where a resolution is made.
+//
+// Three refusals before it starts, and each of them is a merge that could not be
+// judged afterwards:
+//
+//   - the worktree has to be on this branch. One ticket has one worktree and git
+//     refuses a second on one branch, so a worktree holding something else is a
+//     path the state file is wrong about;
+//   - it has to be CLEAN. A merge made on top of uncommitted work merges that
+//     work too, and nothing checked it, nothing reviewed it and nobody asked for
+//     it. The implementation's own commitWork leaves a clean tree after every
+//     attempt, so a dirty one here is a surprise and surprises stop;
+//   - the collision has to be inside the project's own directory. `git commit`
+//     refuses an index with unmerged entries, so a conflict above the project is
+//     one commitWork can never resolve — it would come back as "the integrator
+//     did not manage it" three minutes later, blaming the wrong thing.
+//
+// On any error nothing is left behind: the merge is aborted, the branch is where
+// it was, and no attempt has been spent.
+func (g *tktGit) MergeTargetIn(branch, target, dir string) (string, string, error) {
+	unlock, err := lockGit(g.orch.lockDir())
+	if err == nil {
+		defer unlock()
+	}
+	top, err := g.worktreeTop(dir)
+	if err != nil {
+		return "", "", err
+	}
+	on, err := gitCmd(top, nil, nil, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(on) != branch {
+		return "", "", fmt.Errorf("%s has %s checked out and not %s, so lca will not merge %s into it",
+			top, strings.TrimSpace(on), branch, target)
+	}
+	if st, err := gitCmd(top, nil, nil, "status", "--porcelain"); err != nil {
+		return "", "", err
+	} else if strings.TrimSpace(st) != "" {
+		return "", "", fmt.Errorf("%s has uncommitted work in it, and merging %s on top of work no check ran over makes a merge nobody can judge — %s was not merged into %s",
+			top, target, target, branch)
+	}
+	sha, found, err := g.BranchHead(target)
+	if err != nil {
+		return "", "", err
+	}
+	if !found {
+		return "", "", usageErrf("pipeline: target_branch: %q is not a branch in %s", target, g.top)
+	}
+	// --no-ff, so the merge is always a commit with two parents and ResolvedAt can
+	// check that it is one. A fast-forward here would be a target that already
+	// contains the branch, which probeMerge has answered long before.
+	msg := fmt.Sprintf("Merge %s into %s\n\nlca ticket %s: the target branch moved under this change", target, branch, g.key())
+	out, errs, code := gitRun(top, nil, nil, append(hooksOff(), "merge", "--no-ff", "--no-edit", "-m", msg, sha)...)
+	if code == 0 {
+		return sha, "", nil
+	}
+	files := unmergedPaths(top)
+	if len(files) == 0 {
+		// Not a conflict: git could not do the merge at all. The exit code alone
+		// cannot tell the two apart — branch.go's note on gitRun says why — so the
+		// index is what is asked, and an index with nothing unmerged means nothing is
+		// half done either.
+		g.abortMerge(top)
+		return sha, "", fmt.Errorf("merging %s into %s in %s failed: %s", target, branch, top,
+			strings.TrimSpace(lastLines(firstNonEmpty(strings.TrimSpace(errs), out), 4, 400)))
+	}
+	if ps := g.pathspec(); len(ps) > 0 {
+		var above []string
+		for _, f := range files {
+			if f != g.sub && !strings.HasPrefix(f, g.sub+"/") {
+				above = append(above, f)
+			}
+		}
+		if len(above) > 0 {
+			g.abortMerge(top)
+			return sha, strings.Join(files, ", "), fmt.Errorf("%s and %s collide in %s, which is above %s — lca commits only inside the project's own directory, so a resolution up there could never be committed. %s was not merged into %s",
+				target, branch, strings.Join(above, ", "), g.sub, target, branch)
+		}
+	}
+	return sha, strings.Join(files, ", "), nil
+}
+
+// unmergedPaths is the index's own answer to "what collided", which is the only
+// one that is not a guess: it is what `git commit` consults before refusing, and
+// it is still true after a model has edited half of the files.
+func unmergedPaths(top string) []string {
+	out, err := gitCmd(top, nil, nil, "diff", "--name-only", "--diff-filter=U", "--no-relative")
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if f := strings.TrimSpace(line); f != "" && !contains(files, f) {
+			files = append(files, f)
+		}
+	}
+	return files
+}
+
+// abortMerge puts a worktree back the way `git merge` found it. Best effort and
+// unchecked on purpose: it is called on paths that are already reporting a
+// failure, and a second error on top of the first would only hide it.
+func (g *tktGit) abortMerge(top string) {
+	if _, _, code := gitRun(top, nil, nil, "rev-parse", "--verify", "-q", "MERGE_HEAD"); code == 0 {
+		gitRun(top, nil, nil, append(hooksOff(), "merge", "--abort")...)
+	}
+}
+
+// ResolvedAt judges what the integrator left, by asking git four questions a
+// model cannot answer about itself.
+//
+// The first three are that there IS a resolution: no MERGE_HEAD still sitting
+// there, a commit that is not the one the attempt started from, and a commit
+// that is really the merge — two parents, the approved commit and the target.
+// The parent check is not bookkeeping: the integrator has run_command in its
+// jail, so "resolved it" could be a `git commit --amend`, a reset or a cherry
+// pick, and a branch tip that is not a merge of those two commits is not the
+// thing this transition was going to hand to the merge gate.
+//
+// The fourth is the one that needs saying out loud, because a resolution that
+// DROPS the ticket's change passes a check as easily as a correct one — `git
+// checkout --theirs .` is one keystroke, the markers are gone, the tests are
+// green and the branch now says exactly what the target already said. It is
+// caught by comparing three diffs, all confined to the project:
+//
+//	changed   = base..approved   the change a reviewer approved, base being the
+//	                             merge base of the branch and the target
+//	differing = target..approved where the approved change and the target still
+//	                             disagree at all
+//	landing   = target..head     what this merge actually ADDS to the target
+//
+// A path in `changed` and in `differing` but NOT in `landing` is a path where
+// the ticket had a change, the target did not have it, and the merge no longer
+// carries it: the resolution took the target's side whole and the reviewed work
+// is gone. `differing` is what keeps the honest cases out — a path where the
+// target did the same thing already, or where the ticket only reformatted what
+// the target then rewrote, is identical on both sides and nothing was lost by
+// keeping one. Where it is wrong it is wrong in the safe direction: a conflict
+// for a person, which is where the whole transition defaults anyway.
+func (g *tktGit) ResolvedAt(branch, dir, approved, target string) (string, string, error) {
+	top, err := g.worktreeTop(dir)
+	if err != nil {
+		return "", "", err
+	}
+	if _, _, code := gitRun(top, nil, nil, "rev-parse", "--verify", "-q", "MERGE_HEAD"); code == 0 {
+		return "", "", fmt.Errorf("the merge in %s was never finished — MERGE_HEAD is still there, so nothing was resolved", top)
+	}
+	head, found, err := g.BranchHead(branch)
+	if err != nil {
+		return "", "", err
+	}
+	if !found {
+		return "", "", fmt.Errorf("%s is gone, so there is no resolution on it", branch)
+	}
+	if head == approved {
+		return "", "", fmt.Errorf("%s is still at %s, so nothing was committed and the merge of %s was not resolved",
+			branch, shortSha(approved), target)
+	}
+	line, err := gitCmd(top, nil, nil, "rev-list", "--parents", "-1", head)
+	if err != nil {
+		return "", "", err
+	}
+	parents := strings.Fields(strings.TrimSpace(line))
+	if len(parents) > 0 {
+		parents = parents[1:] // the first field is the commit itself
+	}
+	if len(parents) != 2 || !contains(parents, approved) || !contains(parents, target) {
+		return "", "", fmt.Errorf("%s is at %s, which is not a merge of %s and %s — whatever is there, it is not the resolution of this conflict",
+			branch, shortSha(head), shortSha(approved), shortSha(target))
+	}
+	base, err := gitCmd(g.top, nil, nil, "merge-base", approved, target)
+	if err != nil {
+		return "", "", err
+	}
+	changed, err := g.changedNames(top, strings.TrimSpace(base), approved)
+	if err != nil {
+		return "", "", err
+	}
+	differing, err := g.changedNames(top, target, approved)
+	if err != nil {
+		return "", "", err
+	}
+	landing, err := g.changedNames(top, target, head)
+	if err != nil {
+		return "", "", err
+	}
+	var lost []string
+	for _, p := range changed {
+		if contains(differing, p) && !contains(landing, p) {
+			lost = append(lost, p)
+		}
+	}
+	return head, strings.Join(lost, ", "), nil
+}
+
+// changedNames is `git diff --name-only a b`, confined to the project and
+// spelled from the repository root so three of these can be compared as sets.
+func (g *tktGit) changedNames(top, a, b string) ([]string, error) {
+	args := append([]string{"diff", "--name-only", "--no-relative", a, b}, g.pathspec()...)
+	out, err := gitCmd(top, nil, nil, args...)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if f := strings.TrimSpace(line); f != "" && !contains(names, f) {
+			names = append(names, f)
+		}
+	}
+	return names, nil
+}
+
+// AbandonResolution puts the branch and its worktree back at the commit the
+// attempt started from, and parks whatever the integrator committed on
+// refs/lca/resolve/<branch> first.
+//
+// The order is the whole of it, and it is handBack's lesson in a smaller place:
+// the attempt is SAVED BEFORE the branch is moved, and when it cannot be saved
+// the branch is not moved at all. A committed answer a person can read beats a
+// tidy branch that silently discarded one — and what a person is told by the
+// refusal ("the rejected attempt is kept at …") has to be true when they go and
+// look.
+//
+// Nothing committed is the other half: the worktree is still mid-merge, there is
+// nothing to keep, and `git merge --abort` leaves the branch exactly at the
+// approved commit, which is what the refusal promises. The markers are not put
+// back the way handBack puts them back, because there the human was being handed
+// a worktree to finish in; here they are being handed a BRANCH to merge by hand,
+// and a worktree left mid-merge would only block the next night's run.
+func (g *tktGit) AbandonResolution(branch, dir, approved string) (string, error) {
+	unlock, err := lockGit(g.orch.lockDir())
+	if err == nil {
+		defer unlock()
+	}
+	top, err := g.worktreeTop(dir)
+	if err != nil {
+		return "", err
+	}
+	if _, _, code := gitRun(top, nil, nil, "rev-parse", "--verify", "-q", "MERGE_HEAD"); code == 0 {
+		if _, errs, code := gitRun(top, nil, nil, append(hooksOff(), "merge", "--abort")...); code != 0 {
+			return "", fmt.Errorf("the unfinished merge in %s could not be aborted: %s", top,
+				strings.TrimSpace(lastLines(errs, 3, 300)))
+		}
+		return "", nil
+	}
+	head, found, err := g.BranchHead(branch)
+	if err != nil {
+		return "", err
+	}
+	if !found || head == approved {
+		return "", nil // nothing was committed, so there is nothing to put back
+	}
+	ref := "refs/lca/resolve/" + branch
+	if _, err := gitCmd(g.top, nil, nil, "update-ref", ref, head); err != nil {
+		// Without somewhere to keep it, the reset would make the attempt unreachable.
+		// Leave the branch where it is: the gate refuses this ticket from here on, so
+		// nothing merges either way, and the work is still there to read.
+		return "", fmt.Errorf("the integrator's resolution of %s could not be put on %s, so lca left %s where it is rather than discard it: %w",
+			branch, ref, branch, err)
+	}
+	// `reset --hard` in LCA'S OWN worktree, which is the one place the never-list
+	// at the top of this file does not reach: lca made this directory, the owner
+	// file beside it says so, and nothing of the operator's is in it. It moves the
+	// branch with it, because the branch is what is checked out here.
+	if _, errs, code := gitRun(top, nil, nil, append(hooksOff(), "reset", "--hard", approved)...); code != 0 {
+		return ref, fmt.Errorf("%s could not be put back at %s after a rejected resolution: %s",
+			branch, shortSha(approved), strings.TrimSpace(lastLines(errs, 3, 300)))
+	}
+	return ref, nil
 }
