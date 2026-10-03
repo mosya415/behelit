@@ -119,6 +119,8 @@ var settings = []setting{
 
 	{Key: "root", Env: "LCA_ROOT", Group: "locators", Kind: kLocator, Help: "the project root — from -C/cwd or LCA_ROOT, never from a file"},
 	{Key: "dir", Env: "LCA_DIR", Group: "locators", Kind: kLocator, Help: "where config.json, roles.yaml and state live"},
+	{Key: "skills", Env: "LCA_SKILLS", Group: "locators", Kind: kLocator,
+		Help: "extra skill directories shared across projects, separated like PATH"},
 }
 
 func settingKeys() []string {

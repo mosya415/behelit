@@ -901,11 +901,19 @@ func (r *Repl) cmdTodo(string) bool {
 func (r *Repl) cmdSkills(string) bool {
 	section("skills")
 	var rows [][]string
+	root := r.orch.jl.Root
 	for _, n := range sortedKeys(r.orch.skills) {
 		sk := r.orch.skills[n]
-		rows = append(rows, []string{n, faint("%s", firstNonEmpty(sk.Description, gNil))})
+		// WHERE it came from, because a shared LCA_SKILLS repository and this
+		// project's own .lca/skills can hold the same name — the project wins, and
+		// "why is this skill not the one I edited" is otherwise unanswerable from
+		// inside the session.
+		rows = append(rows, []string{n, faint("%s", firstNonEmpty(sk.Description, gNil)), faint("%s", prettyPath(sk.Dir, root))})
 	}
 	table(nil, rows)
+	if dirs := envSkillDirs(); len(dirs) > 0 {
+		hint("LCA_SKILLS adds %s%sa project's own skills still win", strings.Join(dirs, ", "), gSep)
+	}
 	return false
 }
 

@@ -34,10 +34,48 @@ func skillDirs(root, dir string) []string {
 	if home != "" {
 		out = append(out, filepath.Join(home, ".claude", "skills"), filepath.Join(home, ".config", "opencode", "skills"))
 	}
+	// LCA_SKILLS is the shared knowledge base: one git repository of skills that
+	// several projects read, which is how a team's hard-won "how we deploy to the
+	// stand" stops being retyped into every project's own .lca. A list, separated
+	// the way PATH is on this platform, so a personal repo and a team one can both
+	// be named.
+	//
+	// It sits ABOVE the home directories and BELOW the project's own files: it is
+	// named deliberately by the operator, so it outranks whatever happens to be in
+	// ~/.claude, while a project that ships its own version of a skill still wins —
+	// a shared skill is a default, not a law.
+	out = append(out, envSkillDirs()...)
 	out = append(out, filepath.Join(dir, "skills"),
 		filepath.Join(root, ".claude", "skills"),
 		filepath.Join(root, ".opencode", "skill"), filepath.Join(root, ".opencode", "skills"),
 		filepath.Join(root, ".lca", "skills"))
+	return out
+}
+
+// envSkillDirs reads LCA_SKILLS. A `~` is expanded because this is typed into a
+// shell profile by hand, where `~/skills` is what a person writes; an empty
+// element is skipped rather than read as the current directory, which is how a
+// trailing separator would otherwise pull the whole project into the index.
+func envSkillDirs() []string {
+	raw := os.Getenv("LCA_SKILLS")
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	home, _ := os.UserHomeDir()
+	var out []string
+	for _, p := range filepath.SplitList(raw) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if home != "" && (p == "~" || strings.HasPrefix(p, "~/")) {
+			p = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(p, "~"), "/"))
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		out = append(out, p)
+	}
 	return out
 }
 

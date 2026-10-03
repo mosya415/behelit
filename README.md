@@ -2244,6 +2244,22 @@ in progress at a time.
 one-line index and load the full instructions, plus a list of bundled files,
 with the `skill` tool.
 
+**A shared knowledge base across projects** is `LCA_SKILLS`: directories
+separated the way `PATH` is, read for skills like the rest, so a team's
+hard-won "how we deploy to the stand" lives in one git repository instead of
+being retyped into every project's own `.lca`.
+
+```sh
+export LCA_SKILLS="$HOME/work/team-skills:$HOME/skills"
+```
+
+The order is the point. A shared repository outranks `~/.claude`, because the
+operator named it deliberately; a project's own `.lca/skills` outranks the
+shared repository, because a shared skill is a default and not a law — so a repo
+that needs its own version of `deploy-stand` simply ships one. `/skills` prints
+where each one came from, which is the only way to answer "why is this not the
+skill I edited" from inside a session.
+
 **Commands** are prompt templates in `.lca/commands/<name>.md` (also
 `.opencode/command(s)`, `.claude/commands`), run as `/name args`. `$ARGUMENTS`
 is the raw argument string; `$1…$N` are positional (the highest takes the
