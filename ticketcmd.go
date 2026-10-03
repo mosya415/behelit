@@ -179,7 +179,7 @@ func runTicket(cfg Config, args []string) int {
 
 	if *dry {
 		r.printPlan()
-		return exitOK
+		return r.planExit()
 	}
 
 	status, reason := r.execute()
@@ -262,7 +262,7 @@ func newTicketRun(cfg Config, key, newTask string, dry bool) (*tktRun, error) {
 	// a pipeline silently running without the team's deploy runbook is worse than
 	// one that refuses to start.
 	dirs := skillDirs(cfg.Root, cfg.Dir)
-	sk, err := resolveStageSkills(pc, orch.skills, dirs)
+	sk, err := resolveStageSkills(pc, orch.skills, dirs, need)
 	if err != nil {
 		r.close()
 		return nil, err
@@ -316,19 +316,83 @@ func newTicketRun(cfg Config, key, newTask string, dry bool) (*tktRun, error) {
 	orch.setRunContext(ctx)
 	r.ctx, r.stop, r.cancel = ctx, stop, cancel
 
+	// The three questions that can only be asked of the world this configuration
+	// will meet. After budget.start on purpose: a budget answers for its own
+	// ceilings only once it is armed, so asking before that line reads every run
+	// as uncapped.
+	if err := r.preflight(dry, need); err != nil {
+		r.close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// preflight is the last of newTicketRun, and the half of it a PLAN is held to
+// exactly as a run is.
+//
+// -dry-run exists so an operator can prove a configuration before letting this
+// near a shared remote, which makes a plan that exits 0 where the real run exits
+// 2 worse than no plan at all: it is the one output that was supposed to be
+// checkable. Every question here is local, deterministic, needs no network, no
+// model and no tracker, and is asked of the same facts the run itself is stopped
+// by — so there is no `dry` branch on any of them. The one thing a plan does
+// differently is the LAST one, and it is noted there.
+func (r *tktRun) preflight(dry bool, need tktNeed) error {
 	// Unattended and unbounded in every dimension is the one combination nobody
 	// can afford, and this command is unattended by construction — there is no
 	// person here to read the turns and press Ctrl-C. oneShot refuses the same
 	// pairing for the same reason; this one has more of it to refuse, because a
 	// ticket buys up to five stages and a rework round buys two of them again.
-	//
-	// After budget.start on purpose: a budget answers for its own ceilings only
-	// once it is armed, so asking before this line reads every run as uncapped.
-	if !dry && budget.steps() == stepsUnlimited && !budget.bounded() {
-		r.close()
-		return nil, usageErrf("roles.yaml defaults: max_steps is unlimited and nothing else bounds this run — add timeout: (say 2700) or max_tokens:, or give a step count. `lca ticket` answers to a cron line, and an unattended run has to have one real ceiling.")
+	b := r.orch.budget
+	if b.steps() == stepsUnlimited && !b.bounded() {
+		return usageErrf("roles.yaml defaults: max_steps is unlimited and nothing else bounds this run — add timeout: (say 2700) or max_tokens:, or give a step count. `lca ticket` answers to a cron line, and an unattended run has to have one real ceiling.")
 	}
-	return r, nil
+	// The credentials the configured servers were given, by name. The run would
+	// otherwise reach its first call and stop there.
+	if err := r.pc.validateCreds(need); err != nil {
+		return err
+	}
+	if !dry {
+		return nil
+	}
+	// And the mistake that is not in roles.yaml at all: the clone this runs in has
+	// the target branch checked out, which is the ordinary state of a clone
+	// somebody works in and the default state of one `git clone` just made.
+	// MergeIn refuses it — correctly, naming the directory — but it refuses LAST,
+	// after a coder and a reviewer have been bought and a branch has been cut, and
+	// `git worktree list` answers it now for nothing.
+	//
+	// A plan only, because the real run must ask at the moment of the merge:
+	// between a plan and 3am somebody parks their checkout or switches onto the
+	// target, and neither a stale yes nor a stale no may decide a merge.
+	g, gerr := newTktGit(r.orch, func() string { return r.st.Ticket }, r.pc.Target)
+	if gerr != nil {
+		return gerr
+	}
+	if held, ok := g.worktreeOf(r.pc.Target); ok {
+		r.targetHeldBy = held
+	}
+	// And the git on THIS machine. The merge needs `merge-tree --write-tree`
+	// (git 2.38), and refusing for the want of it is as local and deterministic as
+	// a missing key — it just arrives last, after the night has been spent, and on
+	// the host where it matters it is a property of the image rather than of
+	// anything the operator wrote. A plan that let it through was a plan an
+	// operator could not use as a gate, which is the one thing this is for.
+	if ok, ver := r.orch.mergeTree3Way(g.top); !ok {
+		return usageErrf("the merge needs `git merge-tree --write-tree`, which arrived in git 2.38, and the git here is %s. Nothing in this pipeline can merge on this machine: install a newer git on the host that runs the cron line.", ver)
+	}
+	return nil
+}
+
+// planExit is -dry-run's exit code. A plan that found the target branch checked
+// out has proved a run cannot finish here, and saying so only in prose would
+// leave `lca ticket X -dry-run && …` reading it as a pass — which is the whole
+// use an operator puts a plan to.
+func (r *tktRun) planExit() int {
+	if r.targetHeldBy != "" {
+		return exitUsage
+	}
+	return exitOK
 }
 
 // openState finds or creates this ticket's state file, and refuses the two
@@ -607,6 +671,14 @@ func (r *tktRun) printPlan() {
 		{"at", firstNonEmpty(r.st.State, "nothing recorded yet")},
 	}
 	sectionTable("ticket", r.pc.Src, []string{"", ""}, facts)
+	// Next to the target it is about, and in MergeIn's own words, because it is
+	// MergeIn's refusal arriving early: this run would code, check and review and
+	// then stop at the merge. Said as a line and not as a cell, because the
+	// remedy is the half that matters and a cell is where a table clips.
+	if r.targetHeldBy != "" {
+		errLine("%s is checked out in %s, so lca will not move it — this run would code, check and review and then refuse at the merge. Park that checkout somewhere else (`git -C %s switch --detach`), or point pipeline: target_branch at a branch nobody has checked out.",
+			r.pc.Target, r.targetHeldBy, r.targetHeldBy)
+	}
 
 	rows := [][]string{}
 	for i, tr := range r.spine {
@@ -620,12 +692,12 @@ func (r *tktRun) printPlan() {
 		case res == gateBlocked:
 			mark = "waits"
 		}
-		stage := "—"
-		if tr.Stage != "" {
-			stage = tr.Stage
-		}
-		rows = append(rows, []string{fmt.Sprintf("%d", i+1), tr.Name, tr.To, mark, stage,
-			tktSkillList(r.skills, tr.Stage)})
+		// stageOf and not tr.Stage: with a ticket key the open transition reads the
+		// tracker and buys nothing, so row 1's "writes" and "skills" columns have to
+		// say so — the CALLS section below already hides `open one (-new)`.
+		stage := r.stageOf(tr)
+		rows = append(rows, []string{fmt.Sprintf("%d", i+1), tr.Name, tr.To, mark,
+			firstNonEmpty(stage, "—"), tktSkillList(r.skills, stage)})
 	}
 	sectionTable("transitions", "lca performs every one of these; a model only writes content",
 		[]string{"#", "transition", "state", "", "writes", "skills"}, rows, 2)

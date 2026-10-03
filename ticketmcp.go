@@ -103,21 +103,12 @@ func newTktMCP(o *Orchestrator, lead *Session, pc *PipelineConfig, need tktNeed)
 // with no -new cannot open a ticket even if the key is in the file, and a
 // pipeline with push: false holds no forge grant at all.
 func (pc *PipelineConfig) writeTools(need tktNeed) []string {
-	out := []string{pc.Tracker.Comment}
-	if need.creating {
-		out = append(out, pc.Tracker.Create)
-	}
-	if pc.Tracker.Transition != "" {
-		out = append(out, pc.Tracker.Transition)
-	}
-	if pc.pipelinePush() {
-		out = append(out, pc.Forge.CreateMR)
-	}
 	var keep []string
-	for _, t := range out {
-		if strings.TrimSpace(t) != "" && !contains(keep, t) {
-			keep = append(keep, t)
+	for _, c := range pc.configuredCalls(need) {
+		if !c.write || strings.TrimSpace(c.tool) == "" || contains(keep, c.tool) {
+			continue
 		}
+		keep = append(keep, c.tool)
 	}
 	return keep
 }

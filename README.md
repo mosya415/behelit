@@ -2113,7 +2113,7 @@ that lets a probe tell **our** effect from **somebody else's**:
 | `merge` | `merge-base --is-ancestor` | our head is already in the target | — |
 | `push` | `ls-remote` | the remote's sha is ours, or contains it | the remote's sha does not contain ours |
 | `propose` | the forge's own find tool, **always** | a merge request for this branch exists | — |
-| `report` | the marker in our own comment | a comment carries this state's marker | — |
+| `report` | the marker in our own comment, and the recorded status move | a comment carries this state's marker **and** the move (if one is configured) is recorded | — |
 
 Two consequences worth stating. **The state file says `pushed` and the remote
 says otherwise:** the remote wins and the push is simply made again — either it
@@ -2374,6 +2374,11 @@ named skill is loaded and its instructions go into *that* stage's task message,
 in the order the block lists them; precedence is the documented one, so a
 project's own `.lca/skills` still beats the shared repository.
 
+Only the stages this invocation runs are resolved: `ticket:` is loaded by `-new`
+and by nothing else, because with a key the `open` transition reads the tracker
+and no model writes there — so a team that never opens tickets from lca is not
+held to a file lca would never read, and `-dry-run` shows `—` on that row.
+
 Two things follow:
 
 * **A named skill that is missing from every skills directory is an error** that
@@ -2398,8 +2403,30 @@ with the state it records, whether it `would` run / is already `done` / would be
 `skip`ped / `waits` on something; which stage writes content there and which
 skills that stage gets; each transition's gate sentence in full; and the skills
 in force with their hashes. It touches no tracker, no forge, no remote and no
-model, and writes no state. The two mistakes that stop a real run — a missing key
-and a missing skill — are the two that stop this one.
+model, and writes no state.
+
+**A plan an operator cannot use as a gate is worse than no plan**, so every
+refusal that is local and deterministic is one this stops on too — it exits 2
+wherever the real run would:
+
+* a missing key, and a named skill that is not on this machine;
+* `defaults: max_steps: unlimited` with nothing else bounding the run — this
+  command answers to a cron line, and an unattended run has to have one real
+  ceiling;
+* a `${env:…}` credential a configured server needs and nobody exported into
+  *this* environment, named by variable (a cron job inherits no shell, so this is
+  the ordinary first-night mistake; the run would otherwise be row 2 on its first
+  call);
+* **the target branch checked out in this clone** — the default state of a clone
+  somebody works in, and the one mistake that otherwise surfaces last, after a
+  coder and a reviewer have been bought. It is printed as the refusal
+  [the merge itself makes](#what-the-git-side-does-and-refuses), with the same
+  remedy: park the checkout (`git -C <dir> switch --detach`), or point
+  `target_branch` at a branch nobody has checked out.
+
+What it still cannot prove is what only a server can answer: whether that token
+is *accepted*, whether the tracker has that ticket, whether the forge has that
+branch.
 
 `-json` writes one object on stdout and moves everything else to stderr. It
 carries the same `status` word and the same

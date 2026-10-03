@@ -815,6 +815,15 @@ type tktRun struct {
 	skills []TicketSkill
 	runID  string
 
+	// targetHeldBy is the directory that has the TARGET branch checked out, as
+	// `git worktree list` answers it. It is filled by a PLAN and left empty by a
+	// run: MergeIn asks the same question itself, at the moment it matters, and a
+	// stale answer taken minutes earlier must not be what a merge is decided on.
+	// A plan has the opposite need — it is read before the first night, and this
+	// is the mistake that otherwise surfaces last, after a coder and a reviewer
+	// have been paid for.
+	targetHeldBy string
+
 	// commented says the ticket already carries THIS run's comment, so the report
 	// transition owes only the status move. The two halves of the report are
 	// proved separately (probeReport), and re-posting a comment the marker has
@@ -829,14 +838,35 @@ type tktRun struct {
 	cancel context.CancelFunc
 }
 
+// configuredCheck is the coder role's own check_cmd as the FILE has it, which is
+// a different question from st.Check.Cmd (what ran). Empty when the roles are
+// not loaded — a unit test driving the machine against fakes — in which case the
+// caller falls back to the sentence about a missing key, as it did before.
+func (r *tktRun) configuredCheck() string {
+	if r.orch == nil || r.orch.roles == nil {
+		return ""
+	}
+	if ag := r.orch.roles.role(r.pc.Coder); ag != nil {
+		return strings.TrimSpace(ag.CheckCmd)
+	}
+	return ""
+}
+
 // checkWhy and reviewWhy are the two blocked sentences, written once because
 // they go into the journal, into the ticket comment and into the result object
 // and must say the same thing in all three.
 func (r *tktRun) checkWhy() string {
 	if r.st.Check.Cmd == "" {
-		// Named, with the file: "no check command ran" reads as a check that broke,
-		// and the fix is a key nobody wrote. tktCheckText says it this way too, and
-		// these sentences are written once precisely so all three places agree.
+		// Two different things, and saying the wrong one sends an operator to edit a
+		// key that is already there. st.Check.Cmd is what RAN, so it is empty both
+		// before the implement transition and when no command exists at all —
+		// which is how a plan for a team whose coder HAS a check_cmd told them it
+		// did not, with the file path, in the sentence they would act on. The
+		// config is the authority on whether one exists; the state is the authority
+		// on whether it ran.
+		if cmd := r.configuredCheck(); cmd != "" {
+			return fmt.Sprintf("nothing has checked this change yet: the coder's own check (%s) runs at the implement transition", cmd)
+		}
 		return fmt.Sprintf("nothing checked this change: no check command is configured for the coder role, so there is no green to gate on — write it as roles: %s: check_cmd in %s", r.pc.Coder, firstNonEmpty(r.pc.Src, "roles.yaml"))
 	}
 	if r.st.Check.Exit == nil {
@@ -1106,6 +1136,24 @@ func (r *tktRun) index(name string) int {
 		}
 	}
 	return -1
+}
+
+// stageOf is which model stage a transition buys IN THIS INVOCATION, which is
+// the transition's own Stage everywhere except `open`.
+//
+// `open` has two shapes and that is the whole reason doOpen is two functions: a
+// `-new` run has a model write the body, and a run given a key only READS the
+// tracker, so no stage runs there and the `ticket:` skills reach nobody. A plan
+// that printed the stage and its skills on row 1 anyway was contradicting its
+// own CALLS section one screen further down, where `open one (-new)` is already
+// hidden — and resolution held every keyed run to a skill lca was never going to
+// load, so a team with no -new workflow could not start at all until somebody
+// wrote one.
+func (r *tktRun) stageOf(tr *tktTransition) string {
+	if tr.Name == tktOpen && r.newTask == "" {
+		return ""
+	}
+	return tr.Stage
 }
 
 func (r *tktRun) save() {

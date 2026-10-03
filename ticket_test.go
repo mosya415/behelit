@@ -30,6 +30,7 @@ type fakeWorld struct {
 	comments []string
 	nextKey  string
 	readErr  error
+	moveErr  error
 
 	// the repo
 	heads       map[string]string   // branch → sha
@@ -45,6 +46,7 @@ type fakeWorld struct {
 
 	// the models
 	commentBody func(tktStageIn) string // what the report stage writes, when a test cares
+	commentErr  error                   // the report stage could not be bought
 	check       TicketCheck
 	verdicts    []string // one per round; the last one repeats
 	head        string
@@ -74,8 +76,14 @@ func (w *fakeWorld) world() tktWorld {
 
 func (w *fakeWorld) hit(name string) { w.calls[name]++ }
 
-func (w *fakeWorld) Read(_ context.Context, tool, key string) (TicketBody, error) {
+// Every tracker call takes the CONTEXT seriously, because the real ones do: an
+// MCP call on a context that is already done comes back "was interrupted", and
+// the transition that has to survive exactly that is the report.
+func (w *fakeWorld) Read(ctx context.Context, tool, key string) (TicketBody, error) {
 	w.hit("read")
+	if err := ctx.Err(); err != nil {
+		return TicketBody{}, err
+	}
 	if tool == "" {
 		w.t.Fatalf("Read was called with no tool name — a tool name is configuration, never a guess")
 	}
@@ -99,14 +107,20 @@ func (w *fakeWorld) Create(_ context.Context, tool, project string, body TicketB
 	return w.nextKey, nil
 }
 
-func (w *fakeWorld) Comment(_ context.Context, tool, key, body string) (string, error) {
+func (w *fakeWorld) Comment(ctx context.Context, tool, key, body string) (string, error) {
 	w.hit("comment")
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	w.comments = append(w.comments, body)
 	return fmt.Sprintf("c%d", len(w.comments)), nil
 }
 
-func (w *fakeWorld) FindComment(_ context.Context, tool, key, marker string) (string, bool, error) {
+func (w *fakeWorld) FindComment(ctx context.Context, tool, key, marker string) (string, bool, error) {
 	w.hit("findcomment")
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
 	for i, c := range w.comments {
 		if strings.Contains(c, marker) {
 			return fmt.Sprintf("c%d", i+1), true, nil
@@ -115,8 +129,14 @@ func (w *fakeWorld) FindComment(_ context.Context, tool, key, marker string) (st
 	return "", false, nil
 }
 
-func (w *fakeWorld) Move(_ context.Context, tool, key, status string) error {
+func (w *fakeWorld) Move(ctx context.Context, tool, key, status string) error {
 	w.hit("move")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w.moveErr != nil {
+		return w.moveErr
+	}
 	w.comments = append(w.comments, "status="+status)
 	return nil
 }
@@ -257,9 +277,15 @@ func (w *fakeWorld) WriteMR(_ context.Context, in tktStageIn) (TicketMR, error) 
 	return TicketMR{Title: in.Ticket.Key + " " + in.Ticket.Summary}, nil
 }
 
-func (w *fakeWorld) WriteComment(_ context.Context, in tktStageIn) (string, error) {
+func (w *fakeWorld) WriteComment(ctx context.Context, in tktStageIn) (string, error) {
 	w.hit("stage:" + in.Stage)
 	w.hit("instr:" + in.Stage + ":" + in.Instructions)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if w.commentErr != nil {
+		return "", w.commentErr
+	}
 	if w.commentBody != nil {
 		return w.commentBody(in), nil
 	}
@@ -1108,7 +1134,7 @@ func TestEachStageIsGivenTheSkillsTheBlockNamedAndNothingElse(t *testing.T) {
 	}
 
 	pc := pipeFrom(t, skilledPipeline)
-	got, err := resolveStageSkills(pc, skills, []string{shared})
+	got, err := resolveStageSkills(pc, skills, []string{shared}, tktNeed{creating: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1157,7 +1183,7 @@ func TestASkillNamedInTheConfigAndMissingStopsTheRun(t *testing.T) {
 	skills := loadSkills(filepath.Join(base, "proj"), filepath.Join(base, "proj", ".lca"))
 
 	pc := pipeFrom(t, fullPipeline+"  skills:\n    reviewer: [review-checklist]\n")
-	_, err := resolveStageSkills(pc, skills, []string{shared, "/elsewhere/skills"})
+	_, err := resolveStageSkills(pc, skills, []string{shared, "/elsewhere/skills"}, tktNeed{creating: true})
 	if err == nil {
 		t.Fatal("a pipeline silently running without the team's instructions is worse than one that refuses to start")
 	}
@@ -1187,7 +1213,7 @@ func TestSkillsAreRecordedByNameAndContentHash(t *testing.T) {
 	load := func() []TicketSkill {
 		skills := loadSkills(filepath.Join(base, "proj"), filepath.Join(base, "proj", ".lca"))
 		got, err := resolveStageSkills(pipeFrom(t, fullPipeline+"  skills:\n    coder: [deploy-to-stand]\n"),
-			skills, []string{shared})
+			skills, []string{shared}, tktNeed{creating: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1219,7 +1245,7 @@ func TestTheRunRecordsWhichSkillsWereInForce(t *testing.T) {
 	t.Setenv("LCA_SKILLS", shared)
 	skills := loadSkills(filepath.Join(base, "proj"), filepath.Join(base, "proj", ".lca"))
 	pc := pipeFrom(t, fullPipeline+"  skills:\n    reviewer: [review-checklist]\n")
-	sk, err := resolveStageSkills(pc, skills, []string{shared})
+	sk, err := resolveStageSkills(pc, skills, []string{shared}, tktNeed{creating: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1265,7 +1291,7 @@ func TestADryRunTouchesNothingAndShowsEveryTransitionItsGateAndItsSkills(t *test
 	skills := loadSkills(filepath.Join(base, "proj"), filepath.Join(base, "proj", ".lca"))
 	pc := pipeFrom(t, skilledPipeline)
 	pc.Skills = map[string][]string{tktStageCoder: {"deploy-to-stand"}}
-	sk, err := resolveStageSkills(pc, skills, []string{shared})
+	sk, err := resolveStageSkills(pc, skills, []string{shared}, tktNeed{creating: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1327,6 +1353,204 @@ func TestADryRunMarksWhatIsAlreadyDone(t *testing.T) {
 	}
 	if !strings.Contains(out, tktImplemented) {
 		t.Fatalf("...and where it stands:\n%s", out)
+	}
+}
+
+// ── a plan that is wrong is worse than no plan ──────────────────────────────
+//
+// -dry-run is what an operator reads before letting this near a shared remote,
+// so the two ways it can lie are the two things these tests pin: it must not
+// promise a stage it will not buy, and it must not exit 0 where the run exits 2.
+
+// A keyed run reads the tracker and buys no model at `open`, so the plan's row 1
+// must say so — and the `ticket:` skills must not be required at all, or a team
+// that never opens tickets from lca cannot start until somebody authors a file
+// lca is never going to read.
+func TestAKeyedRunNeitherPlansNorRequiresTheTicketStage(t *testing.T) {
+	base := t.TempDir()
+	shared := filepath.Join(base, "shared")
+	writeSkill(t, shared, "ticket-brief", "how we write a ticket", "name the stand", nil)
+	t.Setenv("LCA_SKILLS", shared)
+	skills := loadSkills(filepath.Join(base, "proj"), filepath.Join(base, "proj", ".lca"))
+	pc := pipeFrom(t, fullPipeline+"  skills:\n    ticket: [ticket-brief]\n")
+
+	// Resolution first: with a key, the stage is not run and its skills are not
+	// asked for — not even when they are there.
+	keyed, err := resolveStageSkills(pc, skills, []string{shared}, tktNeed{})
+	if err != nil {
+		t.Fatalf("a keyed run must not be held to the ticket stage's skills: %v", err)
+	}
+	if len(skillsFor(keyed, tktStageTicket)) != 0 {
+		t.Fatalf("a skill no stage will load must not be recorded as in force: %+v", keyed)
+	}
+	// And the one that proves it is the REQUIREMENT and not just the listing: a
+	// skill that is not on this machine at all stops only the run that would load
+	// it.
+	none := map[string]*Skill{}
+	if _, err := resolveStageSkills(pc, none, []string{shared}, tktNeed{}); err != nil {
+		t.Fatalf("a keyed run must start without the ticket stage's skill existing: %v", err)
+	}
+	if _, err := resolveStageSkills(pc, none, []string{shared}, tktNeed{creating: true}); err == nil {
+		t.Fatal("a -new run DOES load it, so a missing one still stops that run")
+	}
+
+	// The plan's own row, which is what an operator reads.
+	w := newFakeWorld(t)
+	r := fresh(t, w, pc)
+	r.skills, r.st.Skills = keyed, keyed
+	row := planRow(t, captureStdout(t, r.printPlan), tktOpen)
+	if strings.Contains(row, tktStageTicket) {
+		t.Fatalf("with a key no model writes at `open`, and the plan must not promise one:\n%s", row)
+	}
+
+	// With -new it is the other way round, and the same row says so.
+	creating, err := resolveStageSkills(pc, skills, []string{shared}, tktNeed{creating: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nr := newRun(t, w, pc, &TicketState{Ticket: "", State: tktStart})
+	nr.newTask = "make the stand stop dropping big requests"
+	nr.skills, nr.st.Skills = creating, creating
+	row = planRow(t, captureStdout(t, nr.printPlan), tktOpen)
+	for _, want := range []string{tktStageTicket, "ticket-brief"} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("a -new run writes the body, so the plan names %q:\n%s", want, row)
+		}
+	}
+}
+
+// planRow is one row of -dry-run's transitions table, found by its transition
+// name: the row is what carries the stage and the skills, and asserting on the
+// whole page would pass on the facts table's own word "ticket".
+func planRow(t *testing.T, out, name string) string {
+	t.Helper()
+	for _, l := range strings.Split(stripANSI(out), "\n") {
+		fs := strings.Fields(l)
+		if len(fs) > 2 && fs[1] == name {
+			return l
+		}
+	}
+	t.Fatalf("no %s row in the plan:\n%s", name, out)
+	return ""
+}
+
+// The budget rule is the run's, and a plan that exited 0 on a configuration the
+// run refuses is a plan an operator cannot use as a gate.
+//
+// Driven against a real repository, because the plan's own last question needs
+// one: with the guard skipped the plan would walk straight past this and answer
+// nothing at all, which is exactly the regression.
+func TestAPlanIsHeldToTheSameBudgetRuleAsTheRun(t *testing.T) {
+	f := newTktRepoFix(t, "BSK-21")
+	f.park(t)
+	armed := func(rc *RolesConfig) *runBudget {
+		b, err := newRunBudget(rc, 0, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, cancel := b.start(context.Background())
+		t.Cleanup(cancel)
+		return b
+	}
+
+	f.orch.budget = armed(&RolesConfig{RunMaxSteps: stepsUnlimited})
+	for _, dry := range []bool{false, true} {
+		w := newFakeWorld(t)
+		r := fresh(t, w, pipeFrom(t, fullPipeline))
+		r.orch = f.orch
+		err := r.preflight(dry, tktNeed{})
+		if err == nil {
+			t.Fatalf("dry=%v: unattended and unbounded in every dimension is the one combination nobody can afford", dry)
+		}
+		if !strings.Contains(err.Error(), "max_steps") {
+			t.Fatalf("dry=%v: the refusal names the key: %v", dry, err)
+		}
+	}
+
+	// And one real ceiling is enough, so what is refused is the configuration and
+	// not the plan.
+	f.orch.budget = armed(&RolesConfig{RunMaxSteps: stepsUnlimited, RunTimeout: 45 * time.Minute})
+	w := newFakeWorld(t)
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+	r.orch = f.orch
+	if err := r.preflight(true, tktNeed{}); err != nil {
+		t.Fatalf("one real ceiling is enough: %v", err)
+	}
+}
+
+// A credential variable nobody exported is the ordinary first-night mistake — a
+// cron job inherits no shell — and the run is row 2 on its first call. A plan
+// can prove it without reaching anything, so it has to.
+func TestAPlanNamesTheCredentialVariableNobodyExported(t *testing.T) {
+	m := newMockMCP(t)
+	f := mcpFix(t, jiraConfig(m.hostPort(), m.URL, ""), lockOf("jira", m.URL, m.tools))
+	if mcpTools["jira__issue_get"] == nil {
+		t.Fatalf("the fixture's tools must be registered: %s", f.warnText())
+	}
+	pc := pipeFrom(t, fullPipeline)
+	pc.Tracker.Read, pc.Tracker.Comment = "jira__issue_get", "jira__issue_comment_add"
+
+	t.Setenv("JIRA_MCP_TOKEN", "tok-abcdef")
+	if err := pc.validateCreds(tktNeed{}); err != nil {
+		t.Fatalf("an exported token is the whole requirement: %v", err)
+	}
+	t.Setenv("JIRA_MCP_TOKEN", "")
+	for _, dry := range []bool{false, true} {
+		r := &tktRun{orch: &Orchestrator{}, pc: pc}
+		err := r.preflight(dry, tktNeed{})
+		if err == nil {
+			t.Fatalf("dry=%v: every call to that server would be refused before it left", dry)
+		}
+		for _, want := range []string{"JIRA_MCP_TOKEN", "tracker: read", "cron job"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("dry=%v: the refusal names %q: %v", dry, want, err)
+			}
+		}
+		var ue *usageErr
+		if !asUsageErr(err, &ue) {
+			t.Fatalf("that is a thing to fix in the environment, not a failed task: %T", err)
+		}
+	}
+}
+
+// The default cron setup: a clone with the target branch checked out. MergeIn
+// refuses it, correctly and by name — but last, after a coder and a reviewer
+// have been paid for. One `git worktree list` proves it in the plan.
+func TestAPlanSaysWhenTheTargetBranchIsCheckedOutHere(t *testing.T) {
+	f := newTktRepoFix(t, "BSK-20")
+	w := newFakeWorld(t)
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+	r.orch = f.orch
+
+	// Not parked, which is the ordinary state of a clone somebody works in.
+	if err := r.preflight(true, tktNeed{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.targetHeldBy != f.top {
+		t.Fatalf("the plan must find the target's own checkout: %q, want %q", r.targetHeldBy, f.top)
+	}
+	out := stripANSI(captureStdout(t, r.printPlan))
+	for _, want := range []string{"checked out", f.top, "switch --detach", "target_branch"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the plan must say it and name the remedy, like MergeIn does — %q missing:\n%s", want, out)
+		}
+	}
+	if r.planExit() != exitUsage {
+		t.Fatalf("a plan an operator uses as a gate must not exit 0 here: %d", r.planExit())
+	}
+
+	// Parked, which is what an unattended clone should be: nothing to say.
+	f.park(t)
+	parked := fresh(t, w, pipeFrom(t, fullPipeline))
+	parked.orch = f.orch
+	if err := parked.preflight(true, tktNeed{}); err != nil {
+		t.Fatal(err)
+	}
+	if parked.targetHeldBy != "" || parked.planExit() != exitOK {
+		t.Fatalf("a parked clone holds no branch: %q / %d", parked.targetHeldBy, parked.planExit())
+	}
+	if strings.Contains(stripANSI(captureStdout(t, parked.printPlan)), "checked out") {
+		t.Fatal("and a plan with nothing to refuse must not invent a warning")
 	}
 }
 
@@ -1685,5 +1909,268 @@ func TestTomorrowNightsRunRetriesWhatIsStillMissingAndSaysNothingTwice(t *testin
 	}
 	if third.st.State != tktReported || third.st.Blocked != "" {
 		t.Fatalf("and the state file no longer says it is blocked: %q / %q", third.st.State, third.st.Blocked)
+	}
+}
+
+// ── the transitions that are only half proved, and the night that runs out ───
+//
+// Each of these is a crash in a one-instruction window, or a clock that ran out,
+// put back into the machine. They are the failures that cost a night: the
+// cheapest of them wedges one ticket for ever, and the run says it passed.
+
+// A -new run killed just AFTER the create has a key on disk and `pending: open`
+// in the same file. The probe is the thing that can tell "the call landed" from
+// "it did not", so it is asked first — a refusal evaluated before it wedged that
+// ticket for ever, and its remedy (re-run with the key) could not work, because
+// the state file a re-run reads is the same one.
+func TestANewRunKilledJustAfterTheCreateIsContinued(t *testing.T) {
+	w := newFakeWorld(t)
+	w.nextKey = "BSK-9"
+	st := &TicketState{Ticket: "BSK-9", Summary: "the stand drops requests over 8k",
+		State: tktStart, Pending: tktOpen}
+	r := newRun(t, w, pipeFrom(t, fullPipeline), st)
+	r.newTask = "make the stand stop dropping big requests"
+
+	status, reason := r.execute()
+	if status != statusPassed {
+		t.Fatalf("the ticket exists, so the run continues it: %s (%s)\n%+v", status, reason, r.st.Journal)
+	}
+	if w.calls["create"] != 0 {
+		t.Fatalf("and it must not open a second one: %d", w.calls["create"])
+	}
+	if r.st.State != tktReported {
+		t.Fatalf("a continued ticket goes all the way: %q", r.st.State)
+	}
+}
+
+// A branch whose ref exists with no recorded base: killed in the one instruction
+// between `worktree add -b` and the save. CutBranch writes the authorship ref at
+// the same moment the branch appears, so git can still answer whose branch it
+// is — without that, the run refused its own branch every night and nothing in
+// the message said that deleting the branch was the way out.
+func TestABranchCutBeforeItsSaveIsStillOursAndItsBaseIsRecovered(t *testing.T) {
+	w := newFakeWorld(t)
+	w.heads["agent/BSK-1"] = "base000"
+	w.madeAt = map[string]string{"agent/BSK-1": "base000"}
+	st := &TicketState{Ticket: "BSK-1", Summary: "x", State: tktOpened,
+		Branch: "agent/BSK-1", BranchAt: "", Pending: tktBranch}
+	r := newRun(t, w, pipeFrom(t, fullPipeline), st)
+
+	status, reason := r.execute()
+	if status != statusPassed {
+		t.Fatalf("a branch carrying lca's own made-ref is ours: %s (%s)", status, reason)
+	}
+	if r.st.BranchAt != "base000" {
+		t.Fatalf("and the base it was cut at is recovered from that ref: %q", r.st.BranchAt)
+	}
+	if w.calls["cutbranch"] != 0 {
+		t.Fatalf("the branch is there, so nothing cuts it again: %d", w.calls["cutbranch"])
+	}
+}
+
+// A run that ERRORS must not write `reported` over the state the work actually
+// stands in. auditState refuses a document that says `merged` or past it with no
+// green check under it — which is the right audit of a journal somebody edited,
+// and was a correct audit of one lca itself had corrupted. Three nights and the
+// ticket could not be resumed at all.
+func TestAnErroredRunLeavesTheStateResumable(t *testing.T) {
+	w := newFakeWorld(t)
+	w.heads["agent/BSK-1"] = "somebodys-work" // there before we got here
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+
+	status, _ := r.execute()
+	if status != statusConfig {
+		t.Fatalf("a branch nobody here cut is row 2: %s", status)
+	}
+	if r.st.State != tktOpened {
+		t.Fatalf("the state says where the work stands, and that is not `reported`: %q", r.st.State)
+	}
+	for _, s := range stepsNamed(r.st, tktReport) {
+		if s.To != "" {
+			t.Fatalf("a run that did not walk the whole arc records no state for its report: %+v", s)
+		}
+	}
+	if len(w.comments) == 0 {
+		t.Fatal("it still tells the ticket, which is what the report is for")
+	}
+
+	// Night two, on the document night one left: the refusal is still the branch
+	// and not an integrity problem lca invented.
+	again := newRun(t, w, pipeFrom(t, fullPipeline), r.st)
+	status, reason := again.execute()
+	if status != statusConfig || !strings.Contains(reason, "somebody else's branch") {
+		t.Fatalf("every later night must say the same thing: %s (%s)", status, reason)
+	}
+	if strings.Contains(reason, "cannot be resumed") {
+		t.Fatalf("and never that the document itself is unresumable: %s", reason)
+	}
+
+	// And the invariant on its own, so it does not depend on some earlier line
+	// having remembered to write a blocked sentence: only a run that walked the
+	// WHOLE arc may record `reported`.
+	clean := newFakeWorld(t)
+	third := newRun(t, clean, pipeFrom(t, fullPipeline),
+		&TicketState{Ticket: "BSK-1", Summary: "x", State: tktImplemented})
+	if rerr := third.reportOut(statusInfra); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if third.st.State != tktImplemented {
+		t.Fatalf("an infra_error is not a walk, whatever is in `blocked`: %q", third.st.State)
+	}
+}
+
+// A -new run whose create call failed has nothing to comment ON. Every tracker
+// call it used to make carried an empty key — a read, a comment and a status
+// move — and a server that is lenient about a missing key resolves those
+// somewhere nobody asked.
+func TestARunWithNoTicketKeyWritesNothingToTheTracker(t *testing.T) {
+	w := newFakeWorld(t)
+	w.nextKey = "" // the create call fails
+	r := newRun(t, w, pipeFrom(t, fullPipeline), &TicketState{Ticket: "", State: tktStart})
+	r.newTask = "make the stand stop dropping big requests"
+
+	status, _ := r.execute()
+	if status == statusPassed || r.st.Ticket != "" {
+		t.Fatalf("nothing was opened: %s / %q", status, r.st.Ticket)
+	}
+	for _, call := range []string{"read", "findcomment", "comment", "move"} {
+		if w.calls[call] != 0 {
+			t.Fatalf("a write aimed at no identified ticket is never made, and %s was: %v", call, w.calls)
+		}
+	}
+	steps := stepsNamed(r.st, tktReport)
+	if len(steps) != 1 || steps[0].Status != tktSkipped {
+		t.Fatalf("and the journal says why, rather than going quiet: %+v", steps)
+	}
+	if !strings.Contains(steps[0].Detail, "no ticket to comment on") {
+		t.Fatalf("by name: %q", steps[0].Detail)
+	}
+}
+
+// A process killed between the comment and the status move finds its own marker
+// on every later night. The marker proves the COMMENT and nothing else, so the
+// move is recorded separately — otherwise the run recorded `report already`,
+// exited 0, and the board never moved while the journal said it had.
+func TestAReportKilledAfterItsCommentStillMovesTheStatus(t *testing.T) {
+	w := newFakeWorld(t)
+	w.moveErr = fmt.Errorf("the tracker refused the transition")
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+	if status, _ := r.execute(); status != statusPassed {
+		t.Fatal("the work itself is done; only the move failed")
+	}
+	if r.st.CommentID == "" || r.st.MovedTo != "" {
+		t.Fatalf("the comment landed and the move did not: %q / %q", r.st.CommentID, r.st.MovedTo)
+	}
+
+	// Night two: the comment is found by the marker, so it is not posted again —
+	// and the half still owed is made.
+	w.moveErr = nil
+	again := newRun(t, w, pipeFrom(t, fullPipeline), r.st)
+	if status, reason := again.execute(); status != statusPassed {
+		t.Fatalf("%s (%s)", status, reason)
+	}
+	if again.st.MovedTo == "" {
+		t.Fatal("the status move is the half the marker cannot prove, and it has to happen")
+	}
+	if w.calls["comment"] != 1 {
+		t.Fatalf("a second identical comment is what the marker exists to prevent: %d", w.calls["comment"])
+	}
+	if w.calls["move"] != 2 {
+		t.Fatalf("and the move is re-entered: %d", w.calls["move"])
+	}
+}
+
+// The night's clock running out is the commonest unattended failure there is,
+// and the budget ends a run by CANCELLING its context — so by the time anything
+// reports, every symptom reads as an interrupt. The two go to different queues:
+// 130 says "the operator stopped it" and sends the ticket back to be retried for
+// ever, 4 says "it did not fit" and sends it to a person. A slow ticket retried
+// every night is the failure that costs the most.
+func TestASpentClockIsBudgetExceededAndNotCancelled(t *testing.T) {
+	b, err := newRunBudget(&RolesConfig{RunTimeout: time.Nanosecond}, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cancel := b.start(context.Background())
+	defer cancel()
+
+	w := newFakeWorld(t)
+	w.readErr = context.Canceled // what a stage cut off mid-arc comes back as
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+	r.orch = &Orchestrator{budget: b}
+
+	status, reason := r.execute()
+	if status != statusBudget {
+		t.Fatalf("a spent budget outranks the shape of the stop it caused: %s (%s)", status, reason)
+	}
+	if !strings.Contains(reason, "time budget is spent") {
+		t.Fatalf("and it says which ceiling, in the budget's own words: %q", reason)
+	}
+	if statusExitCode(status) != exitBudget {
+		t.Fatalf("4 goes to a person, 130 goes back in the queue: %d", statusExitCode(status))
+	}
+	// A completed walk still outranks it: work that was done and verified before
+	// the clock ran out was done.
+	green := newFakeWorld(t)
+	done := fresh(t, green, pipeFrom(t, fullPipeline))
+	done.orch = &Orchestrator{budget: b}
+	if status, reason := done.execute(); status != statusPassed {
+		t.Fatalf("a finished arc is a success whatever the clock says: %s (%s)", status, reason)
+	}
+}
+
+// And the ticket has to hear about that night. The report is the one transition
+// that still has to happen when the run's own context is already dead, so it is
+// bought on its own short-lived clock — bounded by the same closing deadline the
+// summary's equivalent problem uses, so it cannot outlive the promise the budget
+// made either.
+func TestATrippedClockStillTellsTheTicket(t *testing.T) {
+	b, err := newRunBudget(&RolesConfig{RunTimeout: time.Nanosecond}, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := b.start(context.Background())
+	defer cancel()
+	<-ctx.Done() // the night is over before anything was bought
+
+	w := newFakeWorld(t)
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+	r.orch, r.ctx = &Orchestrator{budget: b}, ctx
+
+	status, reason := r.execute()
+	if status != statusBudget {
+		t.Fatalf("%s (%s)", status, reason)
+	}
+	if len(w.comments) == 0 || !strings.Contains(w.comments[0], r.st.Marker) {
+		t.Fatalf("the report gets its own clock, or the ticket hears nothing at all: %v", w.comments)
+	}
+	if w.calls["move"] != 1 {
+		t.Fatalf("and the status it earned is applied: %d", w.calls["move"])
+	}
+	if r.ctx != ctx {
+		t.Fatal("the run's own context is put back, so nothing after the report runs on borrowed time")
+	}
+}
+
+// And when the stage itself cannot be bought, lca writes the comment from the
+// journal. It holds every fact that comment needs; going quiet is the one
+// failure this whole transition exists to prevent.
+func TestAnUnbuyableReportStageIsWrittenFromTheJournalInstead(t *testing.T) {
+	w := newFakeWorld(t)
+	two := 2
+	w.check = TicketCheck{Cmd: "go test ./...", Exit: &two, Attempts: 2, Tail: "FAIL"}
+	w.commentErr = fmt.Errorf("the gateway is not answering")
+	r := fresh(t, w, pipeFrom(t, fullPipeline))
+
+	if status, _ := r.execute(); status != statusFailed {
+		t.Fatal("the run is blocked on the red check")
+	}
+	if len(w.comments) == 0 {
+		t.Fatal("a model that cannot be bought is not a reason for the ticket to hear nothing")
+	}
+	for _, want := range []string{"BLOCKED at " + tktImplemented, r.st.Marker} {
+		if !strings.Contains(w.comments[0], want) {
+			t.Fatalf("the comment lca wrote itself must carry %q:\n%s", want, w.comments[0])
+		}
 	}
 }

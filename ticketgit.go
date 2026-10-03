@@ -126,14 +126,25 @@ func (g *tktGit) CutBranch(branch string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	// Authorship FIRST, and the branch second. The ref is what tells a later run
+	// that this branch is lca's — the namespace is not proof, and the ancestry
+	// cannot tell lca's branch from a human's bookmark at the same commit — and
+	// writing it after `worktree add` left a gap one git exec wide in which a
+	// crash produced a branch nobody could claim: probeBranch read it as somebody
+	// else's on every re-run, so the ticket could never continue and the operator
+	// had to delete a branch by hand.
+	//
+	// Written first, the same crash leaves a ref pointing at a commit with no
+	// branch beside it, which costs nothing and claims nothing: the next run finds
+	// no branch, cuts one, and overwrites this ref with the same value. The only
+	// cost of the order is that `lca clean --branches` may see a ref with no
+	// branch, which it already tolerates — it deletes branches, not refs.
+	if _, err := gitCmd(g.top, nil, nil, "update-ref", madeRef(branch), base); err != nil {
+		return "", "", err
+	}
 	if _, err := gitCmd(g.top, nil, nil, append(hooksOff(), "worktree", "add", "-b", branch, dir, base)...); err != nil {
 		return "", "", err
 	}
-	// Authorship, recorded the moment the branch exists, for madeRef's own reason:
-	// the namespace is not proof and the ancestry cannot tell lca's branch from a
-	// human's bookmark at the same commit. `lca clean --branches` deletes only a
-	// branch that carries this.
-	gitCmd(g.top, nil, nil, "update-ref", madeRef(branch), base)
 	if real, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = real
 	}

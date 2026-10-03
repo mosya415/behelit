@@ -724,6 +724,83 @@ func (pc *PipelineConfig) validate(rc *RolesConfig, need tktNeed) error {
 	return nil
 }
 
+// tktCall is one call the pipeline: block configures, in the terms everything
+// that walks them needs: which block it came out of, which verb's args: it
+// takes, the key an error names, the tool's own name, and whether it is a WRITE
+// — which is what decides the grant lca's own session holds.
+type tktCall struct {
+	where, verb, key, tool string
+	write                  bool
+}
+
+// configuredCalls is every call THIS invocation could make, in the order the arc
+// reaches them: narrowed by -new and by push:, exactly as validate narrows the
+// keys it requires.
+//
+// One list, because three things walk it — the schema check below, the
+// credential check beside it, and the write grant in ticketmcp.go — and three
+// copies of it would eventually disagree about which calls a run makes. The
+// grant is the one that must not: a list that still named the create tool for a
+// run without -new would hand lca's own session the power to open a ticket
+// nobody asked for.
+func (pc *PipelineConfig) configuredCalls(need tktNeed) []tktCall {
+	calls := []tktCall{
+		{"tracker", tktVerbRead, "tracker: read", pc.Tracker.Read, false},
+		{"tracker", tktVerbComment, "tracker: comment", pc.Tracker.Comment, true},
+	}
+	if need.creating {
+		calls = append(calls, tktCall{"tracker", tktVerbCreate, "tracker: create", pc.Tracker.Create, true})
+	}
+	if pc.Tracker.Transition != "" {
+		calls = append(calls, tktCall{"tracker", tktVerbMove, "tracker: transition", pc.Tracker.Transition, true})
+	}
+	if pc.pipelinePush() {
+		calls = append(calls,
+			tktCall{"forge", tktVerbFindMR, "forge: find_merge_request", pc.Forge.FindMR, false},
+			tktCall{"forge", tktVerbCreateMR, "forge: create_merge_request", pc.Forge.CreateMR, true})
+	}
+	return calls
+}
+
+// validateCreds resolves the ${env:…} references the servers behind those calls
+// were configured with, and refuses by NAME when one is not exported.
+//
+// The real run finds this out at its FIRST call: mcpclient goes to build the
+// header, the variable is empty, and the whole night is row 2 — after the plan
+// said the configuration was fine. A cron job inherits nobody's shell, so this
+// is the ordinary first-night mistake, and it is the kind a plan can genuinely
+// prove: the variable is either in this process's environment or it is not, and
+// asking reaches no network and starts no server.
+//
+// The value itself is never read, only whether there is one. Headers are asked
+// of an http server and env of a stdio one, which is exactly what the client
+// builds for each — a plan that refused over a reference the run never resolves
+// would be a plan nobody could trust either.
+func (pc *PipelineConfig) validateCreds(need tktNeed) error {
+	asked := map[string]bool{}
+	for _, c := range pc.configuredCalls(need) {
+		mt := mcpTools[c.tool]
+		if mt == nil || mt.Server == nil || asked[mt.Server.Name] {
+			// A tool no server exposes is validateTools' refusal, not this one's: two
+			// errors for one typo is two things to fix and one of them imaginary.
+			continue
+		}
+		asked[mt.Server.Name] = true
+		sv := mt.Server
+		refs := sv.Headers
+		if sv.Transport == "stdio" {
+			refs = sv.Env
+		}
+		for _, ref := range refs {
+			if !ref.set() {
+				return usageErrf("%s: pipeline: %s: $%s is not set, so %s cannot be built for mcp server %q — export it in the environment this runs in (a cron job does not inherit your shell's exports). Every call this run makes to %s would be refused before it left.",
+					firstNonEmpty(pc.Src, "roles.yaml"), c.key, ref.EnvVar, ref.Name, sv.Name, sv.Name)
+			}
+		}
+	}
+	return nil
+}
+
 // validateTools checks the configured tool names and arguments against the
 // MANIFEST — mcp.lock.json, through the registry the session itself uses — which
 // is the one source of truth about these tools that lca genuinely has.
@@ -737,26 +814,7 @@ func (pc *PipelineConfig) validate(rc *RolesConfig, need tktNeed) error {
 // nothing else, and the tests drive it that way. This one needs the registry,
 // so it runs where the registry exists, before the tracker is touched.
 func (pc *PipelineConfig) validateTools(need tktNeed) error {
-	type call struct {
-		where, verb, key, tool string
-		write                  bool
-	}
-	calls := []call{
-		{"tracker", tktVerbRead, "tracker: read", pc.Tracker.Read, false},
-		{"tracker", tktVerbComment, "tracker: comment", pc.Tracker.Comment, true},
-	}
-	if need.creating {
-		calls = append(calls, call{"tracker", tktVerbCreate, "tracker: create", pc.Tracker.Create, true})
-	}
-	if pc.Tracker.Transition != "" {
-		calls = append(calls, call{"tracker", tktVerbMove, "tracker: transition", pc.Tracker.Transition, true})
-	}
-	if pc.pipelinePush() {
-		calls = append(calls,
-			call{"forge", tktVerbFindMR, "forge: find_merge_request", pc.Forge.FindMR, false},
-			call{"forge", tktVerbCreateMR, "forge: create_merge_request", pc.Forge.CreateMR, true})
-	}
-	for _, c := range calls {
+	for _, c := range pc.configuredCalls(need) {
 		mt := mcpTools[c.tool]
 		if mt == nil {
 			if err := mcpToolNameError(c.tool); err != nil {
@@ -960,9 +1018,19 @@ type TicketSkill struct {
 // The names are resolved against the same index the `skill` tool uses, so the
 // precedence is the documented one — a project's own .lca/skills beats the
 // shared repository, which beats ~/.claude.
-func resolveStageSkills(pc *PipelineConfig, skills map[string]*Skill, dirs []string) ([]TicketSkill, error) {
+//
+// It resolves the stages THIS invocation will run, which is every one of them
+// except `ticket` without -new: with a key the open transition reads the tracker
+// and no model runs there, so that stage's skills would be loaded by nothing.
+// Requiring them anyway held a team that never opens tickets from lca to a file
+// lca was never going to read, and a plan that listed them was promising a stage
+// it would not buy.
+func resolveStageSkills(pc *PipelineConfig, skills map[string]*Skill, dirs []string, need tktNeed) ([]TicketSkill, error) {
 	var out []TicketSkill
 	for _, stage := range tktStages {
+		if stage == tktStageTicket && !need.creating {
+			continue
+		}
 		for _, name := range pc.Skills[stage] {
 			sk := skills[name]
 			if sk == nil {

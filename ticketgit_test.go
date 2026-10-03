@@ -141,6 +141,66 @@ func TestAWorktreeThatWasRemovedIsAddedBackOntoTheSameBranch(t *testing.T) {
 	}
 }
 
+// `worktree list --porcelain` names the MAIN worktree with its branch line like
+// any other, so what git says holds this branch may be the OPERATOR'S own
+// checkout — their repository root, switched onto the agent's branch in the
+// morning to look at last night's work, with their uncommitted edits in it.
+// Adopting that jails the coder there and `add -A` sweeps their work into this
+// ticket's commit, which is the one thing the top of ticketgit.go swears never
+// happens. So an adopted worktree has to be one lca made, and the owner file
+// beside it is what says so.
+func TestAWorktreeLcaDidNotMakeIsNeverAdopted(t *testing.T) {
+	f := newTktRepoFix(t, "BSK-15")
+	_, wt, err := f.git.CutBranch("agent/BSK-15")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Night one's worktree is removed, which is the case `lca clean` exists for.
+	os.RemoveAll(wt)
+	gitT(t, f.top, "worktree", "prune")
+
+	// In the morning a developer switches their own checkout onto the branch to
+	// read the agent's work, and leaves an edit in it.
+	gitT(t, f.top, "switch", "-q", "agent/BSK-15")
+	mine := filepath.Join(f.top, "f.txt")
+	if err := os.WriteFile(mine, []byte("what a person was in the middle of\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := f.git.Worktree("agent/BSK-15")
+	if err == nil {
+		t.Fatalf("lca will not work in a tree it does not own, and it was handed %q", got)
+	}
+	var ue *usageErr
+	if !asUsageErr(err, &ue) {
+		t.Fatalf("that is a thing to fix in the environment, not a failed task: %T %v", err, err)
+	}
+	for _, want := range []string{f.top, "agent/BSK-15", "not a worktree lca made", "switch --detach"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal must name %q and the remedy, as MergeIn's does:\n%v", want, err)
+		}
+	}
+	// And the person's work is exactly where they left it.
+	if b, rerr := os.ReadFile(mine); rerr != nil || !strings.Contains(string(b), "in the middle of") {
+		t.Fatalf("nothing here touches a tree lca does not own: %q %v", b, rerr)
+	}
+	if out := gitT(t, f.top, "status", "--porcelain"); !strings.Contains(out, "f.txt") {
+		t.Fatalf("their edit must still be uncommitted: %q", out)
+	}
+
+	// A worktree lca DID make is adopted, so the check is ownership and not fear
+	// of adoption.
+	gitT(t, f.top, "checkout", "-q", "--", "f.txt")
+	f.park(t)
+	again, err := f.git.Worktree("agent/BSK-15")
+	if err != nil {
+		t.Fatalf("a branch with no worktree of ours left must be given one: %v", err)
+	}
+	if third, err := f.git.Worktree("agent/BSK-15"); err != nil || third != again {
+		t.Fatalf("and that one is adopted on the next night: %q %v", third, err)
+	}
+}
+
 func TestTheMergeHappensInTheObjectDatabaseAndMovesTheTarget(t *testing.T) {
 	f := newTktRepoFix(t, "BSK-3")
 	skipNo3Way(t, f.top)
